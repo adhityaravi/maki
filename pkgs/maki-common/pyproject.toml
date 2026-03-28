@@ -1,6 +1,6 @@
 [project]
 name = "maki-common"
-version = "0.0.1"
+dynamic = ["version"]
 requires-python = ">=3.12"
 dependencies = ["nats-py>=2.9", "structlog>=24.0"]
 
@@ -13,3 +13,9 @@ k8s = ["kubernetes>=31"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/maki_common/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maki_common"]

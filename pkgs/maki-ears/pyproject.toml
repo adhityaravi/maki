@@ -1,6 +1,6 @@
 [project]
 name = "maki-ears"
-version = "0.0.1"
+dynamic = ["version"]
 requires-python = ">=3.12"
 dependencies = [
     "maki-common",
@@ -16,3 +16,9 @@ maki-common = { workspace = true }
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/maki_ears/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maki_ears"]
