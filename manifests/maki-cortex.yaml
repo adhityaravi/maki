@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maki-cortex
+  namespace: maki
+  labels:
+    app: maki-cortex
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: maki-cortex
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maki-cortex
+  namespace: maki
+  labels:
+    app: maki-cortex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-cortex
+  template:
+    metadata:
+      labels:
+        app: maki-cortex
+    spec:
+      containers:
+        - name: cortex
+          image: localhost:32000/maki-cortex:v0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NATS_URL
+              value: "nats://maki-nerve-nats:4222"
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: maki-claude-auth
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m

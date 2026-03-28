@@ -1,0 +1,17 @@
+[project]
+name = "maki-cortex"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "maki-common[claude]",
+]
+
+[project.scripts]
+maki-cortex = "maki_cortex.main:cli"
+
+[tool.uv.sources]
+maki-common = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

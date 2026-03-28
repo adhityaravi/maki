@@ -1,0 +1,17 @@
+[project]
+name = "maki-immune"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "maki-common[claude,httpx,k8s]",
+]
+
+[project.scripts]
+maki-immune = "maki_immune.main:cli"
+
+[tool.uv.sources]
+maki-common = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

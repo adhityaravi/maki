@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maki-ears
+  namespace: maki
+  labels:
+    app: maki-ears
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-ears
+  template:
+    metadata:
+      labels:
+        app: maki-ears
+    spec:
+      containers:
+        - name: ears
+          image: localhost:32000/maki-ears:v0
+          imagePullPolicy: Always
+          env:
+            - name: NATS_URL
+              value: "nats://maki-nerve-nats:4222"
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: maki-discord-auth
+                  key: token
+          resources:
+            requests:
+              memory: 64Mi
+              cpu: 50m
+            limits:
+              memory: 128Mi
+              cpu: 200m

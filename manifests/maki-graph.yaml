@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maki-graph
+  namespace: maki
+  labels:
+    app: maki-graph
+spec:
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+    - name: http
+      port: 7474
+      targetPort: 7474
+  selector:
+    app: maki-graph
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: maki-graph
+  namespace: maki
+  labels:
+    app: maki-graph
+spec:
+  serviceName: maki-graph
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-graph
+  template:
+    metadata:
+      labels:
+        app: maki-graph
+    spec:
+      containers:
+        - name: neo4j
+          image: neo4j:5-community
+          ports:
+            - containerPort: 7687
+              name: bolt
+            - containerPort: 7474
+              name: http
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: maki-graph-secret
+                  key: password
+            - name: NEO4J_PLUGINS
+              value: '["apoc"]'
+            - name: NEO4J_apoc_export_file_enabled
+              value: "true"
+            - name: NEO4J_apoc_import_file_enabled
+              value: "true"
+            - name: NEO4J_apoc_import_file_use__neo4j__config
+              value: "true"
+            - name: NEO4J_server_memory_heap_initial__size
+              value: "256m"
+            - name: NEO4J_server_memory_heap_max__size
+              value: "512m"
+            - name: NEO4J_server_memory_pagecache_size
+              value: "256m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 200m
+            limits:
+              memory: 1536Mi
+              cpu: "1"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: microk8s-hostpath
+        resources:
+          requests:
+            storage: 5Gi

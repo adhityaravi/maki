@@ -1,0 +1,15 @@
+[project]
+name = "maki-common"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = ["nats-py>=2.9", "structlog>=24.0"]
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk"]
+fastapi = ["fastapi>=0.115", "uvicorn>=0.34"]
+httpx = ["httpx>=0.28"]
+k8s = ["kubernetes>=31"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

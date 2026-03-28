@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maki-vault-initdb
+  namespace: maki
+data:
+  init-pgvector.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maki-vault
+  namespace: maki
+  labels:
+    app: maki-vault
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: maki-vault
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: maki-vault
+  namespace: maki
+  labels:
+    app: maki-vault
+spec:
+  serviceName: maki-vault
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-vault
+  template:
+    metadata:
+      labels:
+        app: maki-vault
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: maki
+            - name: POSTGRES_USER
+              value: maki
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: maki-vault-secret
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - maki
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: 500m
+      volumes:
+        - name: initdb
+          configMap:
+            name: maki-vault-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: microk8s-hostpath
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,18 @@
+[project]
+name = "maki-ears"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "maki-common",
+    "discord.py>=2.4",
+]
+
+[project.scripts]
+maki-ears = "maki_ears.main:cli"
+
+[tool.uv.sources]
+maki-common = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maki-immune
+  namespace: maki
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maki-immune-role
+  namespace: maki
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maki-immune-binding
+  namespace: maki
+subjects:
+  - kind: ServiceAccount
+    name: maki-immune
+    namespace: maki
+roleRef:
+  kind: Role
+  name: maki-immune-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maki-immune
+  namespace: maki
+  labels:
+    app: maki-immune
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: maki-immune
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maki-immune
+  namespace: maki
+  labels:
+    app: maki-immune
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-immune
+  template:
+    metadata:
+      labels:
+        app: maki-immune
+    spec:
+      serviceAccountName: maki-immune
+      containers:
+        - name: immune
+          image: localhost:32000/maki-immune:v0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NATS_URL
+              value: "nats://maki-nerve-nats:4222"
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: maki-claude-auth
+                  key: token
+            - name: CLAUDE_MODEL
+              value: "claude-sonnet-4-20250514"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m

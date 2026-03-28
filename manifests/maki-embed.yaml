@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maki-embed
+  namespace: maki
+  labels:
+    app: maki-embed
+spec:
+  ports:
+    - port: 11434
+      targetPort: 11434
+  selector:
+    app: maki-embed
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: maki-embed
+  namespace: maki
+  labels:
+    app: maki-embed
+spec:
+  serviceName: maki-embed
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maki-embed
+  template:
+    metadata:
+      labels:
+        app: maki-embed
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 100m
+            limits:
+              memory: 2Gi
+              cpu: "2"
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: microk8s-hostpath
+        resources:
+          requests:
+            storage: 10Gi

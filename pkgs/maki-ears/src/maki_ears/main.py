@@ -1,0 +1,282 @@
+"""maki-ears: Discord interface for Maki.
+
+Bridges Discord messages to the brain loop via NATS pub/sub.
+Listens in #maki-general and DMs, relays responses from stem.
+"""
+
+import asyncio
+import json
+import logging
+import os
+
+import discord
+from maki_common import PendingFutures, configure_logging, connect_nats
+from maki_common.subjects import (
+    EARS_MESSAGE_IN,
+    EARS_MESSAGE_OUT,
+    EARS_THOUGHT_OUT,
+    EARS_VITALS_OUT,
+    IMMUNE_ALERT,
+)
+
+configure_logging()
+log = logging.getLogger(__name__)
+
+NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
+OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
+THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-thoughts")
+VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-vitals")
+
+_nc = None
+_pending = PendingFutures()
+_general_channel_ids: set[int] = set()
+_thoughts_channel_ids: set[int] = set()
+_vitals_channel_ids: set[int] = set()
+
+intents = discord.Intents.default()
+intents.message_content = True
+_bot = discord.Client(intents=intents)
+
+
+@_bot.event
+async def on_ready():
+    log.info("Discord connected", extra={"bot_name": _bot.user.name, "bot_id": _bot.user.id})
+
+    for guild in _bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name == GENERAL_CHANNEL_NAME:
+                _general_channel_ids.add(channel.id)
+                log.info(
+                    "Listening in channel",
+                    extra={
+                        "channel": channel.name,
+                        "guild": guild.name,
+                        "channel_id": channel.id,
+                    },
+                )
+
+    if not _general_channel_ids:
+        log.warning("No general channel found", extra={"channel_name": GENERAL_CHANNEL_NAME})
+
+    for guild in _bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name == THOUGHTS_CHANNEL_NAME:
+                _thoughts_channel_ids.add(channel.id)
+                log.info(
+                    "Thoughts channel found",
+                    extra={
+                        "channel": channel.name,
+                        "guild": guild.name,
+                        "channel_id": channel.id,
+                    },
+                )
+
+    if not _thoughts_channel_ids:
+        log.warning("No thoughts channel found", extra={"channel_name": THOUGHTS_CHANNEL_NAME})
+
+    for guild in _bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name == VITALS_CHANNEL_NAME:
+                _vitals_channel_ids.add(channel.id)
+                log.info(
+                    "Vitals channel found",
+                    extra={
+                        "channel": channel.name,
+                        "guild": guild.name,
+                        "channel_id": channel.id,
+                    },
+                )
+
+    if not _vitals_channel_ids:
+        log.warning("No vitals channel found", extra={"channel_name": VITALS_CHANNEL_NAME})
+
+
+@_bot.event
+async def on_message(message: discord.Message):
+    if message.author == _bot.user:
+        return
+
+    if message.author.id != OWNER_ID:
+        await message.channel.send("Get your own, perv!")
+        return
+
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_general = message.channel.id in _general_channel_ids
+
+    if not is_dm and not is_general:
+        return
+
+    content = message.content.strip()
+    if not content:
+        return
+
+    log.info(
+        "Message received",
+        extra={
+            "author": message.author.name,
+            "channel_id": message.channel.id,
+            "content_len": len(content),
+        },
+    )
+
+    payload = {
+        "message_id": str(message.id),
+        "channel_id": str(message.channel.id),
+        "username": message.author.name,
+        "content": content,
+    }
+
+    try:
+        await _nc.publish(EARS_MESSAGE_IN, json.dumps(payload).encode())
+        log.info("Published to NATS", extra={"subject": EARS_MESSAGE_IN})
+    except Exception:
+        log.exception("Failed to publish message to NATS")
+        await message.channel.send("Sorry, I couldn't process that right now.")
+        return
+
+    async with message.channel.typing():
+        future = _pending.create(str(message.id))
+        try:
+            response_text = await asyncio.wait_for(future, timeout=150.0)
+        except TimeoutError:
+            response_text = "Sorry, I took too long thinking about that. Try again?"
+        finally:
+            _pending.remove(str(message.id))
+
+    await _send_response(message.channel, response_text)
+
+
+async def _response_listener():
+    """Subscribe to NATS for outgoing responses and resolve pending futures."""
+    sub = await _nc.subscribe(EARS_MESSAGE_OUT)
+    log.info("Subscribed", extra={"subject": EARS_MESSAGE_OUT})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            message_id = data.get("message_id", "")
+            response = data.get("response", "")
+
+            if _pending.resolve(message_id, response):
+                log.info("Response resolved", extra={"message_id": message_id})
+            else:
+                log.warning("Response for unknown message", extra={"message_id": message_id})
+        except Exception:
+            log.exception("Error processing NATS response")
+
+
+async def _thought_listener():
+    """Subscribe to NATS for proactive thoughts and post to #maki-thoughts."""
+    sub = await _nc.subscribe(EARS_THOUGHT_OUT)
+    log.info("Subscribed", extra={"subject": EARS_THOUGHT_OUT})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            thought = data.get("thought", "")
+            turn_id = data.get("turn_id", "unknown")
+
+            if not thought:
+                continue
+
+            log.info("Thought received", extra={"turn_id": turn_id, "thought_len": len(thought)})
+
+            for channel_id in _thoughts_channel_ids:
+                channel = _bot.get_channel(channel_id)
+                if channel:
+                    await _send_response(channel, thought)
+                    log.info("Thought posted", extra={"channel": THOUGHTS_CHANNEL_NAME, "channel_id": channel_id})
+
+            if not _thoughts_channel_ids:
+                log.warning("No thoughts channel available, thought dropped", extra={"turn_id": turn_id})
+
+        except Exception:
+            log.exception("Error processing thought")
+
+
+async def _vitals_listener():
+    """Subscribe to NATS for health digests and post to #maki-vitals."""
+    sub = await _nc.subscribe(EARS_VITALS_OUT)
+    log.info("Subscribed", extra={"subject": EARS_VITALS_OUT})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            digest = data.get("digest", "")
+            if not digest:
+                continue
+
+            log.info("Health digest received", extra={"digest_len": len(digest)})
+            for channel_id in _vitals_channel_ids:
+                channel = _bot.get_channel(channel_id)
+                if channel:
+                    await _send_response(channel, digest)
+                    log.info("Digest posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
+
+            if not _vitals_channel_ids:
+                log.warning("No vitals channel available, digest dropped")
+        except Exception:
+            log.exception("Error processing vitals")
+
+
+async def _alert_listener():
+    """Subscribe to immune alerts and post to #maki-vitals."""
+    sub = await _nc.subscribe(IMMUNE_ALERT)
+    log.info("Subscribed", extra={"subject": IMMUNE_ALERT})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            alert = data.get("alert", "")
+            if not alert:
+                continue
+
+            alert_text = f"**ALERT** {alert}"
+            log.info("Alert received", extra={"alert_preview": alert[:100]})
+            for channel_id in _vitals_channel_ids:
+                channel = _bot.get_channel(channel_id)
+                if channel:
+                    await _send_response(channel, alert_text)
+                    log.info("Alert posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
+
+            if not _vitals_channel_ids:
+                log.warning("No vitals channel available, alert dropped")
+        except Exception:
+            log.exception("Error processing alert")
+
+
+async def _send_response(channel, text: str):
+    """Send a response to Discord, splitting if necessary."""
+    while text:
+        chunk = text[:2000]
+        if len(text) > 2000:
+            last_newline = chunk.rfind("\n")
+            if last_newline > 1000:
+                chunk = text[:last_newline]
+        await channel.send(chunk)
+        text = text[len(chunk) :]
+
+
+async def main():
+    global _nc
+
+    log.info("maki-ears starting", extra={"nats_url": NATS_URL})
+
+    _nc = await connect_nats(NATS_URL)
+
+    asyncio.create_task(_response_listener())
+    asyncio.create_task(_thought_listener())
+    asyncio.create_task(_vitals_listener())
+    asyncio.create_task(_alert_listener())
+
+    try:
+        await _bot.start(DISCORD_TOKEN)
+    finally:
+        await _nc.close()
+        log.info("NATS connection closed")
+
+
+def cli():
+    asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
