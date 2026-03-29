@@ -1,6 +1,7 @@
 """maki-cortex: The Thinker. Reasoning engine backed by Claude Agent SDK.
 
 Subscribes to turn requests via NATS, invokes Claude, publishes responses.
+Normal turns use streaming with MCP tools. Idle reflection stays single-shot.
 """
 
 import asyncio
@@ -10,7 +11,7 @@ import os
 import time
 
 from maki_common import configure_logging, connect_nats
-from maki_common.claude import invoke_claude
+from maki_common.claude import invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
@@ -20,6 +21,15 @@ log = logging.getLogger(__name__)
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "10"))
+RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
+
+HEALTH_ENDPOINTS = {
+    "recall": RECALL_URL,
+    "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
+    "stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
+    "cortex": f"http://localhost:{HEALTH_PORT}",
+}
 
 _semaphore = asyncio.Semaphore(1)
 
@@ -52,6 +62,18 @@ You can also adjust your own idle loop configuration by including tags like:
 ## Time context
 Last interaction with Adi: {hours_since}h ago
 Local time: {local_time}, {day_of_week}"""
+
+
+TOOLS_PROMPT = """## Available Tools
+
+You have MCP tools to investigate and interact with your own systems:
+- **search_memories** / **get_all_memories** / **add_memory** — search, read, or store memories
+- **get_system_health** — get detailed health from your immune system (restarts, failures, K8s state)
+- **check_component** — check a specific component's health endpoint
+- **get_config** / **update_config** — read or change your configuration
+
+Use these when you need to investigate something or when a user asks about your state.
+Don't use tools unnecessarily — if the answer is already in your context, just respond."""
 
 
 def build_system_prompt(turn: dict) -> str:
@@ -117,10 +139,14 @@ def build_system_prompt(turn: dict) -> str:
             conv_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation\n" + "\n".join(conv_lines))
 
+    # Add tools prompt for normal turns (not idle)
+    if turn.get("mode") != "idle_reflection":
+        parts.append(TOOLS_PROMPT)
+
     return "\n\n".join(parts)
 
 
-async def handle_turn_request(msg, nc):
+async def handle_turn_request(msg, nc, mcp_server):
     """Process a single turn request."""
     try:
         turn = json.loads(msg.data.decode())
@@ -140,16 +166,30 @@ async def handle_turn_request(msg, nc):
 
         system_prompt = build_system_prompt(turn)
         full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
-        response_text = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
 
-        response = {
-            "turn_id": turn_id,
-            "response": response_text,
-            "mission_proposals": [],
-        }
+        if is_idle:
+            # Idle reflection: single-shot, no tools
+            response_text = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
+            response = {"turn_id": turn_id, "response": response_text, "done": True}
+            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+            log.info("Idle turn response published", extra={"turn_id": turn_id})
+        else:
+            # Normal turn: streaming with tools
+            async with _semaphore:
+                async for chunk in stream_claude(
+                    full_prompt,
+                    model=MODEL,
+                    max_turns=MAX_TURNS,
+                    mcp_servers={"maki": mcp_server},
+                ):
+                    response = {"turn_id": turn_id, "response": chunk, "done": False}
+                    await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+                    log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
 
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
-        log.info("Turn response published", extra={"turn_id": turn_id})
+            # Signal done
+            done_msg = {"turn_id": turn_id, "response": "", "done": True}
+            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            log.info("Turn stream complete", extra={"turn_id": turn_id})
 
     except Exception:
         log.exception("Error handling turn request")
@@ -161,7 +201,7 @@ async def handle_turn_request(msg, nc):
         error_response = {
             "turn_id": turn_id,
             "response": "I encountered an error processing this turn. Please try again.",
-            "mission_proposals": [],
+            "done": True,
         }
         await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
 
@@ -184,9 +224,19 @@ async def heartbeat_loop(nc):
 
 
 async def main():
-    log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL})
+    log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS})
 
     nc = await connect_nats(NATS_URL)
+
+    # Create MCP tool server
+    from maki_common.tools import create_maki_tools
+
+    mcp_server = create_maki_tools(
+        nc=nc,
+        recall_url=RECALL_URL,
+        health_endpoints=HEALTH_ENDPOINTS,
+    )
+    log.info("MCP tools registered")
 
     sub = await nc.subscribe(CORTEX_TURN_REQUEST)
     log.info("Subscribed", extra={"subject": CORTEX_TURN_REQUEST})
@@ -197,7 +247,7 @@ async def main():
     await tcp_health_server(port=HEALTH_PORT)
 
     async for msg in sub.messages:
-        asyncio.create_task(handle_turn_request(msg, nc))
+        asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
 
 
 def cli():

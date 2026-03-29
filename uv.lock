@@ -1198,7 +1198,6 @@ source = { virtual = "." }
 
 [[package]]
 name = "maki-common"
-version = "0.0.1"
 source = { editable = "pkgs/maki-common" }
 dependencies = [
     { name = "nats-py" },
@@ -1234,7 +1233,6 @@ provides-extras = ["claude", "fastapi", "httpx", "k8s"]
 
 [[package]]
 name = "maki-cortex"
-version = "0.0.1"
 source = { editable = "pkgs/maki-cortex" }
 dependencies = [
     { name = "maki-common", extra = ["claude"] },
@@ -1245,7 +1243,6 @@ requires-dist = [{ name = "maki-common", extras = ["claude"], editable = "pkgs/m
 
 [[package]]
 name = "maki-ears"
-version = "0.0.1"
 source = { editable = "pkgs/maki-ears" }
 dependencies = [
     { name = "discord-py" },
@@ -1260,7 +1257,6 @@ requires-dist = [
 
 [[package]]
 name = "maki-immune"
-version = "0.0.1"
 source = { editable = "pkgs/maki-immune" }
 dependencies = [
     { name = "maki-common", extra = ["claude", "httpx", "k8s"] },
@@ -1271,7 +1267,6 @@ requires-dist = [{ name = "maki-common", extras = ["claude", "httpx", "k8s"], ed
 
 [[package]]
 name = "maki-recall"
-version = "0.0.1"
 source = { editable = "pkgs/maki-recall" }
 dependencies = [
     { name = "langchain-neo4j" },
@@ -1298,7 +1293,6 @@ requires-dist = [
 
 [[package]]
 name = "maki-stem"
-version = "0.0.1"
 source = { editable = "pkgs/maki-stem" }
 dependencies = [
     { name = "maki-common", extra = ["fastapi", "httpx"] },
@@ -1309,7 +1303,6 @@ requires-dist = [{ name = "maki-common", extras = ["fastapi", "httpx"], editable
 
 [[package]]
 name = "maki-synapse"
-version = "0.0.1"
 source = { editable = "pkgs/maki-synapse" }
 dependencies = [
     { name = "maki-common", extra = ["claude", "fastapi"] },

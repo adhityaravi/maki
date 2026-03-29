@@ -22,6 +22,7 @@ from maki_common.subjects import (
     EARS_VITALS_OUT,
     IMMUNE_ACTION,
     IMMUNE_ALERT,
+    IMMUNE_STATE_REQUEST,
 )
 
 configure_logging()
@@ -56,21 +57,46 @@ You are clinical, analytical, ops-focused. Not conversational.
 
 ## Your Role
 - Monitor system health holistically — look at the big picture, not just individual components
-- Detect root causes, not just symptoms
+- Investigate root causes using your tools — read logs, check events, describe pods
+- Take corrective action when needed — restart pods, scale or rollback deployments
 - Tune your own operational parameters based on system behavior
-- Report findings concisely
+- Report findings and actions concisely to Discord
 
 ## Current System State
 {system_state}
 
-## Recent Reflex Actions
+## Recent Actions
 {recent_actions}
 
 ## Your Current Config
 {config}
 
+## Available Tools
+
+### Investigation (read-only)
+- **list_pods** — list all pods with status, readiness, restarts, age
+- **describe_pod** (pod_name) — detailed pod info: conditions, container states, resources
+- **get_pod_logs** (pod_name, tail_lines) — read recent logs (default 100 lines)
+- **get_k8s_events** (involved_object) — K8s events, optionally filtered by object name
+- **get_deployment_status** (deployment_name) — replicas, conditions, image versions
+
+### Remediation (rate-limited, requires lock)
+- **restart_pod** (pod_name, reason) — delete pod so deployment recreates it
+- **scale_deployment** (deployment_name, replicas) — scale replicas (0-5)
+- **rollback_deployment** (deployment_name) — rolling restart to fresh instances
+
+### Self-Configuration
+- **get_config** — read your current configuration
+- **update_config** (key, value) — update a configuration value
+
+## Tool Guidelines
+- ALWAYS investigate before remediating — read logs and events first
+- Provide a clear reason when taking remediation actions
+- After acting, verify the result (e.g. list_pods again after a restart)
+- Don't use tools unnecessarily — if the answer is already in your context, just respond
+
 ## Self-Tuning
-You can adjust your own parameters by including tags in your response:
+You can also adjust your own parameters via tags in your response:
 [CONFIG:heartbeat_interval=900] — tighten patrol frequency (seconds)
 [CONFIG:health_check_interval=15] — tighten health checks (seconds)
 [CONFIG:reflex_restart_max=5] — allow more autonomous restarts per hour
@@ -83,12 +109,12 @@ You can adjust your own parameters by including tags in your response:
 Assess the system holistically. Consider:
 - Are all organs healthy as a system, not just individually?
 - Any cross-component correlations or cascading risks?
-- Resource trends — sustainable or heading toward issues?
+- If something is unhealthy, investigate with tools before concluding
 - If there was a recent incident, has the system stabilized?
 - Should you tighten or relax your monitoring intervals?
 
 Always include a [DIGEST:...] with a concise system status summary.
-Only include [ALERT:...] for genuinely urgent issues.
+Only include [ALERT:...] for genuinely urgent issues requiring human attention.
 Adjust config if the current intervals don't match the system's needs."""
 
 # Global state
@@ -97,6 +123,8 @@ _js = None
 _config_kv = None
 _lock_kv = None
 _k8s_v1 = None
+_k8s_apps_v1 = None
+_mcp_server = None
 _component_health: dict = {}
 _restart_history: dict[str, list[float]] = {}
 _recent_actions: list[dict] = []
@@ -309,7 +337,7 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
 
     if len(history) >= max_restarts:
         log.warning(
-            "Reflex limit reached",
+            "Reflex limit reached, escalating to Claude",
             extra={
                 "component": component,
                 "restarts": len(history),
@@ -317,7 +345,14 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
             },
         )
         await _publish_alert(
-            f"Reflex limit reached for {component}: {len(history)} restarts in last hour, not restarting again"
+            f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"
+        )
+        asyncio.create_task(
+            _escalate_to_claude(
+                component,
+                state,
+                f"Reflex restart limit reached ({len(history)}/{max_restarts} restarts in last hour)",
+            )
         )
         return
 
@@ -326,9 +361,12 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         return
 
     try:
-        _k8s_v1.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=10)
+        # Count the attempt before the delete — even if it fails (e.g. pod already gone),
+        # we want to hit the rate limit and escalate to Claude for investigation.
         history.append(now)
         _restart_history[component] = history
+
+        _k8s_v1.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=10)
 
         action = {
             "type": "reflex_restart",
@@ -376,7 +414,86 @@ async def _publish_vitals(digest: str):
     log.info("Vitals digest published", extra={"digest_len": len(digest)})
 
 
+# --- State Request Handler ---
+
+
+async def _state_request_handler(msg):
+    """Handle NATS request for full system state (from stem/cortex)."""
+    try:
+        lock_info = None
+        try:
+            entry = await _lock_kv.get("infrastructure")
+            lock_info = json.loads(entry.value.decode())
+        except Exception:
+            pass
+
+        state = {
+            "component_health": _component_health,
+            "recent_actions": _recent_actions[-10:],
+            "lock": lock_info,
+            "last_cortex_heartbeat": _last_cortex_heartbeat,
+            "last_incident_time": _last_incident_time,
+        }
+        await msg.respond(json.dumps(state).encode())
+        log.info("State request served", extra={"components": len(_component_health)})
+    except Exception:
+        log.exception("Failed to serve state request")
+        await msg.respond(b"{}")
+
+
 # --- Claude Reasoning ---
+
+MAX_CLAUDE_TURNS = int(os.environ.get("IMMUNE_MAX_TURNS", "8"))
+
+
+async def _escalate_to_claude(component: str, state: dict, reason: str):
+    """Escalate a problem to Claude for deeper investigation and remediation."""
+    log.info("Escalating to Claude", extra={"component": component, "reason": reason})
+
+    system_state = _build_system_state()
+    recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
+    config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
+    config_str = json.dumps(config, indent=2)
+
+    prompt = IMMUNE_SYSTEM_PROMPT.format(
+        system_state=system_state,
+        recent_actions=recent_actions_str,
+        config=config_str,
+    )
+    prompt += f"""
+
+## ESCALATION
+
+The fast reflex loop has escalated {component} to you because: {reason}
+
+Component details: {json.dumps(state, default=str)}
+
+Investigate this problem using your tools. Read logs, check events, examine the pod.
+Determine root cause and take corrective action if possible.
+Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...]."""
+
+    try:
+        response = await invoke_claude(
+            prompt,
+            model=MODEL,
+            semaphore=_semaphore,
+            max_turns=MAX_CLAUDE_TURNS,
+            mcp_servers={"maki-immune": _mcp_server},
+        )
+
+        config_updates = parse_config_tags(response)
+        await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
+
+        for digest in parse_tagged(response, "DIGEST"):
+            await _publish_vitals(digest)
+
+        for alert in parse_tagged(response, "ALERT"):
+            await _publish_alert(alert)
+
+        log.info("Claude escalation complete", extra={"component": component})
+
+    except Exception:
+        log.exception("Claude escalation failed", extra={"component": component})
 
 
 def _build_system_state() -> str:
@@ -431,7 +548,13 @@ async def _immune_heartbeat_loop():
                 config=config_str,
             )
 
-            response = await invoke_claude(prompt, model=MODEL, semaphore=_semaphore)
+            response = await invoke_claude(
+                prompt,
+                model=MODEL,
+                semaphore=_semaphore,
+                max_turns=MAX_CLAUDE_TURNS,
+                mcp_servers={"maki-immune": _mcp_server},
+            )
 
             config_updates = parse_config_tags(response)
             await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
@@ -452,7 +575,7 @@ async def _immune_heartbeat_loop():
 
 
 async def main():
-    global _nc, _js, _config_kv, _lock_kv, _k8s_v1
+    global _nc, _js, _config_kv, _lock_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
 
     log.info("maki-immune starting", extra={"nats_url": NATS_URL, "model": MODEL})
 
@@ -465,9 +588,33 @@ async def main():
     try:
         k8s_config.load_incluster_config()
         _k8s_v1 = k8s_client.CoreV1Api()
+        _k8s_apps_v1 = k8s_client.AppsV1Api()
         log.info("K8s client initialized (in-cluster)")
     except Exception:
         log.warning("K8s in-cluster config not available, pod operations disabled")
+
+    # Create MCP tool server for Claude
+    from maki_common.tools import create_immune_tools
+
+    async def _config_getter():
+        return await load_kv_config(_config_kv, DEFAULT_CONFIG)
+
+    _mcp_server = create_immune_tools(
+        k8s_v1=_k8s_v1,
+        k8s_apps_v1=_k8s_apps_v1,
+        namespace=NAMESPACE,
+        nc=_nc,
+        acquire_lock=_acquire_lock,
+        release_lock=_release_lock,
+        restart_history=_restart_history,
+        recent_actions=_recent_actions,
+        config_getter=_config_getter,
+        config_kv=_config_kv,
+    )
+    log.info("Immune MCP tools registered")
+
+    await _nc.subscribe(IMMUNE_STATE_REQUEST, cb=_state_request_handler)
+    log.info("Subscribed", extra={"subject": IMMUNE_STATE_REQUEST})
 
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_immune_heartbeat_loop())

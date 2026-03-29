@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 import httpx
 from fastapi import FastAPI, HTTPException
 from maki_common import (
-    PendingFutures,
+    PendingQueues,
     configure_logging,
     connect_nats,
     init_kv,
@@ -31,6 +31,7 @@ from maki_common.subjects import (
     EARS_MESSAGE_IN,
     EARS_MESSAGE_OUT,
     EARS_THOUGHT_OUT,
+    IMMUNE_STATE_REQUEST,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
@@ -86,7 +87,7 @@ _nc = None
 _kv = None
 _js = None
 _config_kv = None
-_pending = PendingFutures()
+_pending = PendingQueues()
 _conversation_history: list[dict] = []
 _last_activity: float = time.time()
 _thoughts_today: int = 0
@@ -94,15 +95,18 @@ _thoughts_today_date: str = ""
 
 
 async def _response_listener():
-    """Listen for cortex responses and resolve pending futures."""
+    """Listen for cortex responses and push chunks into pending queues."""
     sub = await _nc.subscribe(CORTEX_TURN_RESPONSE)
     log.info("Subscribed", extra={"subject": CORTEX_TURN_RESPONSE})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
             turn_id = data.get("turn_id")
-            if turn_id and _pending.resolve(turn_id, data):
-                log.info("Response received", extra={"turn_id": turn_id})
+            if turn_id and _pending.push(turn_id, data):
+                log.info(
+                    "Response chunk pushed",
+                    extra={"turn_id": turn_id, "done": data.get("done", False)},
+                )
             else:
                 log.warning("Response for unknown turn", extra={"turn_id": turn_id})
         except Exception:
@@ -251,12 +255,31 @@ async def _feed_memories(user_message: str, cortex_response: str):
 
 
 async def _gather_system_state() -> dict:
-    """Gather infrastructure state for cortex self-awareness."""
+    """Gather infrastructure state for cortex self-awareness.
+
+    Requests rich data from maki-immune via NATS request/reply,
+    falling back to basic HTTP health checks.
+    """
     state = {
         "nats": {"connected": _nc.is_connected if _nc else False},
         "conversation_stream": {"total_turns": len(_conversation_history)},
     }
 
+    # Try to get rich state from immune via NATS request/reply
+    try:
+        resp = await _nc.request(IMMUNE_STATE_REQUEST, b"", timeout=2.0)
+        immune_data = json.loads(resp.data.decode())
+        # Merge immune's rich component health into state
+        for name, info in immune_data.get("component_health", {}).items():
+            state[name] = info
+        if immune_data.get("recent_actions"):
+            state["recent_reflex_actions"] = {"count": len(immune_data["recent_actions"])}
+        log.info("Rich system state from immune", extra={"components": len(state)})
+        return state
+    except Exception:
+        log.info("Immune state unavailable, falling back to HTTP checks")
+
+    # Fallback: basic HTTP health checks
     async with httpx.AsyncClient(timeout=2.0) as client:
         for name, url in HEALTH_ENDPOINTS.items():
             try:
@@ -359,13 +382,14 @@ async def _idle_loop():
                 },
             }
 
-            future = _pending.create(turn_id)
+            queue = _pending.create(turn_id)
 
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
                 log.info("Idle turn published", extra={"turn_id": turn_id})
 
-                response_data = await asyncio.wait_for(future, timeout=TURN_TIMEOUT)
+                # Idle reflection is single-shot — one response with done=True
+                response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
                 thought = response_data.get("response", "")
 
                 config_updates = parse_config_tags(thought or "")
@@ -442,8 +466,16 @@ class TurnResponse(BaseModel):
     response: str
 
 
-async def _process_turn(message: str) -> tuple[str, str]:
-    """Core turn logic. Returns (turn_id, response_text)."""
+async def _process_turn(
+    message: str,
+    *,
+    forward_to: dict | None = None,
+) -> tuple[str, str]:
+    """Core turn logic with streaming. Returns (turn_id, full_response_text).
+
+    If forward_to is provided (dict with message_id, channel_id),
+    streams each chunk to EARS_MESSAGE_OUT as it arrives from cortex.
+    """
     global _last_activity
     _last_activity = time.time()
 
@@ -470,15 +502,42 @@ async def _process_turn(message: str) -> tuple[str, str]:
         "mission_results": None,
     }
 
-    future = _pending.create(turn_id)
+    queue = _pending.create(turn_id)
 
     try:
         await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(turn_payload).encode())
         log.info("Turn request published", extra={"turn_id": turn_id})
 
-        response_data = await asyncio.wait_for(future, timeout=TURN_TIMEOUT)
-        response_text = response_data["response"]
-        log.info("Turn complete", extra={"turn_id": turn_id})
+        chunks = []
+        while True:
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
+            except TimeoutError:
+                log.error("Turn timed out", extra={"turn_id": turn_id})
+                raise
+
+            chunk_text = data.get("response", "")
+            done = data.get("done", False)
+
+            if chunk_text:
+                chunks.append(chunk_text)
+
+            # Forward chunk to ears if streaming to Discord
+            if forward_to and (chunk_text or done):
+                ears_msg = {
+                    "message_id": forward_to["message_id"],
+                    "channel_id": forward_to["channel_id"],
+                    "turn_id": turn_id,
+                    "response": chunk_text,
+                    "done": done,
+                }
+                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(ears_msg).encode())
+
+            if done:
+                break
+
+        response_text = "".join(chunks)
+        log.info("Turn complete", extra={"turn_id": turn_id, "chunks": len(chunks)})
 
         await _publish_turn_to_stream(
             turn_id=turn_id,
@@ -491,7 +550,6 @@ async def _process_turn(message: str) -> tuple[str, str]:
         return turn_id, response_text
 
     except TimeoutError:
-        log.error("Turn timed out", extra={"turn_id": turn_id})
         raise
     except Exception:
         log.exception("Turn failed", extra={"turn_id": turn_id})
@@ -501,7 +559,7 @@ async def _process_turn(message: str) -> tuple[str, str]:
 
 
 async def _ears_listener():
-    """Listen for incoming Discord messages via NATS and process turns."""
+    """Listen for incoming Discord messages via NATS and stream responses to ears."""
     sub = await _nc.subscribe(EARS_MESSAGE_IN)
     log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
     async for msg in sub.messages:
@@ -514,24 +572,20 @@ async def _ears_listener():
 
             log.info("Discord message", extra={"username": username, "content_len": len(content)})
 
-            turn_id, response_text = await _process_turn(content)
-
-            response = {
-                "message_id": message_id,
-                "channel_id": channel_id,
-                "turn_id": turn_id,
-                "response": response_text,
-            }
-            await _nc.publish(EARS_MESSAGE_OUT, json.dumps(response).encode())
-            log.info("Response published to ears", extra={"turn_id": turn_id})
+            # _process_turn streams chunks to EARS_MESSAGE_OUT via forward_to
+            await _process_turn(
+                content,
+                forward_to={"message_id": message_id, "channel_id": channel_id},
+            )
 
         except TimeoutError:
-            response = {
+            error_msg = {
                 "message_id": data.get("message_id", ""),
                 "channel_id": data.get("channel_id", ""),
                 "response": "Sorry, I took too long thinking about that. Try again?",
+                "done": True,
             }
-            await _nc.publish(EARS_MESSAGE_OUT, json.dumps(response).encode())
+            await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
         except Exception:
             log.exception("Error processing Discord message")
 

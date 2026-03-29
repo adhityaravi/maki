@@ -10,7 +10,7 @@ import logging
 import os
 
 import discord
-from maki_common import PendingFutures, configure_logging, connect_nats
+from maki_common import PendingQueues, configure_logging, connect_nats
 from maki_common.subjects import (
     EARS_MESSAGE_IN,
     EARS_MESSAGE_OUT,
@@ -30,7 +30,7 @@ THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-thoughts")
 VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-vitals")
 
 _nc = None
-_pending = PendingFutures()
+_pending = PendingQueues()
 _general_channel_ids: set[int] = set()
 _thoughts_channel_ids: set[int] = set()
 _vitals_channel_ids: set[int] = set()
@@ -136,30 +136,53 @@ async def on_message(message: discord.Message):
         await message.channel.send("Sorry, I couldn't process that right now.")
         return
 
-    async with message.channel.typing():
-        future = _pending.create(str(message.id))
-        try:
-            response_text = await asyncio.wait_for(future, timeout=150.0)
-        except TimeoutError:
-            response_text = "Sorry, I took too long thinking about that. Try again?"
-        finally:
-            _pending.remove(str(message.id))
+    thinking_emoji = "\U0001f363"  # 🍣
+    await message.add_reaction(thinking_emoji)
 
-    await _send_response(message.channel, response_text)
+    queue = _pending.create(str(message.id))
+    try:
+        async with message.channel.typing():
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=150.0)
+                except TimeoutError:
+                    await message.channel.send("Sorry, I took too long thinking about that. Try again?")
+                    break
+
+                # Skip reaction messages from cortex
+                if "reaction" in data:
+                    continue
+
+                chunk = data.get("response", "")
+                done = data.get("done", False)
+
+                if chunk:
+                    await _send_response(message.channel, chunk)
+
+                if done:
+                    break
+    finally:
+        _pending.remove(str(message.id))
+        try:
+            await message.remove_reaction(thinking_emoji, _bot.user)
+        except Exception:
+            pass
 
 
 async def _response_listener():
-    """Subscribe to NATS for outgoing responses and resolve pending futures."""
+    """Subscribe to NATS for outgoing responses and push chunks into queues."""
     sub = await _nc.subscribe(EARS_MESSAGE_OUT)
     log.info("Subscribed", extra={"subject": EARS_MESSAGE_OUT})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
             message_id = data.get("message_id", "")
-            response = data.get("response", "")
 
-            if _pending.resolve(message_id, response):
-                log.info("Response resolved", extra={"message_id": message_id})
+            if _pending.push(message_id, data):
+                log.info(
+                    "Response chunk pushed",
+                    extra={"message_id": message_id, "done": data.get("done", False)},
+                )
             else:
                 log.warning("Response for unknown message", extra={"message_id": message_id})
         except Exception:
