@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
-TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "120"))
+TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
 KV_BUCKET = "maki-identity"
 KV_KEY = "identity"

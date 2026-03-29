@@ -22,7 +22,7 @@ NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
-MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "10"))
+MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "100"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
 # GitHub App config (optional — enables self-evolution tools)

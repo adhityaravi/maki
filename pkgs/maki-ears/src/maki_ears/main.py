@@ -164,7 +164,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             while True:
                 try:
-                    data = await asyncio.wait_for(queue.get(), timeout=150.0)
+                    data = await asyncio.wait_for(queue.get(), timeout=1860.0)
                 except TimeoutError:
                     await message.channel.send("Sorry, I took too long thinking about that. Try again?")
                     break
