@@ -6,10 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY pyproject.toml /build/pyproject.toml
 COPY pkgs/maki-common /build/pkgs/maki-common
 COPY pkgs/maki-recall /build/pkgs/maki-recall
-RUN cd /build && uv pip install --system ./pkgs/maki-common ./pkgs/maki-recall \
+RUN find /build/pkgs -name pyproject.toml -exec sed -i '/\[tool\.uv\.sources\]/,/^$/d' {} + \
+    && uv pip install --system /build/pkgs/maki-common /build/pkgs/maki-recall \
     && rm -rf /build
 
 RUN apt-get purge -y gcc libc6-dev && apt-get autoremove -y
