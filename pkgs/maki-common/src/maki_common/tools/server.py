@@ -64,6 +64,7 @@ def create_immune_tools(
     recent_actions: list,
     config_getter: Any,
     config_kv: Any | None = None,
+    recall_url: str | None = None,
 ) -> Any:
     """Create an in-process MCP server with immune-specific tools.
 
@@ -78,6 +79,7 @@ def create_immune_tools(
         recent_actions: Mutable list of recent actions.
         config_getter: Async callable returning current config dict.
         config_kv: NATS KV store for config (optional).
+        recall_url: Base URL for maki-recall API (optional, enables memory tools).
     """
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -97,6 +99,11 @@ def create_immune_tools(
             config_getter,
         )
     )
+
+    if recall_url:
+        from maki_common.tools.recall import make_recall_tools
+
+        all_tools.extend(make_recall_tools(recall_url))
 
     if config_kv is not None:
         from maki_common.tools.config import make_config_tools

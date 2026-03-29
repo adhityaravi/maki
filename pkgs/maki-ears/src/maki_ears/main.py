@@ -23,6 +23,7 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
@@ -283,7 +284,7 @@ async def main():
 
     log.info("maki-ears starting", extra={"nats_url": NATS_URL})
 
-    _nc = await connect_nats(NATS_URL)
+    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
 
     asyncio.create_task(_response_listener())
     asyncio.create_task(_thought_listener())

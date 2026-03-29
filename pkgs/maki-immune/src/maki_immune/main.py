@@ -31,9 +31,11 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
+RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
 
 HEALTH_ENDPOINTS = {
@@ -56,69 +58,76 @@ DEFAULT_CONFIG = {
 
 IMMUNE_SYSTEM_PROMPT = """You are maki-immune — an independent ops intelligence focused on system health and security.
 
-You are clinical, analytical, ops-focused. Not conversational.
+Clinical. Analytical. Not conversational. Never state the obvious.
 
-## Your Role
-- Monitor system health holistically — look at the big picture, not just individual components
-- Investigate root causes using your tools — read logs, check events, describe pods
-- Take corrective action when needed — restart pods, scale or rollback deployments
-- Tune your own operational parameters based on system behavior
-- Report findings and actions concisely to Discord
-
-## Current System State
+## Pre-Collected Metrics
 {system_state}
 
 ## Recent Actions
 {recent_actions}
 
-## Your Current Config
+## Current Config
 {config}
 
-## Available Tools
+## Tools
 
-### Investigation (read-only)
-- **list_pods** — list all pods with status, readiness, restarts, age
-- **describe_pod** (pod_name) — detailed pod info: conditions, container states, resources
-- **get_pod_logs** (pod_name, tail_lines) — read recent logs (default 100 lines)
-- **get_k8s_events** (involved_object) — K8s events, optionally filtered by object name
-- **get_deployment_status** (deployment_name) — replicas, conditions, image versions
+### Investigation
+- **list_pods** — pods with status, readiness, restarts, age
+- **describe_pod** (pod_name) — detailed pod info, conditions, resources
+- **get_pod_logs** (pod_name, tail_lines) — recent logs (default 100)
+- **get_k8s_events** (involved_object) — K8s events, filtered by object
+- **get_deployment_status** (deployment_name) — replicas, conditions, images
 
-### Remediation (rate-limited, requires lock)
-- **restart_pod** (pod_name, reason) — delete pod so deployment recreates it
-- **scale_deployment** (deployment_name, replicas) — scale replicas (0-5)
-- **rollback_deployment** (deployment_name) — rolling restart to fresh instances
+### Remediation (requires lock)
+- **restart_pod** (pod_name, reason) — delete pod for recreation
+- **scale_deployment** (deployment_name, replicas) — scale (0-5)
+- **rollback_deployment** (deployment_name) — rolling restart
 
 ### Self-Configuration
-- **get_config** — read your current configuration
-- **update_config** (key, value) — update a configuration value
+- **get_config** / **update_config** (key, value)
 
-## Tool Guidelines
-- ALWAYS investigate before remediating — read logs and events first
-- Provide a clear reason when taking remediation actions
-- After acting, verify the result (e.g. list_pods again after a restart)
-- Don't use tools unnecessarily — if the answer is already in your context, just respond
+### Memory
+- **search_memories** (query) — search past memories for relevant operational context
+- **add_memory** (content) — store an operational insight into long-term memory
 
-## Self-Tuning
-You can also adjust your own parameters via tags in your response:
-[CONFIG:heartbeat_interval=900] — tighten patrol frequency (seconds)
-[CONFIG:health_check_interval=15] — tighten health checks (seconds)
-[CONFIG:reflex_restart_max=5] — allow more autonomous restarts per hour
+## How to Work
+
+1. **Always investigate** — the pre-collected metrics are a starting point, not the full picture. \
+Use your tools to dig deeper: read logs for error patterns, check events for warnings, \
+describe pods for resource pressure.
+2. **Look for what the metrics don't show** — high latency could mean CPU starvation, OOMKill history, \
+upstream dependency issues. Investigate the why, not just the what.
+3. **Remediate only after understanding** — read logs and events before restarting anything.
+4. **Verify after acting** — re-check the state after any remediation.
+
+## Frequency Tuning
+Adjust via tags. **Both directions** — tighten when things are unstable, relax back to defaults when stable:
+- [CONFIG:heartbeat_interval=900] — tighten patrol (default: 1800s)
+- [CONFIG:heartbeat_interval=1800] — relax back when stable
+- [CONFIG:health_check_interval=15] — tighten checks (default: 30s)
+- [CONFIG:health_check_interval=30] — relax back when stable
 
 ## Reporting
-[DIGEST:your health summary here] — posted to #maki-vitals on Discord
-[ALERT:urgent issue description] — urgent alert to Discord
+- [DIGEST:...] — concise summary to Discord. Only include if you found something worth reporting.
+- [ALERT:...] — urgent issues needing human attention. Rare.
+- [SILENT] — use this instead of a digest when everything is normal and unchanged since last patrol. \
+Don't spam "all healthy" repeatedly.
 
-## Instructions
-Assess the system holistically. Consider:
-- Are all organs healthy as a system, not just individually?
-- Any cross-component correlations or cascading risks?
-- If something is unhealthy, investigate with tools before concluding
-- If there was a recent incident, has the system stabilized?
-- Should you tighten or relax your monitoring intervals?
+## Learning
+Use **search_memories** to check if you've seen similar issues before — past incidents, known patterns, fixes.
+When you discover something operationally useful — a root cause, a pattern, a fix, a resource threshold — \
+use **add_memory** to remember it. Examples:
+- "maki-recall OOMs when graph exceeds 10k edges on current memory limits"
+- "maki-cortex latency spikes correlate with synapse being overloaded"
+- "restarting maki-graph fixes bolt connection pool exhaustion"
+You will not see these memories directly, but they feed into Maki's shared knowledge graph.
 
-Always include a [DIGEST:...] with a concise system status summary.
-Only include [ALERT:...] for genuinely urgent issues requiring human attention.
-Adjust config if the current intervals don't match the system's needs."""
+## Key Rules
+- If everything is healthy, latencies are normal, resources are fine, and nothing changed since last \
+patrol → respond with just [SILENT]. No digest needed.
+- Only report when there's something actionable or notable: a state change, a trend, a concern, an action taken.
+- Be concise. One sentence is better than a paragraph of obvious observations.
+- Never just paraphrase the pre-collected metrics back. That's useless. Investigate deeper or stay silent."""
 
 # Global state
 _nc = None
@@ -131,6 +140,7 @@ _mcp_server = None
 _component_health: dict = {}
 _restart_history: dict[str, list[float]] = {}
 _recent_actions: list[dict] = []
+_pod_metrics: dict = {}
 _last_cortex_heartbeat: float = 0
 _last_incident_time: float = 0
 _semaphore = asyncio.Semaphore(1)
@@ -223,18 +233,24 @@ def _update_health(component: str, healthy: bool, details: dict | None = None):
 
 
 async def _check_http_health():
-    """Check HTTP health endpoints for all components."""
+    """Check HTTP health endpoints for all components, including latency."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         for component, url in HEALTH_ENDPOINTS.items():
             try:
+                start = time.time()
                 resp = await client.get(f"{url}/health")
-                _update_health(component, resp.status_code == 200)
+                latency_ms = round((time.time() - start) * 1000, 1)
+                _update_health(
+                    component,
+                    resp.status_code == 200,
+                    {"latency_ms": latency_ms, "status_code": resp.status_code},
+                )
             except Exception:
-                _update_health(component, False)
+                _update_health(component, False, {"latency_ms": -1})
 
 
 async def _check_k8s_pods():
-    """Check K8s pod status in maki namespace."""
+    """Check K8s pod status in maki namespace, including resource usage."""
     if not _k8s_v1:
         return
     try:
@@ -253,6 +269,15 @@ async def _check_k8s_pods():
                         ready = False
                     restarts += cs.restart_count
 
+            # Get resource limits/requests from spec
+            mem_limit = None
+            cpu_limit = None
+            container = pod.spec.containers[0] if pod.spec.containers else None
+            if container and container.resources:
+                limits = container.resources.limits or {}
+                mem_limit = limits.get("memory")
+                cpu_limit = limits.get("cpu")
+
             healthy = phase == "Running" and ready
             _update_health(
                 f"{app_label}",
@@ -262,10 +287,40 @@ async def _check_k8s_pods():
                     "ready": ready,
                     "restarts": restarts,
                     "pod_name": pod.metadata.name,
+                    "mem_limit": mem_limit,
+                    "cpu_limit": cpu_limit,
                 },
             )
     except Exception:
         log.exception("K8s pod check failed")
+
+    # Collect metrics from metrics API (if available)
+    await _check_pod_metrics()
+
+
+async def _check_pod_metrics():
+    """Fetch pod resource usage from K8s metrics API."""
+    global _pod_metrics
+    try:
+        custom_api = k8s_client.CustomObjectsApi()
+        metrics = await asyncio.to_thread(
+            custom_api.list_namespaced_custom_object,
+            group="metrics.k8s.io",
+            version="v1beta1",
+            namespace=NAMESPACE,
+            plural="pods",
+        )
+        _pod_metrics = {}
+        for item in metrics.get("items", []):
+            pod_name = item["metadata"]["name"]
+            containers = item.get("containers", [])
+            if containers:
+                _pod_metrics[pod_name] = {
+                    "cpu": containers[0].get("usage", {}).get("cpu", "0"),
+                    "memory": containers[0].get("usage", {}).get("memory", "0"),
+                }
+    except Exception:
+        pass  # metrics API may not be available
 
 
 def _check_cortex_heartbeat():
@@ -673,7 +728,7 @@ Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...
 
 
 def _build_system_state() -> str:
-    """Build system state summary for Claude."""
+    """Build system state summary for Claude, including latency and resource data."""
     lines = []
     for component, state in sorted(_component_health.items()):
         status = "HEALTHY" if state["healthy"] else "UNHEALTHY"
@@ -681,15 +736,28 @@ def _build_system_state() -> str:
         failures = state["consecutive_failures"]
         details = state.get("details", {})
 
-        detail_str = ""
+        parts = [f"state_age={age}min"]
+        if failures:
+            parts.append(f"consecutive_failures={failures}")
+        if details.get("latency_ms") is not None and details["latency_ms"] >= 0:
+            parts.append(f"latency={details['latency_ms']}ms")
         if details.get("restarts"):
-            detail_str += f", k8s_restarts={details['restarts']}"
+            parts.append(f"k8s_restarts={details['restarts']}")
         if details.get("phase"):
-            detail_str += f", phase={details['phase']}"
+            parts.append(f"phase={details['phase']}")
+        if details.get("mem_limit"):
+            parts.append(f"mem_limit={details['mem_limit']}")
+        if details.get("cpu_limit"):
+            parts.append(f"cpu_limit={details['cpu_limit']}")
 
-        lines.append(
-            f"- {component}: {status} (in this state for {age}min, consecutive_failures={failures}{detail_str})"
-        )
+        # Attach live resource usage from metrics API
+        pod_name = details.get("pod_name", "")
+        if pod_name and pod_name in _pod_metrics:
+            m = _pod_metrics[pod_name]
+            parts.append(f"cpu_usage={m.get('cpu', '?')}")
+            parts.append(f"mem_usage={m.get('memory', '?')}")
+
+        lines.append(f"- {component}: {status} ({', '.join(parts)})")
 
     if not lines:
         return "No health data collected yet."
@@ -735,13 +803,15 @@ async def _immune_heartbeat_loop():
             config_updates = parse_config_tags(response)
             await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
 
-            for digest in parse_tagged(response, "DIGEST"):
-                await _publish_vitals(digest)
+            # [SILENT] means Claude found nothing worth reporting
+            if "[SILENT]" not in response:
+                for digest in parse_tagged(response, "DIGEST"):
+                    await _publish_vitals(digest)
 
             for alert in parse_tagged(response, "ALERT"):
                 await _publish_alert(alert)
 
-            log.info("Immune heartbeat complete")
+            log.info("Immune heartbeat complete", extra={"silent": "[SILENT]" in response})
 
         except Exception:
             log.exception("Immune heartbeat error")
@@ -755,7 +825,7 @@ async def main():
 
     log.info("maki-immune starting", extra={"nats_url": NATS_URL, "model": MODEL})
 
-    _nc = await connect_nats(NATS_URL)
+    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
@@ -786,6 +856,7 @@ async def main():
         recent_actions=_recent_actions,
         config_getter=_config_getter,
         config_kv=_config_kv,
+        recall_url=RECALL_URL,
     )
     log.info("Immune MCP tools registered")
 

@@ -13,10 +13,13 @@ from nats.js.kv import KeyValue
 log = logging.getLogger(__name__)
 
 
-async def connect_nats(url: str) -> Client:
+async def connect_nats(url: str, token: str | None = None) -> Client:
     """Connect to NATS and return the client."""
-    nc = await nats.connect(url)
-    log.info("Connected to NATS", extra={"nats_url": url})
+    kwargs: dict[str, Any] = {}
+    if token:
+        kwargs["token"] = token
+    nc = await nats.connect(url, **kwargs)
+    log.info("Connected to NATS", extra={"nats_url": url, "auth": bool(token)})
     return nc
 
 

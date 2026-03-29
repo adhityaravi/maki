@@ -21,5 +21,8 @@ IMMUNE_STATE_REQUEST = "maki.immune.state"
 DEPLOY_REQUEST = "maki.deploy.request"
 DEPLOY_STATUS_REQUEST = "maki.deploy.status"
 
+# Memory
+MEMORY_STORE = "maki.memory.store"
+
 # Conversation stream
 CONVERSATION_STREAM = "maki.conversation"

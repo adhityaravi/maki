@@ -84,6 +84,11 @@ spec:
           env:
             - name: NATS_URL
               value: "nats://maki-nerve-nats:4222"
+            - name: NATS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: maki-nats-auth
+                  key: token
             - name: CLAUDE_CODE_OAUTH_TOKEN
               valueFrom:
                 secretKeyRef:

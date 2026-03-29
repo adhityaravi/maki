@@ -32,6 +32,7 @@ from maki_common.subjects import (
     EARS_MESSAGE_OUT,
     EARS_THOUGHT_OUT,
     IMMUNE_STATE_REQUEST,
+    MEMORY_STORE,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
@@ -40,6 +41,7 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "120"))
 
 KV_BUCKET = "maki-identity"
@@ -438,7 +440,7 @@ async def lifespan(app: FastAPI):
     global _nc, _js, _config_kv
     log.info("maki-stem starting", extra={"nats_url": NATS_URL})
 
-    _nc = await connect_nats(NATS_URL)
+    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
     await _seed_identity()
@@ -446,6 +448,7 @@ async def lifespan(app: FastAPI):
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CORTEX_CONFIG)
     asyncio.create_task(_response_listener())
     asyncio.create_task(_ears_listener())
+    asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_idle_loop())
 
     yield
@@ -556,6 +559,42 @@ async def _process_turn(
         raise
     finally:
         _pending.remove(turn_id)
+
+
+async def _memory_store_listener():
+    """Listen for memory store requests from any component via NATS.
+
+    Any component can publish to MEMORY_STORE with:
+    {"content": "...", "user_id": "...", "metadata": {...}}
+    Stem forwards to recall's REST API.
+    """
+    sub = await _nc.subscribe(MEMORY_STORE)
+    log.info("Subscribed", extra={"subject": MEMORY_STORE})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            content = data.get("content", "")
+            source = data.get("source", "unknown")
+            user_id = data.get("user_id", MEMORY_USER_ID)
+            metadata = data.get("metadata")
+
+            if not content:
+                continue
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                payload = {
+                    "messages": [{"role": "assistant", "content": content}],
+                    "user_id": user_id,
+                }
+                if metadata:
+                    payload["metadata"] = metadata
+
+                resp = await client.post(f"{RECALL_URL}/memories", json=payload)
+                resp.raise_for_status()
+                log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content)})
+
+        except Exception:
+            log.exception("Error processing memory store request")
 
 
 async def _ears_listener():

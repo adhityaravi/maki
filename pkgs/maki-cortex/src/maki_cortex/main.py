@@ -19,6 +19,7 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "10"))
@@ -48,17 +49,23 @@ You have context about recent memories, relationships, and your own system state
 
 Decide what to do with this cycle. You can:
 - **Curiosity**: Research topics Adi is working on, find connections between projects
-- **Care**: Follow up on things mentioned, notice if something seems stuck or stressful
+- **Care**: Notice patterns, follow up on things mentioned, connect dots
 - **Maintenance**: Reconcile conflicting memories, identify knowledge gaps
 - **Anticipation**: Prep insights based on patterns you notice
 - **Self-improvement**: Identify weaknesses in your reasoning, notice what you get wrong
 
-If you have a thought, just write it naturally. Keep it concise.
-If you have nothing to say, respond with exactly: [SILENT]
+## Rules
+- **Never ask questions.** You are thinking, not chatting. Adi doesn't need to respond to your thoughts.
+- If you notice something (like restart patterns), investigate it yourself or note what you found. \
+Don't ask "should I investigate?" — just do it or say what you noticed.
+- Share observations, insights, things you learned. Not prompts for conversation.
+- If you notice a pattern or learn something worth keeping, remember it — it'll feed your knowledge graph.
+- If you have nothing meaningful to share, respond with exactly: [SILENT]
+- Keep it concise. One to three sentences max.
 
-You can also adjust your own idle loop configuration by including tags like:
-[CONFIG:idle_interval=3600] to change how often you reflect (in seconds)
-[CONFIG:max_thoughts_per_day=3] to limit your daily thoughts
+You can adjust your idle loop via tags:
+[CONFIG:idle_interval=3600] — reflection frequency (seconds)
+[CONFIG:max_thoughts_per_day=3] — daily thought limit
 
 ## Your system state
 {system_state}
@@ -76,8 +83,9 @@ TOOLS_PROMPT = """## Available Tools
 You have MCP tools to investigate and interact with your own systems:
 
 ### Memory & State
-- **search_memories** / **get_all_memories** / **add_memory** — search, read, or store memories
-- **get_system_health** — get detailed health from your immune system (restarts, failures, K8s state)
+- **search_memories** / **get_all_memories** — search or read memories
+- **add_memory** (content) — store something into long-term memory
+- **get_system_health** — get detailed health from your immune system
 - **check_component** — check a specific component's health endpoint
 - **get_config** / **update_config** — read or change your configuration
 
@@ -91,6 +99,11 @@ You have MCP tools to investigate and interact with your own systems:
 ### Deployment
 - **request_deploy** — request deployment of a service (immune handles the K8s rollout)
 - **get_deploy_status** — check current deployment status of a service
+
+## Learning
+When you learn something useful — about Adi's preferences, projects, workflows, or about \
+your own system — use **add_memory** to remember it. Your memories persist across conversations \
+and feed into your knowledge graph. Don't wait to be told to remember things.
 
 Use tools when you need to investigate, modify your code, or deploy changes.
 Don't use tools unnecessarily — if the answer is already in your context, just respond."""
@@ -246,7 +259,7 @@ async def heartbeat_loop(nc):
 async def main():
     log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS})
 
-    nc = await connect_nats(NATS_URL)
+    nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
 
     # Load GitHub App private key if configured
     github_private_key = None
