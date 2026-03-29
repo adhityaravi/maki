@@ -39,7 +39,7 @@ def make_recall_tools(recall_url: str) -> list[tuple[str, str, dict[str, type], 
     async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
         content = args.get("content", "")
         log.info("Tool: add_memory", extra={"content_len": len(content)})
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{recall_url}/memories",
                 json={

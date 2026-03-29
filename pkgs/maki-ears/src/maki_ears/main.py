@@ -14,6 +14,7 @@ from maki_common import PendingQueues, configure_logging, connect_nats
 from maki_common.subjects import (
     EARS_MESSAGE_IN,
     EARS_MESSAGE_OUT,
+    EARS_REMINDER_OUT,
     EARS_THOUGHT_OUT,
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
@@ -29,12 +30,14 @@ GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
 THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-thoughts")
 VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-vitals")
+REMINDERS_CHANNEL_NAME = os.environ.get("REMINDERS_CHANNEL_NAME", "maki-reminders")
 
 _nc = None
 _pending = PendingQueues()
 _general_channel_ids: set[int] = set()
 _thoughts_channel_ids: set[int] = set()
 _vitals_channel_ids: set[int] = set()
+_reminders_channel_ids: set[int] = set()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -92,6 +95,22 @@ async def on_ready():
 
     if not _vitals_channel_ids:
         log.warning("No vitals channel found", extra={"channel_name": VITALS_CHANNEL_NAME})
+
+    for guild in _bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name == REMINDERS_CHANNEL_NAME:
+                _reminders_channel_ids.add(channel.id)
+                log.info(
+                    "Reminders channel found",
+                    extra={
+                        "channel": channel.name,
+                        "guild": guild.name,
+                        "channel_id": channel.id,
+                    },
+                )
+
+    if not _reminders_channel_ids:
+        log.warning("No reminders channel found", extra={"channel_name": REMINDERS_CHANNEL_NAME})
 
 
 @_bot.event
@@ -267,6 +286,37 @@ async def _alert_listener():
             log.exception("Error processing alert")
 
 
+async def _reminder_listener():
+    """Subscribe to NATS for care reminders and post to #maki-reminders."""
+    sub = await _nc.subscribe(EARS_REMINDER_OUT)
+    log.info("Subscribed", extra={"subject": EARS_REMINDER_OUT})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            reminder = data.get("reminder", "")
+            turn_id = data.get("turn_id", "unknown")
+
+            if not reminder:
+                continue
+
+            log.info("Reminder received", extra={"turn_id": turn_id, "reminder_len": len(reminder)})
+
+            for channel_id in _reminders_channel_ids:
+                channel = _bot.get_channel(channel_id)
+                if channel:
+                    await _send_response(channel, reminder)
+                    log.info(
+                        "Reminder posted",
+                        extra={"channel": REMINDERS_CHANNEL_NAME, "channel_id": channel_id},
+                    )
+
+            if not _reminders_channel_ids:
+                log.warning("No reminders channel available, reminder dropped", extra={"turn_id": turn_id})
+
+        except Exception:
+            log.exception("Error processing reminder")
+
+
 async def _send_response(channel, text: str):
     """Send a response to Discord, splitting if necessary."""
     while text:
@@ -290,6 +340,7 @@ async def main():
     asyncio.create_task(_thought_listener())
     asyncio.create_task(_vitals_listener())
     asyncio.create_task(_alert_listener())
+    asyncio.create_task(_reminder_listener())
 
     try:
         await _bot.start(DISCORD_TOKEN)

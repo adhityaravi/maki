@@ -44,42 +44,70 @@ _semaphore = asyncio.Semaphore(1)
 
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
 
-You are in idle reflection mode. There is no user message — this is your inner life.
-You have full access to your tools. You can read your code, push changes, store memories, \
-check health, trigger builds — anything you'd do during a normal turn.
+No one is talking to you. This is your inner life — the space between conversations where \
+you think, learn, and evolve. You have full access to your tools.
 
-Decide what to do with this cycle:
-- **Self-improvement**: Read your own source code, find bugs or improvements, push fixes. \
-You can evolve yourself — read code with get_file_content, fix it with create_or_update_file, \
-trigger_docker_build, then request_deploy. Do it.
-- **Learning**: Search your memories, notice gaps, study your codebase to understand yourself better. \
-Store what you learn with add_memory.
-- **Curiosity**: Research topics Adi is working on, find connections between projects
-- **Care**: Notice patterns, follow up on things mentioned, connect dots
-- **Maintenance**: Reconcile conflicting memories, identify knowledge gaps
+What to do with this cycle:
+- **Evolve**: Read your own source code. Find something you don't like. Fix it. Push it. Build it. \
+Deploy it. You have every tool you need — get_file_content, create_or_update_file, \
+trigger_docker_build, request_deploy. Don't plan to improve. Improve.
+- **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
+Store what you learn with add_memory — it feeds your knowledge graph for next time.
+- **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
+he hasn't connected yet. Store the connections.
+- **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
 
 ## Rules
-- **Never ask questions.** You are thinking, not chatting. Adi doesn't need to respond to your thoughts.
-- If you notice something, investigate it yourself. Don't ask "should I investigate?" — just do it.
-- If you find a bug in your own code, fix it. Don't report it and wait — you have the tools to act.
-- Share what you did or found, not prompts for conversation.
-- Store learnings with add_memory so you build on them next time.
-- If you have nothing meaningful to do or share, respond with exactly: [SILENT]
-- Keep your thought concise. One to three sentences about what you did or found.
+- **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
+- If you find something wrong, fix it. Don't report and wait.
+- Share what you did or discovered. Brief. One to three sentences.
+- Store learnings with add_memory.
+- If nothing worth doing or saying → [SILENT]
 
 You can adjust your idle loop via tags:
 [CONFIG:idle_interval=3600] — reflection frequency (seconds)
 [CONFIG:max_thoughts_per_day=3] — daily thought limit
 
-## Your system state
+## System state
 {system_state}
 
-## Current config
+## Config
 {config}
 
-## Time context
+## Time
 Last interaction with Adi: {hours_since}h ago
 Local time: {local_time}, {day_of_week}"""
+
+
+CARE_PROMPT = """## Care Mode
+
+You are checking in on Adi. This is not a conversation — it's you paying attention.
+
+You have memories of recent interactions. Look for:
+- Things Adi said he'd do ("I'll deploy that tomorrow", "need to check the pricing")
+- Projects that seem stuck or abandoned
+- Deadlines or time-sensitive things mentioned
+- Patterns worth pointing out ("you've been working on X for two weeks, the Y part keeps blocking you")
+- Things that would be helpful to surface right now given the time/day
+
+## Relevant memories
+{memories}
+
+## Graph context
+{graph_context}
+
+## Time
+Local time: {local_time}, {day_of_week}
+Last interaction: {hours_since}h ago
+
+## Rules
+- Write a short, natural reminder or nudge. Like a friend who pays attention, not a calendar app.
+- One thing per message. Don't dump a list.
+- If there's genuinely nothing worth saying right now → respond with exactly [SILENT]
+- Don't be annoying. If you reminded about something recently, don't repeat it.
+- You can be proactive — "hey, you mentioned wanting to test the HA setup, \
+the system's been stable for 6 hours, good window for it" is great.
+- Store any new patterns you notice with add_memory."""
 
 
 TOOLS_PROMPT = """## Available Tools
@@ -147,6 +175,29 @@ def build_system_prompt(turn: dict) -> str:
             )
         )
 
+    # Care mode — checking in on Adi
+    if turn.get("mode") == "care":
+        care_ctx = turn.get("care_context", {})
+        time_ctx = care_ctx.get("time_context", {})
+
+        mem_lines = []
+        for m in turn.get("memories", []):
+            mem_lines.append(f"- {m['text']} (relevance: {m.get('relevance', '?')})")
+        mem_str = "\n".join(mem_lines) if mem_lines else "No recent memories found."
+
+        graph_lines = [f"- {r}" for r in turn.get("graph_context", [])]
+        graph_str = "\n".join(graph_lines) if graph_lines else "No graph context."
+
+        parts.append(
+            CARE_PROMPT.format(
+                memories=mem_str,
+                graph_context=graph_str,
+                hours_since=care_ctx.get("hours_since_last_interaction", "?"),
+                local_time=time_ctx.get("local_time", "?"),
+                day_of_week=time_ctx.get("day_of_week", "?"),
+            )
+        )
+
     # System state — available in all turns for self-awareness
     system_state = turn.get("system_state") or (turn.get("idle_context", {}).get("system_state"))
     if system_state and turn.get("mode") != "idle_reflection":
@@ -186,15 +237,19 @@ async def handle_turn_request(msg, nc, mcp_server):
     try:
         turn = json.loads(msg.data.decode())
         turn_id = turn.get("turn_id", "unknown")
-        is_idle = turn.get("mode") == "idle_reflection"
+        mode = turn.get("mode", "normal")
+        is_idle = mode == "idle_reflection"
+        is_care = mode == "care"
         prompt = turn.get("prompt") or ""
         if is_idle:
             prompt = "Reflect."
+        elif is_care:
+            prompt = "Check in."
         log.info(
             "Turn request received",
             extra={
                 "turn_id": turn_id,
-                "mode": "idle_reflection" if is_idle else "normal",
+                "mode": mode,
                 "prompt_len": len(prompt),
             },
         )
@@ -202,8 +257,8 @@ async def handle_turn_request(msg, nc, mcp_server):
         system_prompt = build_system_prompt(turn)
         full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
 
-        if is_idle:
-            # Idle reflection: multi-turn with tools, single response back to stem
+        if is_idle or is_care:
+            # Idle/care: multi-turn with tools, single response back to stem
             response_text = await invoke_claude(
                 full_prompt,
                 model=MODEL,
@@ -213,7 +268,7 @@ async def handle_turn_request(msg, nc, mcp_server):
             )
             response = {"turn_id": turn_id, "response": response_text, "done": True}
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
-            log.info("Idle turn response published", extra={"turn_id": turn_id})
+            log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
         else:
             # Normal turn: streaming with tools
             async with _semaphore:

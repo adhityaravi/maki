@@ -21,6 +21,9 @@ IMMUNE_STATE_REQUEST = "maki.immune.state"
 DEPLOY_REQUEST = "maki.deploy.request"
 DEPLOY_STATUS_REQUEST = "maki.deploy.status"
 
+# Ears (cont.)
+EARS_REMINDER_OUT = "maki.ears.reminder.out"
+
 # Memory
 MEMORY_STORE = "maki.memory.store"
 
