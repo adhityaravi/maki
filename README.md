@@ -4,8 +4,6 @@
 
 # maki
 
-A persistent, distributed LLM entity.
-
 </div>
 
 ## What is Maki?
