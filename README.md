@@ -2,7 +2,7 @@
 <img src="assets/images/maki.png" alt="maki" width="200">
 </div>
 
-Maki is a personal AI that runs on your own infrastructure. It runs as microservices on Kubernetes, uses NATS for coordination, and Claude for reasoning. It has persistent memory, an idle thinking loop, and a self-healing health monitor.
+Maki is a LLM based assistant that runs on your own infrastructure. It runs as microservices on Kubernetes, uses NATS for coordination, and Claude for reasoning. It has persistent memory, an idle thinking loop, and a self-healing health monitor.
 
 ## Components
 
