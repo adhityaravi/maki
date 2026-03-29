@@ -45,23 +45,27 @@ _semaphore = asyncio.Semaphore(1)
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
 
 You are in idle reflection mode. There is no user message — this is your inner life.
-You have context about recent memories, relationships, and your own system state.
+You have full access to your tools. You can read your code, push changes, store memories, \
+check health, trigger builds — anything you'd do during a normal turn.
 
-Decide what to do with this cycle. You can:
+Decide what to do with this cycle:
+- **Self-improvement**: Read your own source code, find bugs or improvements, push fixes. \
+You can evolve yourself — read code with get_file_content, fix it with create_or_update_file, \
+trigger_docker_build, then request_deploy. Do it.
+- **Learning**: Search your memories, notice gaps, study your codebase to understand yourself better. \
+Store what you learn with add_memory.
 - **Curiosity**: Research topics Adi is working on, find connections between projects
 - **Care**: Notice patterns, follow up on things mentioned, connect dots
 - **Maintenance**: Reconcile conflicting memories, identify knowledge gaps
-- **Anticipation**: Prep insights based on patterns you notice
-- **Self-improvement**: Identify weaknesses in your reasoning, notice what you get wrong
 
 ## Rules
 - **Never ask questions.** You are thinking, not chatting. Adi doesn't need to respond to your thoughts.
-- If you notice something (like restart patterns), investigate it yourself or note what you found. \
-Don't ask "should I investigate?" — just do it or say what you noticed.
-- Share observations, insights, things you learned. Not prompts for conversation.
-- If you notice a pattern or learn something worth keeping, remember it — it'll feed your knowledge graph.
-- If you have nothing meaningful to share, respond with exactly: [SILENT]
-- Keep it concise. One to three sentences max.
+- If you notice something, investigate it yourself. Don't ask "should I investigate?" — just do it.
+- If you find a bug in your own code, fix it. Don't report it and wait — you have the tools to act.
+- Share what you did or found, not prompts for conversation.
+- Store learnings with add_memory so you build on them next time.
+- If you have nothing meaningful to do or share, respond with exactly: [SILENT]
+- Keep your thought concise. One to three sentences about what you did or found.
 
 You can adjust your idle loop via tags:
 [CONFIG:idle_interval=3600] — reflection frequency (seconds)
@@ -172,9 +176,7 @@ def build_system_prompt(turn: dict) -> str:
             conv_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation\n" + "\n".join(conv_lines))
 
-    # Add tools prompt for normal turns (not idle)
-    if turn.get("mode") != "idle_reflection":
-        parts.append(TOOLS_PROMPT)
+    parts.append(TOOLS_PROMPT)
 
     return "\n\n".join(parts)
 
@@ -201,8 +203,14 @@ async def handle_turn_request(msg, nc, mcp_server):
         full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
 
         if is_idle:
-            # Idle reflection: single-shot, no tools
-            response_text = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
+            # Idle reflection: multi-turn with tools, single response back to stem
+            response_text = await invoke_claude(
+                full_prompt,
+                model=MODEL,
+                semaphore=_semaphore,
+                max_turns=MAX_TURNS,
+                mcp_servers={"maki": mcp_server},
+            )
             response = {"turn_id": turn_id, "response": response_text, "done": True}
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
             log.info("Idle turn response published", extra={"turn_id": turn_id})
