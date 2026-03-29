@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: ears
-          image: localhost:32000/maki-ears:v0
+          image: ghcr.io/adhityaravi/maki-ears:latest
           imagePullPolicy: Always
           env:
             - name: NATS_URL

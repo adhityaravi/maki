@@ -1,0 +1,108 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pkgs/**"
+      - "images/**"
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Comma-separated services to build (e.g. cortex,ears). Leave empty for all."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    outputs:
+      cortex: ${{ steps.filter.outputs.cortex }}
+      ears: ${{ steps.filter.outputs.ears }}
+      stem: ${{ steps.filter.outputs.stem }}
+      immune: ${{ steps.filter.outputs.immune }}
+      recall: ${{ steps.filter.outputs.recall }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            cortex:
+              - 'pkgs/maki-cortex/**'
+              - 'pkgs/maki-common/**'
+              - 'images/maki-cortex/**'
+            ears:
+              - 'pkgs/maki-ears/**'
+              - 'pkgs/maki-common/**'
+              - 'images/maki-ears/**'
+            stem:
+              - 'pkgs/maki-stem/**'
+              - 'pkgs/maki-common/**'
+              - 'images/maki-stem/**'
+            immune:
+              - 'pkgs/maki-immune/**'
+              - 'pkgs/maki-common/**'
+              - 'images/maki-immune/**'
+            recall:
+              - 'pkgs/maki-recall/**'
+              - 'pkgs/maki-common/**'
+              - 'images/maki-recall/**'
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: always() && !failure() && !cancelled()
+    strategy:
+      matrix:
+        service: [cortex, ears, stem, immune, recall]
+    steps:
+      - name: Check if should build
+        id: should-build
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SERVICES="${{ github.event.inputs.services }}"
+            if [ -z "$SERVICES" ] || echo "$SERVICES" | grep -q "${{ matrix.service }}"; then
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "build=${{ needs.changes.outputs[matrix.service] }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.should-build.outputs.build == 'true'
+
+      - name: Log in to GHCR
+        if: steps.should-build.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.should-build.outputs.build == 'true'
+        run: |
+          IMAGE="${{ env.IMAGE_PREFIX }}/maki-${{ matrix.service }}"
+          SHA_SHORT="${{ github.sha }}"
+          SHA_SHORT="${SHA_SHORT:0:7}"
+
+          docker build \
+            --no-cache \
+            -f images/maki-${{ matrix.service }}/Dockerfile \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-${SHA_SHORT}" \
+            .
+
+          docker push "${IMAGE}" --all-tags

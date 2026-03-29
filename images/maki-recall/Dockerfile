@@ -1,25 +1,23 @@
 FROM python:3.12-slim
 
-WORKDIR /app
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev gcc libc6-dev && \
-    pip install --no-cache-dir \
-    psycopg2-binary \
-    "mem0ai[graph]" \
-    "psycopg[binary,pool]" \
-    rank-bm25 \
-    langchain-neo4j \
-    neo4j \
-    ollama \
-    fastapi \
-    uvicorn && \
-    apt-get purge -y gcc && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*
 
-COPY main.py .
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-RUN mkdir -p /data
+COPY pyproject.toml /build/pyproject.toml
+COPY pkgs/maki-common /build/pkgs/maki-common
+COPY pkgs/maki-recall /build/pkgs/maki-recall
+RUN cd /build && uv pip install --system ./pkgs/maki-common ./pkgs/maki-recall \
+    && rm -rf /build
+
+RUN apt-get purge -y gcc libc6-dev && apt-get autoremove -y
+
+RUN useradd -m -s /bin/bash recall
+RUN mkdir -p /data && chown recall:recall /data
+USER recall
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["maki-recall"]

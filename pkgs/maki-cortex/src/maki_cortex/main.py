@@ -24,6 +24,13 @@ HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "10"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
+# GitHub App config (optional — enables self-evolution tools)
+GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
+GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
+GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
+REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
+REPO_NAME = os.environ.get("REPO_NAME", "maki")
+
 HEALTH_ENDPOINTS = {
     "recall": RECALL_URL,
     "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
@@ -67,12 +74,25 @@ Local time: {local_time}, {day_of_week}"""
 TOOLS_PROMPT = """## Available Tools
 
 You have MCP tools to investigate and interact with your own systems:
+
+### Memory & State
 - **search_memories** / **get_all_memories** / **add_memory** — search, read, or store memories
 - **get_system_health** — get detailed health from your immune system (restarts, failures, K8s state)
 - **check_component** — check a specific component's health endpoint
 - **get_config** / **update_config** — read or change your configuration
 
-Use these when you need to investigate something or when a user asks about your state.
+### Self-Evolution (GitHub)
+- **get_file_content** / **list_directory** — read your own source code
+- **search_code** — search for patterns in your codebase
+- **create_or_update_file** — push code changes to your repository
+- **trigger_docker_build** — trigger Docker image builds for specified services
+- **get_workflow_status** — check CI/CD workflow status
+
+### Deployment
+- **request_deploy** — request deployment of a service (immune handles the K8s rollout)
+- **get_deploy_status** — check current deployment status of a service
+
+Use tools when you need to investigate, modify your code, or deploy changes.
 Don't use tools unnecessarily — if the answer is already in your context, just respond."""
 
 
@@ -228,13 +248,28 @@ async def main():
 
     nc = await connect_nats(NATS_URL)
 
-    # Create MCP tool server
-    from maki_common.tools import create_maki_tools
+    # Load GitHub App private key if configured
+    github_private_key = None
+    if GITHUB_PRIVATE_KEY_PATH:
+        try:
+            with open(GITHUB_PRIVATE_KEY_PATH) as f:
+                github_private_key = f.read()
+            log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
+        except Exception:
+            log.warning("Failed to load GitHub App private key", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
-    mcp_server = create_maki_tools(
+    # Create MCP tool server
+    from maki_common.tools import create_cortex_tools
+
+    mcp_server = create_cortex_tools(
         nc=nc,
         recall_url=RECALL_URL,
         health_endpoints=HEALTH_ENDPOINTS,
+        github_app_id=GITHUB_APP_ID,
+        github_private_key=github_private_key,
+        github_installation_id=GITHUB_INSTALLATION_ID,
+        repo_owner=REPO_OWNER,
+        repo_name=REPO_NAME,
     )
     log.info("MCP tools registered")
 

@@ -17,5 +17,9 @@ IMMUNE_ACTION = "maki.immune.action"
 IMMUNE_ALERT = "maki.immune.alert"
 IMMUNE_STATE_REQUEST = "maki.immune.state"
 
+# Deploy coordination
+DEPLOY_REQUEST = "maki.deploy.request"
+DEPLOY_STATUS_REQUEST = "maki.deploy.status"
+
 # Conversation stream
 CONVERSATION_STREAM = "maki.conversation"

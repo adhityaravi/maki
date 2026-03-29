@@ -1,9 +1,0 @@
-{
-  "pkgs/maki-common": "0.1.0",
-  "pkgs/maki-cortex": "0.1.0",
-  "pkgs/maki-stem": "0.1.0",
-  "pkgs/maki-ears": "0.1.0",
-  "pkgs/maki-immune": "0.1.0",
-  "pkgs/maki-recall": "0.0.1",
-  "pkgs/maki-synapse": "0.0.1"
-}

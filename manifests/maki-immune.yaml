@@ -19,6 +19,15 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -68,7 +77,7 @@ spec:
       serviceAccountName: maki-immune
       containers:
         - name: immune
-          image: localhost:32000/maki-immune:v0
+          image: ghcr.io/adhityaravi/maki-immune:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

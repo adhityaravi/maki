@@ -110,3 +110,59 @@ def create_immune_tools(
         log.info("Registered immune tool", extra={"tool": name})
 
     return create_sdk_mcp_server(name="maki-immune", tools=sdk_tools)
+
+
+def create_cortex_tools(
+    nc: Any,
+    recall_url: str,
+    health_endpoints: dict[str, str],
+    config_kv: Any | None = None,
+    github_app_id: str | None = None,
+    github_private_key: str | None = None,
+    github_installation_id: str | None = None,
+    repo_owner: str | None = None,
+    repo_name: str | None = None,
+) -> Any:
+    """Create an in-process MCP server with cortex tools (base + github + deploy).
+
+    Args:
+        nc: NATS client.
+        recall_url: Base URL for maki-recall API.
+        health_endpoints: Map of component name to health URL.
+        config_kv: NATS KV store for config (optional).
+        github_app_id: GitHub App ID (optional, enables GitHub tools).
+        github_private_key: GitHub App private key PEM string.
+        github_installation_id: GitHub App installation ID.
+        repo_owner: GitHub repo owner.
+        repo_name: GitHub repo name.
+    """
+    from claude_agent_sdk import create_sdk_mcp_server, tool
+
+    from maki_common.tools.deploy import make_deploy_tools
+    from maki_common.tools.health import make_health_tools
+    from maki_common.tools.recall import make_recall_tools
+
+    all_tools = []
+    all_tools.extend(make_recall_tools(recall_url))
+    all_tools.extend(make_health_tools(nc, health_endpoints))
+    all_tools.extend(make_deploy_tools(nc))
+
+    if config_kv is not None:
+        from maki_common.tools.config import make_config_tools
+
+        all_tools.extend(make_config_tools(config_kv))
+
+    if github_app_id and github_private_key and github_installation_id and repo_owner and repo_name:
+        from maki_common.tools.github import make_github_tools
+
+        all_tools.extend(
+            make_github_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
+        )
+
+    sdk_tools = []
+    for name, description, params, handler in all_tools:
+        decorated = tool(name, description, params)(handler)
+        sdk_tools.append(decorated)
+        log.info("Registered cortex tool", extra={"tool": name})
+
+    return create_sdk_mcp_server(name="maki-cortex", tools=sdk_tools)

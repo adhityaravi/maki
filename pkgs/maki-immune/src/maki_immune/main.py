@@ -19,6 +19,8 @@ from maki_common.config import apply_config_updates, parse_tagged
 from maki_common.health import tcp_health_server
 from maki_common.subjects import (
     CORTEX_HEALTH,
+    DEPLOY_REQUEST,
+    DEPLOY_STATUS_REQUEST,
     EARS_VITALS_OUT,
     IMMUNE_ACTION,
     IMMUNE_ALERT,
@@ -32,6 +34,7 @@ NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
+GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
 
 HEALTH_ENDPOINTS = {
     "maki-stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
@@ -441,6 +444,179 @@ async def _state_request_handler(msg):
         await msg.respond(b"{}")
 
 
+# --- Deploy Coordination ---
+
+
+async def _deploy_request_handler(msg):
+    """Handle deploy requests from cortex — set image, monitor, rollback if unhealthy."""
+    try:
+        request = json.loads(msg.data.decode())
+        service = request.get("service", "")
+        image_tag = request.get("image_tag", "latest")
+        deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
+        image = f"{GHCR_PREFIX}/{deployment_name}:{image_tag}"
+
+        log.info("Deploy request received", extra={"service": service, "image": image})
+
+        if not _k8s_apps_v1:
+            await msg.respond(json.dumps({"status": "error", "message": "K8s client not available"}).encode())
+            return
+
+        if not await _acquire_lock("immune-deploy", ttl=180):
+            await msg.respond(
+                json.dumps({"status": "error", "message": "Infrastructure lock held, try again later"}).encode()
+            )
+            return
+
+        try:
+            # Get current image for rollback
+            dep = await asyncio.to_thread(
+                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
+            )
+            previous_image = dep.spec.template.spec.containers[0].image
+            log.info("Current image recorded for rollback", extra={"previous": previous_image})
+
+            # Patch the deployment with new image
+            patch = {
+                "spec": {
+                    "template": {
+                        "spec": {"containers": [{"name": dep.spec.template.spec.containers[0].name, "image": image}]}
+                    }
+                }
+            }
+            await asyncio.to_thread(
+                _k8s_apps_v1.patch_namespaced_deployment, name=deployment_name, namespace=NAMESPACE, body=patch
+            )
+            log.info("Deployment patched", extra={"deployment": deployment_name, "image": image})
+
+            # Monitor health for 60 seconds
+            healthy = await _monitor_rollout(deployment_name, timeout=60)
+
+            if healthy:
+                result = {"status": "success", "message": f"Deployed {deployment_name} with {image}", "image": image}
+                log.info("Deploy succeeded", extra={"deployment": deployment_name})
+                await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy")
+            else:
+                # Rollback
+                log.warning("Deploy unhealthy, rolling back", extra={"deployment": deployment_name})
+                rollback_patch = {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
+                                ]
+                            }
+                        }
+                    }
+                }
+                await asyncio.to_thread(
+                    _k8s_apps_v1.patch_namespaced_deployment,
+                    name=deployment_name,
+                    namespace=NAMESPACE,
+                    body=rollback_patch,
+                )
+                result = {
+                    "status": "rolled_back",
+                    "message": f"Deploy of {image} failed health check, rolled back to {previous_image}",
+                }
+                await _publish_alert(
+                    f"Deploy of {deployment_name} → {image_tag} FAILED health check. Rolled back to {previous_image}"
+                )
+
+            action = {
+                "type": "deploy",
+                "deployment": deployment_name,
+                "image": image,
+                "result": result["status"],
+                "timestamp": time.time(),
+            }
+            _recent_actions.append(action)
+            if len(_recent_actions) > 50:
+                _recent_actions.pop(0)
+            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+
+            await msg.respond(json.dumps(result).encode())
+
+        finally:
+            await _release_lock("immune-deploy")
+
+    except Exception:
+        log.exception("Deploy request handler error")
+        try:
+            await msg.respond(json.dumps({"status": "error", "message": "Internal error"}).encode())
+        except Exception:
+            pass
+
+
+async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
+    """Monitor deployment health after image update. Returns True if healthy."""
+    deadline = time.time() + timeout
+    # Wait a few seconds for the new pod to start scheduling
+    await asyncio.sleep(5)
+
+    while time.time() < deadline:
+        try:
+            dep = await asyncio.to_thread(
+                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
+            )
+            status = dep.status
+            desired = dep.spec.replicas or 1
+            ready = status.ready_replicas or 0
+            updated = status.updated_replicas or 0
+
+            if ready >= desired and updated >= desired:
+                log.info(
+                    "Rollout healthy",
+                    extra={"deployment": deployment_name, "ready": ready, "desired": desired},
+                )
+                return True
+
+            log.info(
+                "Rollout in progress",
+                extra={"deployment": deployment_name, "ready": ready, "updated": updated, "desired": desired},
+            )
+        except Exception:
+            log.exception("Error checking rollout status")
+
+        await asyncio.sleep(5)
+
+    log.warning("Rollout timed out", extra={"deployment": deployment_name, "timeout": timeout})
+    return False
+
+
+async def _deploy_status_handler(msg):
+    """Handle deploy status requests — return current image and pod state."""
+    try:
+        request = json.loads(msg.data.decode())
+        service = request.get("service", "")
+        deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
+
+        if not _k8s_apps_v1:
+            await msg.respond(json.dumps({"error": "K8s client not available"}).encode())
+            return
+
+        dep = await asyncio.to_thread(
+            _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
+        )
+        status = dep.status
+        image = dep.spec.template.spec.containers[0].image
+
+        result = {
+            "deployment": deployment_name,
+            "image": image,
+            "replicas": dep.spec.replicas,
+            "ready_replicas": status.ready_replicas or 0,
+            "updated_replicas": status.updated_replicas or 0,
+            "available_replicas": status.available_replicas or 0,
+        }
+        await msg.respond(json.dumps(result).encode())
+
+    except Exception as e:
+        log.exception("Deploy status handler error")
+        await msg.respond(json.dumps({"error": str(e)}).encode())
+
+
 # --- Claude Reasoning ---
 
 MAX_CLAUDE_TURNS = int(os.environ.get("IMMUNE_MAX_TURNS", "8"))
@@ -615,6 +791,12 @@ async def main():
 
     await _nc.subscribe(IMMUNE_STATE_REQUEST, cb=_state_request_handler)
     log.info("Subscribed", extra={"subject": IMMUNE_STATE_REQUEST})
+
+    await _nc.subscribe(DEPLOY_REQUEST, cb=_deploy_request_handler)
+    log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
+
+    await _nc.subscribe(DEPLOY_STATUS_REQUEST, cb=_deploy_status_handler)
+    log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
 
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_immune_heartbeat_loop())

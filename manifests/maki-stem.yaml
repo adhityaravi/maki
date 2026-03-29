@@ -31,7 +31,7 @@ spec:
     spec:
       containers:
         - name: stem
-          image: localhost:32000/maki-stem:v0
+          image: ghcr.io/adhityaravi/maki-stem:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
