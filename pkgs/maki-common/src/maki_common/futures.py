@@ -48,3 +48,51 @@ class PendingFutures:
 
     def __contains__(self, key: str) -> bool:
         return key in self._futures
+
+
+class PendingQueues:
+    """Manage streaming request/response correlation via asyncio queues.
+
+    Like PendingFutures but for streaming — each push adds to the queue
+    and the consumer reads chunks until a sentinel arrives.
+
+    Usage:
+        pending = PendingQueues()
+        queue = pending.create("msg-123")
+        # ... later, as chunks arrive:
+        pending.push("msg-123", {"response": "chunk", "done": False})
+        pending.push("msg-123", {"response": "", "done": True})
+        # ... the consumer reads:
+        while True:
+            chunk = await queue.get()
+            if chunk["done"]:
+                break
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[str, asyncio.Queue] = {}
+
+    def create(self, key: str) -> asyncio.Queue:
+        """Create and register a queue for the given key."""
+        queue: asyncio.Queue = asyncio.Queue()
+        self._queues[key] = queue
+        return queue
+
+    def push(self, key: str, value: Any) -> bool:
+        """Push a value to a pending queue. Returns True if found."""
+        queue = self._queues.get(key)
+        if queue is not None:
+            queue.put_nowait(value)
+            return True
+        return False
+
+    def remove(self, key: str) -> None:
+        """Remove a queue."""
+        self._queues.pop(key, None)
+
+    def has(self, key: str) -> bool:
+        """Check if a queue exists for the given key."""
+        return key in self._queues
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._queues

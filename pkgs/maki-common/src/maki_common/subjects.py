@@ -15,6 +15,7 @@ EARS_VITALS_OUT = "maki.ears.vitals.out"
 IMMUNE_HEALTH = "maki.immune.health"
 IMMUNE_ACTION = "maki.immune.action"
 IMMUNE_ALERT = "maki.immune.alert"
+IMMUNE_STATE_REQUEST = "maki.immune.state"
 
 # Conversation stream
 CONVERSATION_STREAM = "maki.conversation"
