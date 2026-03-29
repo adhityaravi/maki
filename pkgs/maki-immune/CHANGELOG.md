@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/adhityaravi/maki/compare/maki-immune-v0.0.1...maki-immune-v0.1.0) (2026-03-29)
+
+
+### Features
+
+* **pkgs:** update maki workloads to use new tools ([3b86a3e](https://github.com/adhityaravi/maki/commit/3b86a3ef8363192314b88550f15bb5fe09d04a94))
+
 ## [0.0.1](https://github.com/adhityaravi/maki/compare/maki-immune-v0.0.1...maki-immune-v0.0.1) (2026-03-28)
 
 
