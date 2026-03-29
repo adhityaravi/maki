@@ -1,9 +1,5 @@
 <div align="center">
-
 <img src="assets/images/maki.png" alt="maki" width="200">
-
-# maki
-
 </div>
 
 ## What is Maki?
