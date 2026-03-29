@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/adhityaravi/maki/compare/maki-common-v0.0.1...maki-common-v0.1.0) (2026-03-29)
+
+
+### Features
+
+* **common:** adds tools for other maki organs ([461f1bf](https://github.com/adhityaravi/maki/commit/461f1bf44012689e62e4b024d047f92cab8f6a48))
+
 ## [0.0.1](https://github.com/adhityaravi/maki/compare/maki-common-v0.0.1...maki-common-v0.0.1) (2026-03-28)
 
 
