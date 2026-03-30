@@ -26,6 +26,7 @@ from maki_common import (
 )
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
+    CONVERSATION_STREAM,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
     EARS_MESSAGE_IN,
@@ -49,7 +50,6 @@ KV_BUCKET = "maki-identity"
 KV_KEY = "identity"
 
 STREAM_NAME = "maki-conversation"
-STREAM_SUBJECT = "maki.conversation"
 STREAM_MAX_MSGS = int(os.environ.get("STREAM_MAX_MSGS", "200"))
 CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "20"))
 INSTANCE_ID = os.environ.get("INSTANCE_ID", "dev-01")
@@ -151,12 +151,12 @@ async def _seed_identity():
 async def _init_conversation_stream():
     """Create or connect to the conversation stream and load existing history."""
     try:
-        await _js.find_stream_name_by_subject(STREAM_SUBJECT)
+        await _js.find_stream_name_by_subject(CONVERSATION_STREAM)
         log.info("Conversation stream exists", extra={"stream": STREAM_NAME})
     except Exception:
         await _js.add_stream(
             name=STREAM_NAME,
-            subjects=[STREAM_SUBJECT],
+            subjects=[CONVERSATION_STREAM],
             retention=RetentionPolicy.LIMITS,
             max_msgs=STREAM_MAX_MSGS,
             storage=StorageType.FILE,
@@ -164,7 +164,7 @@ async def _init_conversation_stream():
         log.info("Created conversation stream", extra={"stream": STREAM_NAME, "max_msgs": STREAM_MAX_MSGS})
 
     try:
-        sub = await _js.subscribe(STREAM_SUBJECT, ordered_consumer=True)
+        sub = await _js.subscribe(CONVERSATION_STREAM, ordered_consumer=True)
         while True:
             try:
                 msg = await sub.next_msg(timeout=1.0)
@@ -192,7 +192,7 @@ async def _publish_turn_to_stream(turn_id: str, user_message: str, cortex_respon
     }
 
     try:
-        ack = await _js.publish(STREAM_SUBJECT, json.dumps(turn_doc).encode())
+        ack = await _js.publish(CONVERSATION_STREAM, json.dumps(turn_doc).encode())
         _conversation_history.append(turn_doc)
         log.info("Turn published to stream", extra={"turn_id": turn_id, "seq": ack.seq})
     except Exception:
