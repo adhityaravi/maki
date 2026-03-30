@@ -9,12 +9,9 @@ from typing import Any
 import httpx
 
 from maki_common.subjects import MEMORY_STORE
+from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 def make_recall_tools(
@@ -34,13 +31,13 @@ def make_recall_tools(
                 f"{recall_url}/search",
                 json={"query": query, "user_id": "adi"},
             )
-            return _mcp_result(resp.text)
+            return mcp_result(resp.text)
 
     async def get_all_memories(args: dict[str, Any]) -> dict[str, Any]:
         log.info("Tool: get_all_memories")
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{recall_url}/memories", params={"user_id": "adi"})
-            return _mcp_result(resp.text)
+            return mcp_result(resp.text)
 
     if nc is not None:
 
@@ -49,7 +46,7 @@ def make_recall_tools(
             log.info("Tool: add_memory (NATS)", extra={"content_len": len(content)})
             payload = {"content": content, "source": source, "user_id": "adi"}
             await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
-            return _mcp_result(f"Memory queued: {content[:100]}")
+            return mcp_result(f"Memory queued: {content[:100]}")
 
     else:
 
@@ -64,7 +61,7 @@ def make_recall_tools(
                         "user_id": "adi",
                     },
                 )
-                return _mcp_result(resp.text)
+                return mcp_result(resp.text)
 
     return [
         (
@@ -99,7 +96,7 @@ def make_nats_memory_tools(nc: Any, source: str) -> list[tuple[str, str, dict[st
         log.info("Tool: store_memory (NATS)", extra={"source": source, "content_len": len(content)})
         payload = {"content": content, "source": source, "user_id": "adi"}
         await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
-        return _mcp_result(f"Memory stored: {content[:100]}")
+        return mcp_result(f"Memory stored: {content[:100]}")
 
     return [
         (
