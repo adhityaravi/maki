@@ -7,11 +7,9 @@ import logging
 import time
 from typing import Any
 
+from maki_common.tools.utils import mcp_result
+
 log = logging.getLogger(__name__)
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
@@ -25,7 +23,7 @@ def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
         log.info("Tool: request_deploy", extra={"service": service, "image_tag": image_tag})
 
         if not service:
-            return _mcp_result("Error: service name is required.")
+            return mcp_result("Error: service name is required.")
 
         try:
             payload = json.dumps(
@@ -36,9 +34,9 @@ def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
                 }
             ).encode()
             resp = await nc.request(DEPLOY_REQUEST, payload, timeout=120.0)
-            return _mcp_result(resp.data.decode())
+            return mcp_result(resp.data.decode())
         except Exception as e:
-            return _mcp_result(f"Deploy request failed: {e}")
+            return mcp_result(f"Deploy request failed: {e}")
 
     async def get_deploy_status(args: dict[str, Any]) -> dict[str, Any]:
         """Get current deployment status for a service."""
@@ -46,14 +44,14 @@ def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
         log.info("Tool: get_deploy_status", extra={"service": service})
 
         if not service:
-            return _mcp_result("Error: service name is required.")
+            return mcp_result("Error: service name is required.")
 
         try:
             payload = json.dumps({"service": service}).encode()
             resp = await nc.request(DEPLOY_STATUS_REQUEST, payload, timeout=10.0)
-            return _mcp_result(resp.data.decode())
+            return mcp_result(resp.data.decode())
         except Exception as e:
-            return _mcp_result(f"Status request failed: {e}")
+            return mcp_result(f"Status request failed: {e}")
 
     return [
         (
