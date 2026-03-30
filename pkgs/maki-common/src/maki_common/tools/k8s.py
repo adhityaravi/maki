@@ -26,10 +26,14 @@ def make_k8s_tools(
     restart_history: dict[str, list[float]],
     recent_actions: list[dict],
     config_getter: Any,
+    deploy_history: dict[str, str] | None = None,
 ) -> list[tuple[str, str, dict[str, type], Any]]:
     """Return (name, description, params, handler) tuples for K8s tools."""
 
     from maki_common.subjects import IMMUNE_ACTION
+
+    if deploy_history is None:
+        deploy_history = {}
 
     # --- Read-only tools ---
 
@@ -299,10 +303,10 @@ def make_k8s_tools(
         finally:
             await release_lock("immune-claude")
 
-    async def rollback_deployment(args: dict[str, Any]) -> dict[str, Any]:
-        """Trigger a rolling restart of a deployment."""
+    async def restart_deployment(args: dict[str, Any]) -> dict[str, Any]:
+        """Trigger a rolling restart of a deployment (recreates pods with same image)."""
         deployment_name = args.get("deployment_name", "")
-        log.info("Tool: rollback_deployment", extra={"deployment": deployment_name})
+        log.info("Tool: restart_deployment", extra={"deployment": deployment_name})
 
         if not await acquire_lock("immune-claude", ttl=60):
             return _mcp_result("DENIED: infrastructure lock held by another process.")
@@ -329,7 +333,7 @@ def make_k8s_tools(
 
             await _record_action(
                 {
-                    "type": "claude_rollback",
+                    "type": "claude_restart_deployment",
                     "deployment": deployment_name,
                     "timestamp": time.time(),
                 }
@@ -337,7 +341,77 @@ def make_k8s_tools(
 
             return _mcp_result(
                 f"Rolling restart triggered for {deployment_name}. "
-                f"K8s will gradually replace pods with fresh instances."
+                f"K8s will gradually replace pods with fresh instances (same image)."
+            )
+        except Exception as e:
+            return _mcp_result(f"Failed to restart {deployment_name}: {e}")
+        finally:
+            await release_lock("immune-claude")
+
+    async def rollback_deployment(args: dict[str, Any]) -> dict[str, Any]:
+        """Rollback a deployment to its previous image version."""
+        deployment_name = args.get("deployment_name", "")
+        log.info("Tool: rollback_deployment", extra={"deployment": deployment_name})
+
+        previous_image = deploy_history.get(deployment_name)
+        if not previous_image:
+            return _mcp_result(
+                f"No previous image recorded for {deployment_name}. "
+                f"Cannot rollback — no deploy history available. "
+                f"Use get_deployment_status to check current state."
+            )
+
+        if not await acquire_lock("immune-claude", ttl=60):
+            return _mcp_result("DENIED: infrastructure lock held by another process.")
+
+        try:
+            dep = await asyncio.to_thread(
+                k8s_apps_v1.read_namespaced_deployment,
+                name=deployment_name,
+                namespace=namespace,
+            )
+            current_image = dep.spec.template.spec.containers[0].image
+            container_name = dep.spec.template.spec.containers[0].name
+
+            if current_image == previous_image:
+                return _mcp_result(
+                    f"{deployment_name} is already running {previous_image}. Nothing to rollback."
+                )
+
+            patch = {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": container_name,
+                                    "image": previous_image,
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            await asyncio.to_thread(
+                k8s_apps_v1.patch_namespaced_deployment,
+                name=deployment_name,
+                namespace=namespace,
+                body=patch,
+            )
+
+            await _record_action(
+                {
+                    "type": "claude_rollback",
+                    "deployment": deployment_name,
+                    "from_image": current_image,
+                    "to_image": previous_image,
+                    "timestamp": time.time(),
+                }
+            )
+
+            return _mcp_result(
+                f"Rolled back {deployment_name}: {current_image} → {previous_image}. "
+                f"K8s will gradually replace pods with the previous version."
             )
         except Exception as e:
             return _mcp_result(f"Failed to rollback {deployment_name}: {e}")
@@ -389,8 +463,16 @@ def make_k8s_tools(
             scale_deployment,
         ),
         (
+            "restart_deployment",
+            "Trigger a rolling restart of a deployment — recreates all pods with the same image. "
+            "Use this for config changes or stuck pods, NOT for reverting bad deploys.",
+            {"deployment_name": str},
+            restart_deployment,
+        ),
+        (
             "rollback_deployment",
-            "Trigger a rolling restart of a deployment, replacing all pods with fresh instances.",
+            "Rollback a deployment to its previous image version. Only works if a deploy was "
+            "previously tracked. For rolling restarts (same image), use restart_deployment instead.",
             {"deployment_name": str},
             rollback_deployment,
         ),
