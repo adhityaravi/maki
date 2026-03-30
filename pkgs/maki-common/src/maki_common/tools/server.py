@@ -65,6 +65,7 @@ def create_immune_tools(
     config_getter: Any,
     config_kv: Any | None = None,
     recall_url: str | None = None,
+    deploy_history: dict[str, str] | None = None,
 ) -> Any:
     """Create an in-process MCP server with immune-specific tools.
 
@@ -80,6 +81,7 @@ def create_immune_tools(
         config_getter: Async callable returning current config dict.
         config_kv: NATS KV store for config (optional).
         recall_url: Base URL for maki-recall API (optional, enables memory tools).
+        deploy_history: Mutable dict mapping deployment name to previous image (for rollbacks).
     """
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -97,6 +99,7 @@ def create_immune_tools(
             restart_history,
             recent_actions,
             config_getter,
+            deploy_history=deploy_history,
         )
     )
 
