@@ -17,8 +17,14 @@ def _mcp_result(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
-def make_recall_tools(recall_url: str) -> list[tuple[str, str, dict[str, type], Any]]:
-    """Return (name, description, params, handler) tuples for recall tools."""
+def make_recall_tools(
+    recall_url: str, nc: Any | None = None, source: str = "cortex"
+) -> list[tuple[str, str, dict[str, type], Any]]:
+    """Return (name, description, params, handler) tuples for recall tools.
+
+    If nc is provided, add_memory fires asynchronously via NATS (instant return).
+    Otherwise falls back to blocking REST call.
+    """
 
     async def search_memories(args: dict[str, Any]) -> dict[str, Any]:
         query = args.get("query", "")
@@ -36,18 +42,29 @@ def make_recall_tools(recall_url: str) -> list[tuple[str, str, dict[str, type], 
             resp = await client.get(f"{recall_url}/memories", params={"user_id": "adi"})
             return _mcp_result(resp.text)
 
-    async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
-        content = args.get("content", "")
-        log.info("Tool: add_memory", extra={"content_len": len(content)})
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{recall_url}/memories",
-                json={
-                    "messages": [{"role": "assistant", "content": content}],
-                    "user_id": "adi",
-                },
-            )
-            return _mcp_result(resp.text)
+    if nc is not None:
+
+        async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
+            content = args.get("content", "")
+            log.info("Tool: add_memory (NATS)", extra={"content_len": len(content)})
+            payload = {"content": content, "source": source, "user_id": "adi"}
+            await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
+            return _mcp_result(f"Memory queued: {content[:100]}")
+
+    else:
+
+        async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
+            content = args.get("content", "")
+            log.info("Tool: add_memory", extra={"content_len": len(content)})
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{recall_url}/memories",
+                    json={
+                        "messages": [{"role": "assistant", "content": content}],
+                        "user_id": "adi",
+                    },
+                )
+                return _mcp_result(resp.text)
 
     return [
         (

@@ -103,7 +103,7 @@ def create_immune_tools(
     if recall_url:
         from maki_common.tools.recall import make_recall_tools
 
-        all_tools.extend(make_recall_tools(recall_url))
+        all_tools.extend(make_recall_tools(recall_url, nc=nc, source="immune"))
 
     if config_kv is not None:
         from maki_common.tools.config import make_config_tools
@@ -150,7 +150,7 @@ def create_cortex_tools(
     from maki_common.tools.recall import make_recall_tools
 
     all_tools = []
-    all_tools.extend(make_recall_tools(recall_url))
+    all_tools.extend(make_recall_tools(recall_url, nc=nc, source="cortex"))
     all_tools.extend(make_health_tools(nc, health_endpoints))
     all_tools.extend(make_deploy_tools(nc))
 

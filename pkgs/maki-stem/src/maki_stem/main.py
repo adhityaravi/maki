@@ -690,12 +690,30 @@ async def _process_turn(
         _pending.remove(turn_id)
 
 
+async def _store_memory(content: str, source: str, user_id: str, metadata: dict | None):
+    """Store a single memory via recall REST API (runs as background task)."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            payload = {
+                "messages": [{"role": "assistant", "content": content}],
+                "user_id": user_id,
+            }
+            if metadata:
+                payload["metadata"] = metadata
+
+            resp = await client.post(f"{RECALL_URL}/memories", json=payload)
+            resp.raise_for_status()
+            log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content)})
+    except Exception:
+        log.exception("Failed to store memory", extra={"source": source})
+
+
 async def _memory_store_listener():
     """Listen for memory store requests from any component via NATS.
 
     Any component can publish to MEMORY_STORE with:
     {"content": "...", "user_id": "...", "metadata": {...}}
-    Stem forwards to recall's REST API.
+    Each memory is stored concurrently as a background task.
     """
     sub = await _nc.subscribe(MEMORY_STORE)
     log.info("Subscribed", extra={"subject": MEMORY_STORE})
@@ -710,17 +728,7 @@ async def _memory_store_listener():
             if not content:
                 continue
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                payload = {
-                    "messages": [{"role": "assistant", "content": content}],
-                    "user_id": user_id,
-                }
-                if metadata:
-                    payload["metadata"] = metadata
-
-                resp = await client.post(f"{RECALL_URL}/memories", json=payload)
-                resp.raise_for_status()
-                log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content)})
+            asyncio.create_task(_store_memory(content, source, user_id, metadata))
 
         except Exception:
             log.exception("Error processing memory store request")

@@ -44,7 +44,7 @@ spec:
                   name: maki-nats-auth
                   key: token
             - name: TURN_TIMEOUT
-              value: "120"
+              value: "1800"
           readinessProbe:
             httpGet:
               path: /health

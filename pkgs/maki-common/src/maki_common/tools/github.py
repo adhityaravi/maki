@@ -71,6 +71,7 @@ def make_github_tools(
 
     auth = _GitHubAuth(app_id, private_key, installation_id)
     repo = f"{repo_owner}/{repo_name}"
+    client = httpx.AsyncClient(timeout=30.0)
 
     async def get_file_content(args: dict[str, Any]) -> dict[str, Any]:
         """Read a file from the repository."""
@@ -78,18 +79,17 @@ def make_github_tools(
         ref = args.get("ref", "main")
         log.info("Tool: get_file_content", extra={"path": path, "ref": ref})
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{API}/repos/{repo}/contents/{path}",
-                    headers=await auth.headers(),
-                    params={"ref": ref},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("type") != "file":
-                    return _mcp_result(f"'{path}' is a {data.get('type')}, not a file. Use list_directory instead.")
-                content = base64.b64decode(data["content"]).decode()
-                return _mcp_result(content)
+            resp = await client.get(
+                f"{API}/repos/{repo}/contents/{path}",
+                headers=await auth.headers(),
+                params={"ref": ref},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("type") != "file":
+                return _mcp_result(f"'{path}' is a {data.get('type')}, not a file. Use list_directory instead.")
+            content = base64.b64decode(data["content"]).decode()
+            return _mcp_result(content)
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -101,18 +101,17 @@ def make_github_tools(
         ref = args.get("ref", "main")
         log.info("Tool: list_directory", extra={"path": path, "ref": ref})
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{API}/repos/{repo}/contents/{path}",
-                    headers=await auth.headers(),
-                    params={"ref": ref},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if not isinstance(data, list):
-                    return _mcp_result(f"'{path}' is a file, not a directory. Use get_file_content instead.")
-                lines = [f"{'d' if item['type'] == 'dir' else 'f'}  {item['name']}" for item in data]
-                return _mcp_result("\n".join(lines))
+            resp = await client.get(
+                f"{API}/repos/{repo}/contents/{path}",
+                headers=await auth.headers(),
+                params={"ref": ref},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                return _mcp_result(f"'{path}' is a file, not a directory. Use get_file_content instead.")
+            lines = [f"{'d' if item['type'] == 'dir' else 'f'}  {item['name']}" for item in data]
+            return _mcp_result("\n".join(lines))
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -123,19 +122,18 @@ def make_github_tools(
         query = args.get("query", "")
         log.info("Tool: search_code", extra={"query": query})
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{API}/search/code",
-                    headers=await auth.headers(),
-                    params={"q": f"{query} repo:{repo}"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                items = data.get("items", [])[:20]
-                if not items:
-                    return _mcp_result("No results found.")
-                lines = [f"{item['path']} (score: {item.get('score', '?')})" for item in items]
-                return _mcp_result(f"Found {data['total_count']} results:\n" + "\n".join(lines))
+            resp = await client.get(
+                f"{API}/search/code",
+                headers=await auth.headers(),
+                params={"q": f"{query} repo:{repo}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", [])[:20]
+            if not items:
+                return _mcp_result("No results found.")
+            lines = [f"{item['path']} (score: {item.get('score', '?')})" for item in items]
+            return _mcp_result(f"Found {data['total_count']} results:\n" + "\n".join(lines))
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -148,35 +146,34 @@ def make_github_tools(
         message = args.get("message", f"Update {path}")
         log.info("Tool: create_or_update_file", extra={"path": path, "message": message})
         try:
-            async with httpx.AsyncClient() as client:
-                # Get current file SHA if it exists (needed for updates)
-                sha = None
-                resp = await client.get(
-                    f"{API}/repos/{repo}/contents/{path}",
-                    headers=await auth.headers(),
-                    params={"ref": "main"},
-                )
-                if resp.status_code == 200:
-                    sha = resp.json().get("sha")
+            # Get current file SHA if it exists (needed for updates)
+            sha = None
+            resp = await client.get(
+                f"{API}/repos/{repo}/contents/{path}",
+                headers=await auth.headers(),
+                params={"ref": "main"},
+            )
+            if resp.status_code == 200:
+                sha = resp.json().get("sha")
 
-                body: dict[str, Any] = {
-                    "message": message,
-                    "content": base64.b64encode(content.encode()).decode(),
-                    "branch": "main",
-                }
-                if sha:
-                    body["sha"] = sha
+            body: dict[str, Any] = {
+                "message": message,
+                "content": base64.b64encode(content.encode()).decode(),
+                "branch": "main",
+            }
+            if sha:
+                body["sha"] = sha
 
-                resp = await client.put(
-                    f"{API}/repos/{repo}/contents/{path}",
-                    headers=await auth.headers(),
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                commit_sha = data["commit"]["sha"][:7]
-                action = "Updated" if sha else "Created"
-                return _mcp_result(f"{action} {path} — commit {commit_sha}")
+            resp = await client.put(
+                f"{API}/repos/{repo}/contents/{path}",
+                headers=await auth.headers(),
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            commit_sha = data["commit"]["sha"][:7]
+            action = "Updated" if sha else "Created"
+            return _mcp_result(f"{action} {path} — commit {commit_sha}")
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -187,14 +184,13 @@ def make_github_tools(
         services = args.get("services", "")
         log.info("Tool: trigger_docker_build", extra={"services": services})
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{API}/repos/{repo}/actions/workflows/docker.yml/dispatches",
-                    headers=await auth.headers(),
-                    json={"ref": "main", "inputs": {"services": services}},
-                )
-                resp.raise_for_status()
-                return _mcp_result(f"Docker build triggered for: {services or 'all services'}")
+            resp = await client.post(
+                f"{API}/repos/{repo}/actions/workflows/docker.yml/dispatches",
+                headers=await auth.headers(),
+                json={"ref": "main", "inputs": {"services": services}},
+            )
+            resp.raise_for_status()
+            return _mcp_result(f"Docker build triggered for: {services or 'all services'}")
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -205,24 +201,23 @@ def make_github_tools(
         workflow = args.get("workflow", "")
         log.info("Tool: get_workflow_status", extra={"workflow": workflow})
         try:
-            async with httpx.AsyncClient() as client:
-                url = f"{API}/repos/{repo}/actions/runs"
-                params: dict[str, Any] = {"per_page": 5}
-                if workflow:
-                    url = f"{API}/repos/{repo}/actions/workflows/{workflow}/runs"
-                resp = await client.get(url, headers=await auth.headers(), params=params)
-                resp.raise_for_status()
-                runs = resp.json().get("workflow_runs", [])
-                if not runs:
-                    return _mcp_result("No workflow runs found.")
-                lines = []
-                for run in runs:
-                    sha = run.get("head_sha", "")[:7]
-                    lines.append(
-                        f"#{run['run_number']} {run['name']} — {run['status']}/{run.get('conclusion', 'pending')} "
-                        f"(sha: {sha}, {run['created_at']})"
-                    )
-                return _mcp_result("\n".join(lines))
+            url = f"{API}/repos/{repo}/actions/runs"
+            params: dict[str, Any] = {"per_page": 5}
+            if workflow:
+                url = f"{API}/repos/{repo}/actions/workflows/{workflow}/runs"
+            resp = await client.get(url, headers=await auth.headers(), params=params)
+            resp.raise_for_status()
+            runs = resp.json().get("workflow_runs", [])
+            if not runs:
+                return _mcp_result("No workflow runs found.")
+            lines = []
+            for run in runs:
+                sha = run.get("head_sha", "")[:7]
+                lines.append(
+                    f"#{run['run_number']} {run['name']} — {run['status']}/{run.get('conclusion', 'pending')} "
+                    f"(sha: {sha}, {run['created_at']})"
+                )
+            return _mcp_result("\n".join(lines))
         except httpx.HTTPStatusError as e:
             return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
