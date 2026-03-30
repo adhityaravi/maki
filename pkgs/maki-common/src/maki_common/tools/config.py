@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from maki_common.tools.utils import mcp_result
+
 log = logging.getLogger(__name__)
 
 ALLOWED_CONFIG_KEYS = {
@@ -13,10 +15,6 @@ ALLOWED_CONFIG_KEYS = {
     "idle_memory_query",
     "cortex_model",
 }
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 def make_config_tools(
@@ -35,9 +33,9 @@ def make_config_tools(
             for key in keys:
                 entry = await config_kv.get(key)
                 config[key] = entry.value.decode()
-            return _mcp_result(str(config))
+            return mcp_result(str(config))
         except Exception as e:
-            return _mcp_result(f"Failed to read config: {e}")
+            return mcp_result(f"Failed to read config: {e}")
 
     async def update_config(args: dict[str, Any]) -> dict[str, Any]:
         """Update a configuration value."""
@@ -45,12 +43,12 @@ def make_config_tools(
         value = args.get("value", "")
         log.info("Tool: update_config", extra={"key": key, "value": value})
         if key not in effective_keys:
-            return _mcp_result(f"Key '{key}' not allowed. Allowed keys: {', '.join(sorted(effective_keys))}")
+            return mcp_result(f"Key '{key}' not allowed. Allowed keys: {', '.join(sorted(effective_keys))}")
         try:
             await config_kv.put(key, value.encode())
-            return _mcp_result(f"Updated {key} = {value}")
+            return mcp_result(f"Updated {key} = {value}")
         except Exception as e:
-            return _mcp_result(f"Failed to update config: {e}")
+            return mcp_result(f"Failed to update config: {e}")
 
     return [
         (
