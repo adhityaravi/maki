@@ -145,8 +145,8 @@ def make_github_tools(
         """Create or update a file in the repository on main branch."""
         path = args.get("path", "")
         content = args.get("content", "")
-        message = args.get("message", f"Update {path}")
-        log.info("Tool: create_or_update_file", extra={"path": path, "commit_msg": message})
+        commit_msg = args.get("message", f"Update {path}")
+        log.info("Tool: create_or_update_file", extra={"path": path, "commit_msg": commit_msg})
         try:
             # Get current file SHA if it exists (needed for updates)
             sha = None
@@ -159,7 +159,7 @@ def make_github_tools(
                 sha = resp.json().get("sha")
 
             body: dict[str, Any] = {
-                "message": message,
+                "message": commit_msg,
                 "content": base64.b64encode(content.encode()).decode(),
                 "branch": "main",
             }
@@ -216,10 +216,71 @@ def make_github_tools(
             for run in runs:
                 sha = run.get("head_sha", "")[:7]
                 lines.append(
-                    f"#{run['run_number']} {run['name']} — {run['status']}/{run.get('conclusion', 'pending')} "
+                    f"#{run['run_number']} (id:{run['id']}) {run['name']} "
+                    f"— {run['status']}/{run.get('conclusion', 'pending')} "
                     f"(sha: {sha}, {run['created_at']})"
                 )
             return mcp_result("\n".join(lines))
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def get_workflow_logs(args: dict[str, Any]) -> dict[str, Any]:
+        """Get logs from a workflow run, focusing on failed jobs."""
+        run_id = args.get("run_id", "")
+        log.info("Tool: get_workflow_logs", extra={"run_id": run_id})
+        try:
+            if not run_id:
+                # Find the latest failed run
+                resp = await client.get(
+                    f"{API}/repos/{repo}/actions/runs",
+                    headers=await auth.headers(),
+                    params={"per_page": 10, "status": "failure"},
+                )
+                resp.raise_for_status()
+                runs = resp.json().get("workflow_runs", [])
+                if not runs:
+                    return mcp_result("No failed workflow runs found.")
+                run_id = runs[0]["id"]
+
+            # Get jobs for this run
+            resp = await client.get(
+                f"{API}/repos/{repo}/actions/runs/{run_id}/jobs",
+                headers=await auth.headers(),
+            )
+            resp.raise_for_status()
+            jobs = resp.json().get("jobs", [])
+
+            if not jobs:
+                return mcp_result(f"No jobs found for run {run_id}.")
+
+            output_parts = []
+            for job in jobs:
+                if job.get("conclusion") == "success":
+                    continue
+                # Fetch logs for non-success jobs
+                log_resp = await client.get(
+                    f"{API}/repos/{repo}/actions/jobs/{job['id']}/logs",
+                    headers=await auth.headers(),
+                    follow_redirects=True,
+                )
+                if log_resp.status_code == 200:
+                    log_text = log_resp.text
+                    # Keep last 5000 chars to stay within reasonable size
+                    if len(log_text) > 5000:
+                        log_text = "... (truncated, showing last 5000 chars)\n" + log_text[-5000:]
+                    output_parts.append(f"=== Job: {job['name']} ({job['conclusion']}) ===\n{log_text}")
+                else:
+                    output_parts.append(
+                        f"=== Job: {job['name']} ({job['conclusion']}) === "
+                        f"Failed to fetch logs: {log_resp.status_code}"
+                    )
+
+            if not output_parts:
+                return mcp_result(f"All jobs in run {run_id} succeeded.")
+
+            return mcp_result("\n\n".join(output_parts))
         except httpx.HTTPStatusError as e:
             return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
@@ -264,5 +325,12 @@ def make_github_tools(
             "Optionally filter by workflow filename (e.g. 'docker.yml', 'ci.yml').",
             {"workflow": str},
             get_workflow_status,
+        ),
+        (
+            "get_workflow_logs",
+            "Get logs from a GitHub Actions workflow run, focusing on failed jobs. "
+            "Provide a run_id, or leave empty to get the latest failed run's logs.",
+            {"run_id": str},
+            get_workflow_logs,
         ),
     ]
