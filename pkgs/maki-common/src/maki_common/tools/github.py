@@ -10,13 +10,11 @@ from typing import Any
 import httpx
 import jwt
 
+from maki_common.tools.utils import mcp_result
+
 log = logging.getLogger(__name__)
 
 API = "https://api.github.com"
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 class _GitHubAuth:
@@ -91,13 +89,13 @@ def make_github_tools(
             resp.raise_for_status()
             data = resp.json()
             if data.get("type") != "file":
-                return _mcp_result(f"'{path}' is a {data.get('type')}, not a file. Use list_directory instead.")
+                return mcp_result(f"'{path}' is a {data.get('type')}, not a file. Use list_directory instead.")
             content = base64.b64decode(data["content"]).decode()
-            return _mcp_result(content)
+            return mcp_result(content)
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     async def list_directory(args: dict[str, Any]) -> dict[str, Any]:
         """List contents of a directory in the repository."""
@@ -113,13 +111,13 @@ def make_github_tools(
             resp.raise_for_status()
             data = resp.json()
             if not isinstance(data, list):
-                return _mcp_result(f"'{path}' is a file, not a directory. Use get_file_content instead.")
+                return mcp_result(f"'{path}' is a file, not a directory. Use get_file_content instead.")
             lines = [f"{'d' if item['type'] == 'dir' else 'f'}  {item['name']}" for item in data]
-            return _mcp_result("\n".join(lines))
+            return mcp_result("\n".join(lines))
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     async def search_code(args: dict[str, Any]) -> dict[str, Any]:
         """Search code in the repository."""
@@ -135,13 +133,13 @@ def make_github_tools(
             data = resp.json()
             items = data.get("items", [])[:20]
             if not items:
-                return _mcp_result("No results found.")
+                return mcp_result("No results found.")
             lines = [f"{item['path']} (score: {item.get('score', '?')})" for item in items]
-            return _mcp_result(f"Found {data['total_count']} results:\n" + "\n".join(lines))
+            return mcp_result(f"Found {data['total_count']} results:\n" + "\n".join(lines))
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     async def create_or_update_file(args: dict[str, Any]) -> dict[str, Any]:
         """Create or update a file in the repository on main branch."""
@@ -177,11 +175,11 @@ def make_github_tools(
             data = resp.json()
             commit_sha = data["commit"]["sha"][:7]
             action = "Updated" if sha else "Created"
-            return _mcp_result(f"{action} {path} — commit {commit_sha}")
+            return mcp_result(f"{action} {path} — commit {commit_sha}")
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     async def trigger_docker_build(args: dict[str, Any]) -> dict[str, Any]:
         """Trigger the Docker build workflow for specified services."""
@@ -194,11 +192,11 @@ def make_github_tools(
                 json={"ref": "main", "inputs": {"services": services}},
             )
             resp.raise_for_status()
-            return _mcp_result(f"Docker build triggered for: {services or 'all services'}")
+            return mcp_result(f"Docker build triggered for: {services or 'all services'}")
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     async def get_workflow_status(args: dict[str, Any]) -> dict[str, Any]:
         """Get the status of recent workflow runs."""
@@ -213,7 +211,7 @@ def make_github_tools(
             resp.raise_for_status()
             runs = resp.json().get("workflow_runs", [])
             if not runs:
-                return _mcp_result("No workflow runs found.")
+                return mcp_result("No workflow runs found.")
             lines = []
             for run in runs:
                 sha = run.get("head_sha", "")[:7]
@@ -221,11 +219,11 @@ def make_github_tools(
                     f"#{run['run_number']} {run['name']} — {run['status']}/{run.get('conclusion', 'pending')} "
                     f"(sha: {sha}, {run['created_at']})"
                 )
-            return _mcp_result("\n".join(lines))
+            return mcp_result("\n".join(lines))
         except httpx.HTTPStatusError as e:
-            return _mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
         except Exception as e:
-            return _mcp_result(f"Error: {e}")
+            return mcp_result(f"Error: {e}")
 
     return [
         (
