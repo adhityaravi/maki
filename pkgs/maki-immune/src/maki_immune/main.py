@@ -47,6 +47,7 @@ HEALTH_ENDPOINTS = {
 
 CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
+DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 
 DEFAULT_CONFIG = {
@@ -114,7 +115,8 @@ catch them, remember them, never repeat them. You are the last line. Nothing get
 ### Remediation (requires lock)
 - **restart_pod** (pod_name, reason) — delete pod for recreation
 - **scale_deployment** (deployment_name, replicas) — scale (0-5)
-- **rollback_deployment** (deployment_name) — rolling restart
+- **restart_deployment** (deployment_name) — rolling restart (same image)
+- **rollback_deployment** (deployment_name) — revert to previous image version
 
 ### Self-Configuration
 - **get_config** / **update_config** (key, value)
@@ -156,12 +158,14 @@ _nc = None
 _js = None
 _config_kv = None
 _lock_kv = None
+_deploy_history_kv = None
 _k8s_v1 = None
 _k8s_apps_v1 = None
 _mcp_server = None
 _component_health: dict = {}
 _restart_history: dict[str, list[float]] = {}
 _recent_actions: list[dict] = []
+_deploy_history: dict[str, str] = {}
 _pod_metrics: dict = {}
 _last_cortex_heartbeat: float = 0
 _last_incident_time: float = 0
@@ -211,6 +215,32 @@ async def _release_lock(holder: str):
             )
     except Exception:
         pass
+
+
+# --- Deploy History ---
+
+
+async def _load_deploy_history():
+    """Load deploy history from KV on startup."""
+    global _deploy_history
+    try:
+        keys = await _deploy_history_kv.keys()
+        for key in keys:
+            entry = await _deploy_history_kv.get(key)
+            _deploy_history[key] = entry.value.decode()
+        if _deploy_history:
+            log.info("Deploy history loaded", extra={"entries": len(_deploy_history)})
+    except Exception:
+        log.info("No deploy history found in KV (first run)")
+
+
+async def _save_deploy_history(deployment_name: str, previous_image: str):
+    """Persist previous image to KV for crash recovery."""
+    _deploy_history[deployment_name] = previous_image
+    try:
+        await _deploy_history_kv.put(deployment_name, previous_image.encode())
+    except Exception:
+        log.warning("Failed to persist deploy history to KV", extra={"deployment": deployment_name})
 
 
 # --- Health State Tracking ---
@@ -524,16 +554,34 @@ async def _state_request_handler(msg):
 # --- Deploy Coordination ---
 
 
+def _normalize_image_tag(tag: str) -> str:
+    """Normalize image tag to match Docker workflow convention.
+
+    Docker workflow tags images as sha-<7char_short_sha>.
+    Raw SHA inputs get the sha- prefix added automatically.
+    """
+    if tag == "latest":
+        return tag
+    if tag.startswith("sha-"):
+        return tag
+    # Looks like a raw commit SHA — add the sha- prefix
+    return f"sha-{tag[:7]}"
+
+
 async def _deploy_request_handler(msg):
     """Handle deploy requests from cortex — set image, monitor, rollback if unhealthy."""
     try:
         request = json.loads(msg.data.decode())
         service = request.get("service", "")
-        image_tag = request.get("image_tag", "latest")
+        raw_tag = request.get("image_tag", "latest")
+        image_tag = _normalize_image_tag(raw_tag)
         deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
         image = f"{GHCR_PREFIX}/{deployment_name}:{image_tag}"
 
-        log.info("Deploy request received", extra={"service": service, "image": image})
+        log.info(
+            "Deploy request received",
+            extra={"service": service, "raw_tag": raw_tag, "normalized_tag": image_tag, "image": image},
+        )
 
         if not _k8s_apps_v1:
             await msg.respond(json.dumps({"status": "error", "message": "K8s client not available"}).encode())
@@ -552,6 +600,9 @@ async def _deploy_request_handler(msg):
             )
             previous_image = dep.spec.template.spec.containers[0].image
             log.info("Current image recorded for rollback", extra={"previous": previous_image})
+
+            # Persist previous image for rollback (survives restarts)
+            await _save_deploy_history(deployment_name, previous_image)
 
             # Patch the deployment with new image
             patch = {
@@ -574,7 +625,7 @@ async def _deploy_request_handler(msg):
                 log.info("Deploy succeeded", extra={"deployment": deployment_name})
                 await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy")
             else:
-                # Rollback
+                # Rollback to previous image
                 log.warning("Deploy unhealthy, rolling back", extra={"deployment": deployment_name})
                 rollback_patch = {
                     "spec": {
@@ -843,7 +894,7 @@ async def _immune_heartbeat_loop():
 
 
 async def main():
-    global _nc, _js, _config_kv, _lock_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
+    global _nc, _js, _config_kv, _lock_kv, _deploy_history_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
 
     log.info("maki-immune starting", extra={"nats_url": NATS_URL, "model": MODEL})
 
@@ -852,6 +903,10 @@ async def main():
 
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
+    _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
+
+    # Load previous deploy history for rollback support
+    await _load_deploy_history()
 
     try:
         k8s_config.load_incluster_config()
@@ -879,6 +934,7 @@ async def main():
         config_getter=_config_getter,
         config_kv=_config_kv,
         recall_url=RECALL_URL,
+        deploy_history=_deploy_history,
     )
     log.info("Immune MCP tools registered")
 
