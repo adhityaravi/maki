@@ -7,11 +7,9 @@ from typing import Any
 
 import httpx
 
+from maki_common.tools.utils import mcp_result
+
 log = logging.getLogger(__name__)
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 def make_health_tools(
@@ -26,9 +24,9 @@ def make_health_tools(
         log.info("Tool: get_system_health")
         try:
             resp = await nc.request(IMMUNE_STATE_REQUEST, b"", timeout=5.0)
-            return _mcp_result(resp.data.decode())
+            return mcp_result(resp.data.decode())
         except Exception as e:
-            return _mcp_result(f"Failed to get system health: {e}")
+            return mcp_result(f"Failed to get system health: {e}")
 
     async def check_component(args: dict[str, Any]) -> dict[str, Any]:
         """Check a specific component's health endpoint."""
@@ -37,13 +35,13 @@ def make_health_tools(
         url = health_endpoints.get(name)
         if not url:
             available = ", ".join(sorted(health_endpoints.keys()))
-            return _mcp_result(f"Unknown component '{name}'. Available: {available}")
+            return mcp_result(f"Unknown component '{name}'. Available: {available}")
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(f"{url}/health")
-                return _mcp_result(f"{name}: status={resp.status_code}, body={resp.text}")
+                return mcp_result(f"{name}: status={resp.status_code}, body={resp.text}")
         except Exception as e:
-            return _mcp_result(f"{name}: unreachable ({e})")
+            return mcp_result(f"{name}: unreachable ({e})")
 
     return [
         (
