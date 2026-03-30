@@ -669,6 +669,13 @@ async def _process_turn(
                 break
 
         response_text = "".join(chunks)
+
+        # Parse and apply any config tags from cortex response
+        config_updates = parse_config_tags(response_text)
+        await apply_config_updates(
+            _config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys())
+        )
+
         log.info("Turn complete", extra={"turn_id": turn_id, "chunks": len(chunks)})
 
         await _publish_turn_to_stream(
