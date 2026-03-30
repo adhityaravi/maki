@@ -73,9 +73,13 @@ def make_github_tools(
     repo = f"{repo_owner}/{repo_name}"
     client = httpx.AsyncClient(timeout=30.0)
 
+    def _normalize_path(path: str) -> str:
+        """Normalize path for GitHub Contents API (root = empty string)."""
+        return path.strip("/")
+
     async def get_file_content(args: dict[str, Any]) -> dict[str, Any]:
         """Read a file from the repository."""
-        path = args.get("path", "")
+        path = _normalize_path(args.get("path", ""))
         ref = args.get("ref", "main")
         log.info("Tool: get_file_content", extra={"path": path, "ref": ref})
         try:
@@ -97,7 +101,7 @@ def make_github_tools(
 
     async def list_directory(args: dict[str, Any]) -> dict[str, Any]:
         """List contents of a directory in the repository."""
-        path = args.get("path", "")
+        path = _normalize_path(args.get("path", ""))
         ref = args.get("ref", "main")
         log.info("Tool: list_directory", extra={"path": path, "ref": ref})
         try:
@@ -144,7 +148,7 @@ def make_github_tools(
         path = args.get("path", "")
         content = args.get("content", "")
         message = args.get("message", f"Update {path}")
-        log.info("Tool: create_or_update_file", extra={"path": path, "message": message})
+        log.info("Tool: create_or_update_file", extra={"path": path, "commit_msg": message})
         try:
             # Get current file SHA if it exists (needed for updates)
             sha = None
