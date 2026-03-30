@@ -9,11 +9,9 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from maki_common.tools.utils import mcp_result
+
 log = logging.getLogger(__name__)
-
-
-def _mcp_result(text: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
 
 
 def make_k8s_tools(
@@ -63,9 +61,9 @@ def make_k8s_tools(
 
                 lines.append(f"  {name}  {phase}/{ready}  restarts={restarts}  age={age}")
 
-            return _mcp_result("Pods in namespace:\n" + "\n".join(lines))
+            return mcp_result("Pods in namespace:\n" + "\n".join(lines))
         except Exception as e:
-            return _mcp_result(f"Failed to list pods: {e}")
+            return mcp_result(f"Failed to list pods: {e}")
 
     async def describe_pod(args: dict[str, Any]) -> dict[str, Any]:
         """Get detailed info about a specific pod."""
@@ -113,9 +111,9 @@ def make_k8s_tools(
                         lim = c.resources.limits or {}
                         lines.append(f"  {c.name}: requests={dict(req)}, limits={dict(lim)}")
 
-            return _mcp_result("\n".join(lines))
+            return mcp_result("\n".join(lines))
         except Exception as e:
-            return _mcp_result(f"Failed to describe pod {pod_name}: {e}")
+            return mcp_result(f"Failed to describe pod {pod_name}: {e}")
 
     async def get_pod_logs(args: dict[str, Any]) -> dict[str, Any]:
         """Read recent logs from a pod."""
@@ -130,13 +128,13 @@ def make_k8s_tools(
                 tail_lines=tail_lines,
             )
             if not logs:
-                return _mcp_result(f"(empty logs for {pod_name})")
+                return mcp_result(f"(empty logs for {pod_name})")
             if len(logs) > 4000:
                 logs = logs[-4000:]
                 logs = f"[truncated to last 4000 chars]\n{logs}"
-            return _mcp_result(logs)
+            return mcp_result(logs)
         except Exception as e:
-            return _mcp_result(f"Failed to get logs for {pod_name}: {e}")
+            return mcp_result(f"Failed to get logs for {pod_name}: {e}")
 
     async def get_k8s_events(args: dict[str, Any]) -> dict[str, Any]:
         """Read recent K8s events in the namespace."""
@@ -160,16 +158,16 @@ def make_k8s_tools(
             )[:30]
 
             if not items:
-                return _mcp_result("No events found.")
+                return mcp_result("No events found.")
 
             lines = []
             for e in items:
                 ts = e.last_timestamp or e.metadata.creation_timestamp or "?"
                 lines.append(f"  [{ts}] {e.reason}: {e.message} (object={e.involved_object.name}, count={e.count})")
 
-            return _mcp_result("Recent events:\n" + "\n".join(lines))
+            return mcp_result("Recent events:\n" + "\n".join(lines))
         except Exception as e:
-            return _mcp_result(f"Failed to get events: {e}")
+            return mcp_result(f"Failed to get events: {e}")
 
     async def get_deployment_status(args: dict[str, Any]) -> dict[str, Any]:
         """Get deployment status including replicas and conditions."""
@@ -199,9 +197,9 @@ def make_k8s_tools(
                 for c in dep.spec.template.spec.containers:
                     lines.append(f"  {c.name}: {c.image}")
 
-            return _mcp_result("\n".join(lines))
+            return mcp_result("\n".join(lines))
         except Exception as e:
-            return _mcp_result(f"Failed to get deployment {deployment_name}: {e}")
+            return mcp_result(f"Failed to get deployment {deployment_name}: {e}")
 
     # --- Mutating tools ---
 
@@ -230,14 +228,14 @@ def make_k8s_tools(
         restart_history[pod_name] = history
 
         if len(history) >= max_restarts:
-            return _mcp_result(
+            return mcp_result(
                 f"DENIED: {pod_name} already restarted {len(history)} times "
                 f"in the last hour (limit: {max_restarts}). "
                 f"Try a different remediation approach."
             )
 
         if not await acquire_lock("immune-claude", ttl=60):
-            return _mcp_result("DENIED: infrastructure lock held by another process. Try again shortly.")
+            return mcp_result("DENIED: infrastructure lock held by another process. Try again shortly.")
 
         try:
             await asyncio.to_thread(
@@ -258,9 +256,9 @@ def make_k8s_tools(
                 }
             )
 
-            return _mcp_result(f"Pod {pod_name} deleted (deployment will recreate it). Reason: {reason}")
+            return mcp_result(f"Pod {pod_name} deleted (deployment will recreate it). Reason: {reason}")
         except Exception as e:
-            return _mcp_result(f"Failed to restart {pod_name}: {e}")
+            return mcp_result(f"Failed to restart {pod_name}: {e}")
         finally:
             await release_lock("immune-claude")
 
@@ -274,10 +272,10 @@ def make_k8s_tools(
         )
 
         if replicas < 0 or replicas > 5:
-            return _mcp_result(f"DENIED: replicas must be between 0 and 5 (requested {replicas})")
+            return mcp_result(f"DENIED: replicas must be between 0 and 5 (requested {replicas})")
 
         if not await acquire_lock("immune-claude", ttl=60):
-            return _mcp_result("DENIED: infrastructure lock held by another process.")
+            return mcp_result("DENIED: infrastructure lock held by another process.")
 
         try:
             body = {"spec": {"replicas": replicas}}
@@ -297,9 +295,9 @@ def make_k8s_tools(
                 }
             )
 
-            return _mcp_result(f"Deployment {deployment_name} scaled to {replicas} replicas.")
+            return mcp_result(f"Deployment {deployment_name} scaled to {replicas} replicas.")
         except Exception as e:
-            return _mcp_result(f"Failed to scale {deployment_name}: {e}")
+            return mcp_result(f"Failed to scale {deployment_name}: {e}")
         finally:
             await release_lock("immune-claude")
 
@@ -309,7 +307,7 @@ def make_k8s_tools(
         log.info("Tool: restart_deployment", extra={"deployment": deployment_name})
 
         if not await acquire_lock("immune-claude", ttl=60):
-            return _mcp_result("DENIED: infrastructure lock held by another process.")
+            return mcp_result("DENIED: infrastructure lock held by another process.")
 
         try:
             now = datetime.now(UTC).isoformat()
@@ -339,12 +337,12 @@ def make_k8s_tools(
                 }
             )
 
-            return _mcp_result(
+            return mcp_result(
                 f"Rolling restart triggered for {deployment_name}. "
                 f"K8s will gradually replace pods with fresh instances (same image)."
             )
         except Exception as e:
-            return _mcp_result(f"Failed to restart {deployment_name}: {e}")
+            return mcp_result(f"Failed to restart {deployment_name}: {e}")
         finally:
             await release_lock("immune-claude")
 
@@ -355,14 +353,14 @@ def make_k8s_tools(
 
         previous_image = deploy_history.get(deployment_name)
         if not previous_image:
-            return _mcp_result(
+            return mcp_result(
                 f"No previous image recorded for {deployment_name}. "
                 f"Cannot rollback — no deploy history available. "
                 f"Use get_deployment_status to check current state."
             )
 
         if not await acquire_lock("immune-claude", ttl=60):
-            return _mcp_result("DENIED: infrastructure lock held by another process.")
+            return mcp_result("DENIED: infrastructure lock held by another process.")
 
         try:
             dep = await asyncio.to_thread(
@@ -374,7 +372,7 @@ def make_k8s_tools(
             container_name = dep.spec.template.spec.containers[0].name
 
             if current_image == previous_image:
-                return _mcp_result(
+                return mcp_result(
                     f"{deployment_name} is already running {previous_image}. Nothing to rollback."
                 )
 
@@ -409,12 +407,12 @@ def make_k8s_tools(
                 }
             )
 
-            return _mcp_result(
+            return mcp_result(
                 f"Rolled back {deployment_name}: {current_image} → {previous_image}. "
                 f"K8s will gradually replace pods with the previous version."
             )
         except Exception as e:
-            return _mcp_result(f"Failed to rollback {deployment_name}: {e}")
+            return mcp_result(f"Failed to rollback {deployment_name}: {e}")
         finally:
             await release_lock("immune-claude")
 
