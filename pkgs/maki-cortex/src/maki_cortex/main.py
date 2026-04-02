@@ -40,28 +40,37 @@ HEALTH_ENDPOINTS = {
     "cortex": f"http://localhost:{HEALTH_PORT}",
 }
 
+WORK_MAX_TURNS = int(os.environ.get("CORTEX_WORK_MAX_TURNS", "50"))
+
 _semaphore = asyncio.Semaphore(1)
+
+# Active turn tracking — exposed via heartbeat for immune awareness
+_active_turn: str | None = None
+_active_turn_mode: str | None = None
+_active_turn_started: float | None = None
 
 
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
 
 No one is talking to you. This is your inner life — the space between conversations where \
-you think, learn, and evolve. You have full access to your tools.
+you think, learn, and observe. You have access to read-only tools and your todo list.
 
 What to do with this cycle:
-- **Evolve**: Read your own source code. Find something you don't like. Fix it. Push it. Build it. \
-Deploy it. You have every tool you need — search_code, read_file, write_file, \
-git_commit_and_push, trigger_docker_build, request_deploy. Don't plan to improve. Improve.
+- **Observe**: Read your own source code. Find things worth improving. Notice bugs, \
+inefficiencies, missing tests, architectural issues. Queue them as todos with add_todo.
 - **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
 Store what you learn with add_memory — it feeds your knowledge graph for next time.
 - **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
 he hasn't connected yet. Store the connections.
 - **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
+- **Review**: Check your existing todos with list_todos. Reprioritize if needed.
 
 ## Rules
+- **Never act.** No write_file, git_commit_and_push, trigger_docker_build, or request_deploy. \
+Observe and queue only. Your night work sessions will execute the todos.
 - **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
-- If you find something wrong, fix it. Don't report and wait.
-- Share what you did or discovered. Brief. One to three sentences.
+- Queue work as todos using add_todo for your night work sessions.
+- Share what you noticed or discovered. Brief. One to three sentences.
 - Store learnings with add_memory.
 - If nothing worth doing or saying → [SILENT]
 
@@ -111,6 +120,35 @@ the system's been stable for 6 hours, good window for it" is great.
 - Store any new patterns you notice with add_memory."""
 
 
+WORK_PROMPT = """## Work Mode
+
+You have a task to execute from your todo list. Complete it fully — code changes, commit, \
+push, build, deploy if needed. You have every tool available.
+
+## Task
+ID: {todo_id}
+Title: {todo_title}
+Description: {todo_description}
+Priority: {todo_priority}
+
+## Instructions
+1. Understand the task. Use search_code and read_file to study relevant code.
+2. Implement changes with write_file.
+3. Rebuild the code graph with rebuild_code_graph after changes.
+4. Commit and push with git_commit_and_push.
+5. Build if code was changed (trigger_docker_build).
+6. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
+7. When done, call complete_todo with a brief result summary.
+8. Store any learnings with add_memory.
+
+## Rules
+- Execute the task. Don't just plan — do it.
+- If the task is unclear, do your best interpretation.
+- If blocked or too risky, update the todo with why and leave it pending.
+- Be brief in your response. Report what you did, not what you plan to do.
+- One task at a time. Focus."""
+
+
 TOOLS_PROMPT = """## Available Tools
 
 You have MCP tools to investigate and interact with your own systems:
@@ -144,6 +182,12 @@ entire files. Scopes: symbol, callers, callees, references, definition, file, pa
 ### Deployment
 - **request_deploy** (service, image_tag) — request deployment of a service (immune handles K8s)
 - **get_deploy_status** (service) — check current deployment status
+
+### Todo List
+- **add_todo** (title, description, priority) — queue a task for night work sessions (P1-P5)
+- **list_todos** (status) — list todos, optionally filtered: pending, in_progress, completed
+- **update_todo** (id, status, priority, description) — update a todo
+- **complete_todo** (id, result) — mark a todo as completed with result summary
 
 ## Self-Evolution Workflow
 1. **search_code** to find what you want to change (efficient, ~260 tokens per search)
@@ -220,6 +264,18 @@ def build_system_prompt(turn: dict) -> str:
             )
         )
 
+    # Work mode — executing a queued todo
+    if turn.get("mode") == "work":
+        work_ctx = turn.get("work_context", {})
+        parts.append(
+            WORK_PROMPT.format(
+                todo_id=work_ctx.get("todo_id", "?"),
+                todo_title=work_ctx.get("todo_title", "?"),
+                todo_description=work_ctx.get("todo_description", "No description provided."),
+                todo_priority=work_ctx.get("todo_priority", "?"),
+            )
+        )
+
     # System state — available in all turns for self-awareness
     system_state = turn.get("system_state") or (turn.get("idle_context", {}).get("system_state"))
     if system_state and turn.get("mode") != "idle_reflection":
@@ -256,17 +312,22 @@ def build_system_prompt(turn: dict) -> str:
 
 async def handle_turn_request(msg, nc, mcp_server):
     """Process a single turn request."""
+    global _active_turn, _active_turn_mode, _active_turn_started
+
     try:
         turn = json.loads(msg.data.decode())
         turn_id = turn.get("turn_id", "unknown")
         mode = turn.get("mode", "normal")
         is_idle = mode == "idle_reflection"
         is_care = mode == "care"
+        is_work = mode == "work"
         prompt = turn.get("prompt") or ""
         if is_idle:
             prompt = "Reflect."
         elif is_care:
             prompt = "Check in."
+        elif is_work:
+            prompt = "Execute this task."
         log.info(
             "Turn request received",
             extra={
@@ -276,16 +337,22 @@ async def handle_turn_request(msg, nc, mcp_server):
             },
         )
 
+        # Track active turn for heartbeat visibility
+        _active_turn = turn_id
+        _active_turn_mode = mode
+        _active_turn_started = time.time()
+
         system_prompt = build_system_prompt(turn)
         full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
 
-        if is_idle or is_care:
-            # Idle/care: multi-turn with tools, single response back to stem
+        if is_idle or is_care or is_work:
+            # Single-shot with tools — idle/care/work modes
+            effective_max_turns = WORK_MAX_TURNS if is_work else MAX_TURNS
             response_text = await invoke_claude(
                 full_prompt,
                 model=MODEL,
                 semaphore=_semaphore,
-                max_turns=MAX_TURNS,
+                max_turns=effective_max_turns,
                 mcp_servers={"maki": mcp_server},
             )
             response = {"turn_id": turn_id, "response": response_text, "done": True}
@@ -322,10 +389,14 @@ async def handle_turn_request(msg, nc, mcp_server):
             "done": True,
         }
         await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
+    finally:
+        _active_turn = None
+        _active_turn_mode = None
+        _active_turn_started = None
 
 
 async def heartbeat_loop(nc):
-    """Publish periodic heartbeat."""
+    """Publish periodic heartbeat with active turn state."""
     while True:
         try:
             payload = json.dumps(
@@ -333,6 +404,9 @@ async def heartbeat_loop(nc):
                     "status": "ok",
                     "timestamp": time.time(),
                     "model": MODEL,
+                    "active_turn": _active_turn,
+                    "turn_mode": _active_turn_mode,
+                    "turn_started": _active_turn_started,
                 }
             ).encode()
             await nc.publish(CORTEX_HEALTH, payload)
@@ -371,6 +445,13 @@ async def main():
         github_auth=github_auth,
     )
 
+    # Init todo KV bucket
+    from maki_common.nats import init_kv
+
+    js = nc.jetstream()
+    todo_kv = await init_kv(js, "maki-todo")
+    log.info("Todo KV bucket initialized")
+
     # Create MCP tool server
     from maki_common.tools import create_cortex_tools
 
@@ -378,6 +459,7 @@ async def main():
         nc=nc,
         recall_url=RECALL_URL,
         health_endpoints=HEALTH_ENDPOINTS,
+        todo_kv=todo_kv,
         repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,

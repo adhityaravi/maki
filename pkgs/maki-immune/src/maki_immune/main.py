@@ -19,6 +19,7 @@ from maki_common.config import apply_config_updates, parse_tagged
 from maki_common.health import tcp_health_server
 from maki_common.subjects import (
     CORTEX_HEALTH,
+    CORTEX_STUCK,
     DEPLOY_REQUEST,
     DEPLOY_STATUS_REQUEST,
     EARS_VITALS_OUT,
@@ -169,6 +170,9 @@ _recent_actions: list[dict] = []
 _deploy_history: dict[str, str] = {}
 _pod_metrics: dict = {}
 _last_cortex_heartbeat: float = 0
+_cortex_active_turn: str | None = None
+_cortex_turn_mode: str | None = None
+_cortex_turn_started: float | None = None
 _last_incident_time: float = 0
 _semaphore = asyncio.Semaphore(1)
 
@@ -377,16 +381,22 @@ async def _check_pod_metrics():
 
 
 def _check_cortex_heartbeat():
-    """Check if cortex heartbeat is recent."""
+    """Check if cortex heartbeat is recent and include turn state."""
     if _last_cortex_heartbeat == 0:
         return
     age = time.time() - _last_cortex_heartbeat
+    details: dict = {
+        "last_heartbeat_age_s": round(age, 1),
+    }
+    if _cortex_active_turn:
+        details["active_turn"] = _cortex_active_turn
+        details["turn_mode"] = _cortex_turn_mode
+        if _cortex_turn_started:
+            details["turn_running_s"] = round(time.time() - _cortex_turn_started, 1)
     _update_health(
         "maki-cortex-heartbeat",
         age < 60,
-        {
-            "last_heartbeat_age_s": round(age, 1),
-        },
+        details,
     )
 
 
@@ -415,13 +425,17 @@ async def _health_monitor_loop():
 
 
 async def _cortex_heartbeat_listener():
-    """Subscribe to cortex health heartbeat."""
-    global _last_cortex_heartbeat
+    """Subscribe to cortex health heartbeat and parse enriched turn state."""
+    global _last_cortex_heartbeat, _cortex_active_turn, _cortex_turn_mode, _cortex_turn_started
     sub = await _nc.subscribe(CORTEX_HEALTH)
     log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
     async for msg in sub.messages:
         try:
             _last_cortex_heartbeat = time.time()
+            payload = json.loads(msg.data.decode())
+            _cortex_active_turn = payload.get("active_turn")
+            _cortex_turn_mode = payload.get("turn_mode")
+            _cortex_turn_started = payload.get("turn_started")
         except Exception:
             pass
 
@@ -543,6 +557,9 @@ async def _state_request_handler(msg):
             "recent_actions": _recent_actions[-10:],
             "lock": lock_info,
             "last_cortex_heartbeat": _last_cortex_heartbeat,
+            "cortex_active_turn": _cortex_active_turn,
+            "cortex_turn_mode": _cortex_turn_mode,
+            "cortex_turn_started": _cortex_turn_started,
             "last_incident_time": _last_incident_time,
         }
         await msg.respond(json.dumps(state).encode())
@@ -831,6 +848,14 @@ def _build_system_state() -> str:
             parts.append(f"cpu_usage={m.get('cpu', '?')}")
             parts.append(f"mem_usage={m.get('memory', '?')}")
 
+        # Attach cortex turn state for heartbeat component
+        if component == "maki-cortex-heartbeat" and details.get("active_turn"):
+            parts.append(f"active_turn={details['active_turn']}")
+            parts.append(f"mode={details.get('turn_mode', '?')}")
+            turn_running = details.get("turn_running_s")
+            if turn_running is not None:
+                parts.append(f"turn_running={round(turn_running / 60, 1)}min")
+
         lines.append(f"- {component}: {status} ({', '.join(parts)})")
 
     if not lines:
@@ -889,6 +914,42 @@ async def _immune_heartbeat_loop():
 
         except Exception:
             log.exception("Immune heartbeat error")
+
+
+# --- Cortex Stuck Handler ---
+
+
+async def _cortex_stuck_handler(msg):
+    """Handle cortex stuck signal — immediately escalate to Claude."""
+    try:
+        payload = json.loads(msg.data.decode())
+        turn_id = payload.get("turn_id", "unknown")
+        mode = payload.get("mode", "unknown")
+        timeout_s = payload.get("timeout_seconds", 0)
+        user_waiting = payload.get("user_waiting", False)
+
+        log.warning(
+            "Cortex stuck signal received",
+            extra={"turn_id": turn_id, "mode": mode, "timeout_s": timeout_s, "user_waiting": user_waiting},
+        )
+
+        state = {
+            "turn_id": turn_id,
+            "mode": mode,
+            "timeout_seconds": timeout_s,
+            "user_waiting": user_waiting,
+            "cortex_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
+            if _last_cortex_heartbeat
+            else None,
+        }
+        reason = f"Cortex turn {turn_id} (mode={mode}) timed out after {timeout_s}s" + (
+            ". User is waiting for a response." if user_waiting else "."
+        )
+
+        asyncio.create_task(_escalate_to_claude("maki-cortex", state, reason))
+
+    except Exception:
+        log.exception("Cortex stuck handler error")
 
 
 # --- Main ---
@@ -956,6 +1017,9 @@ async def main():
 
     await _nc.subscribe(DEPLOY_STATUS_REQUEST, cb=_deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
+
+    await _nc.subscribe(CORTEX_STUCK, cb=_cortex_stuck_handler)
+    log.info("Subscribed", extra={"subject": CORTEX_STUCK})
 
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_immune_heartbeat_loop())

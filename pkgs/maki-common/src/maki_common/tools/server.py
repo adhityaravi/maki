@@ -136,6 +136,7 @@ def create_cortex_tools(
     recall_url: str,
     health_endpoints: dict[str, str],
     config_kv: Any | None = None,
+    todo_kv: Any | None = None,
     repo_path: str | None = None,
     github_app_id: str | None = None,
     github_private_key: str | None = None,
@@ -145,13 +146,14 @@ def create_cortex_tools(
 ) -> Any:
     """Create an in-process MCP server with cortex tools.
 
-    Includes: recall, health, deploy, config, local code, codegraph, github CI.
+    Includes: recall, health, deploy, config, todo, local code, codegraph, github CI.
 
     Args:
         nc: NATS client.
         recall_url: Base URL for maki-recall API.
         health_endpoints: Map of component name to health URL.
         config_kv: NATS KV store for config (optional).
+        todo_kv: NATS KV store for todo list (optional).
         repo_path: Local repo clone path (optional, enables code tools).
         github_app_id: GitHub App ID (optional, enables GitHub CI tools).
         github_private_key: GitHub App private key PEM string.
@@ -174,6 +176,11 @@ def create_cortex_tools(
         from maki_common.tools.config import make_config_tools
 
         all_tools.extend(make_config_tools(config_kv))
+
+    if todo_kv is not None:
+        from maki_common.tools.todo import make_todo_tools
+
+        all_tools.extend(make_todo_tools(todo_kv))
 
     # Local code + CodeGraph tools (replaces GitHub API file tools)
     github_auth = None

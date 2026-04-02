@@ -372,9 +372,7 @@ def make_k8s_tools(
             container_name = dep.spec.template.spec.containers[0].name
 
             if current_image == previous_image:
-                return mcp_result(
-                    f"{deployment_name} is already running {previous_image}. Nothing to rollback."
-                )
+                return mcp_result(f"{deployment_name} is already running {previous_image}. Nothing to rollback.")
 
             patch = {
                 "spec": {

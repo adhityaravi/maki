@@ -27,6 +27,7 @@ from maki_common import (
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
     CONVERSATION_STREAM,
+    CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
     EARS_MESSAGE_IN,
@@ -69,6 +70,10 @@ HEALTH_ENDPOINTS = {
 
 CARE_CHECK_INTERVAL = int(os.environ.get("CARE_CHECK_INTERVAL", "60"))
 
+WORK_CHECK_INTERVAL = int(os.environ.get("WORK_CHECK_INTERVAL", "300"))
+WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minutes
+USER_INACTIVE_THRESHOLD = 7200  # 2 hours
+
 DEFAULT_CORTEX_CONFIG = {
     "idle_interval": 7200,
     "care_interval": 1800,
@@ -76,6 +81,10 @@ DEFAULT_CORTEX_CONFIG = {
     "quiet_hours_end": "07:00",
     "max_thoughts_per_day": 5,
     "max_reminders_per_day": 5,
+    "work_hours_start": "01:00",
+    "work_hours_end": "06:00",
+    "max_work_items_per_night": 2,
+    "work_cooldown_minutes": 15,
 }
 
 DEFAULT_IDENTITY = """You are Maki.
@@ -114,6 +123,9 @@ _thoughts_today: int = 0
 _thoughts_today_date: str = ""
 _reminders_today: int = 0
 _reminders_today_date: str = ""
+_todo_kv = None
+_work_items_tonight: int = 0
+_work_items_tonight_date: str = ""
 
 
 async def _response_listener():
@@ -336,6 +348,42 @@ def _in_quiet_hours(config: dict) -> bool:
     if start > end:  # spans midnight (e.g., 23:00 - 07:00)
         return current >= start or current < end
     return start <= current < end
+
+
+def _in_work_hours(config: dict) -> bool:
+    """Check if current time is within work hours."""
+    now = datetime.now()
+    current = now.hour * 60 + now.minute
+
+    start_parts = config.get("work_hours_start", "01:00").split(":")
+    end_parts = config.get("work_hours_end", "06:00").split(":")
+    start = int(start_parts[0]) * 60 + int(start_parts[1])
+    end = int(end_parts[0]) * 60 + int(end_parts[1])
+
+    if start > end:  # spans midnight
+        return current >= start or current < end
+    return start <= current < end
+
+
+async def _get_pending_todos() -> list[dict]:
+    """Read all pending todos from KV, sorted by priority (1=highest)."""
+    todos = []
+    try:
+        keys = await _todo_kv.keys()
+    except Exception:
+        return []
+
+    for key in keys:
+        try:
+            entry = await _todo_kv.get(key)
+            todo = json.loads(entry.value.decode())
+            if todo.get("status") == "pending":
+                todos.append(todo)
+        except Exception:
+            continue
+
+    todos.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", 0)))
+    return todos
 
 
 async def _idle_loop():
@@ -563,9 +611,148 @@ async def _care_loop():
             log.exception("Care loop error")
 
 
+async def _work_loop():
+    """Night work loop — execute queued todos while the user sleeps."""
+    global _work_items_tonight, _work_items_tonight_date
+
+    log.info("Work loop started", extra={"check_interval": WORK_CHECK_INTERVAL})
+
+    while True:
+        await asyncio.sleep(WORK_CHECK_INTERVAL)
+
+        try:
+            config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
+
+            if not _in_work_hours(config):
+                continue
+
+            # Reset nightly counter if date changed
+            tonight = datetime.now().strftime("%Y-%m-%d")
+            if tonight != _work_items_tonight_date:
+                _work_items_tonight = 0
+                _work_items_tonight_date = tonight
+
+            max_items = config.get("max_work_items_per_night", 2)
+            if _work_items_tonight >= max_items:
+                continue
+
+            # Only work if user has been inactive
+            if time.time() - _last_activity < USER_INACTIVE_THRESHOLD:
+                log.info("Work loop: user recently active, skipping")
+                continue
+
+            todos = await _get_pending_todos()
+            if not todos:
+                continue
+
+            todo = todos[0]
+            todo_id = todo["id"]
+            log.info(
+                "Work loop: starting task",
+                extra={"todo_id": todo_id, "title": todo["title"], "priority": todo["priority"]},
+            )
+
+            # Mark as in_progress
+            todo["status"] = "in_progress"
+            await _todo_kv.put(todo_id, json.dumps(todo).encode())
+
+            # Load identity
+            try:
+                entry = await _kv.get(KV_KEY)
+                identity = entry.value.decode()
+            except Exception:
+                identity = DEFAULT_IDENTITY
+
+            turn_id = f"work-{uuid.uuid4().hex[:8]}"
+            work_payload = {
+                "turn_id": turn_id,
+                "mode": "work",
+                "identity": identity,
+                "conversation": [],
+                "memories": [],
+                "graph_context": [],
+                "prompt": None,
+                "work_context": {
+                    "todo_id": todo_id,
+                    "todo_title": todo["title"],
+                    "todo_description": todo.get("description", ""),
+                    "todo_priority": todo["priority"],
+                },
+            }
+
+            queue = _pending.create(turn_id)
+
+            try:
+                await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
+                log.info("Work turn published", extra={"turn_id": turn_id, "todo_id": todo_id})
+
+                response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
+                result_text = response_data.get("response", "")
+                _work_items_tonight += 1
+
+                clean_result = strip_tags(result_text or "")
+                if clean_result and clean_result != "[SILENT]":
+                    thought_payload = {
+                        "thought": f"[Night work] Completed: {todo['title']}\n{clean_result}",
+                        "turn_id": turn_id,
+                    }
+                    await _nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
+
+                log.info(
+                    "Work turn complete",
+                    extra={
+                        "turn_id": turn_id,
+                        "todo_id": todo_id,
+                        "work_items_tonight": _work_items_tonight,
+                        "max": max_items,
+                    },
+                )
+
+                asyncio.create_task(
+                    _feed_memories(
+                        f"[Night work] Task: {todo['title']} (priority {todo['priority']})",
+                        clean_result or "Task completed",
+                    )
+                )
+
+            except TimeoutError:
+                log.error("Work turn timed out", extra={"turn_id": turn_id, "todo_id": todo_id})
+                # Publish stuck signal for immune
+                await _nc.publish(
+                    CORTEX_STUCK,
+                    json.dumps(
+                        {
+                            "turn_id": turn_id,
+                            "mode": "work",
+                            "timeout_seconds": WORK_TURN_TIMEOUT,
+                            "user_waiting": False,
+                        }
+                    ).encode(),
+                )
+                # Revert todo to pending
+                todo["status"] = "pending"
+                await _todo_kv.put(todo_id, json.dumps(todo).encode())
+
+            except Exception:
+                log.exception("Work turn failed", extra={"turn_id": turn_id, "todo_id": todo_id})
+                todo["status"] = "pending"
+                await _todo_kv.put(todo_id, json.dumps(todo).encode())
+
+            finally:
+                _pending.remove(turn_id)
+
+            # Cooldown between work items
+            cooldown = config.get("work_cooldown_minutes", 15) * 60
+            log.info("Work cooldown", extra={"cooldown_seconds": cooldown})
+            await asyncio.sleep(cooldown)
+
+        except Exception:
+            log.exception("Work loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _nc, _js, _config_kv
+    global _nc, _js, _config_kv, _todo_kv
     log.info("maki-stem starting", extra={"nats_url": NATS_URL})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
@@ -574,11 +761,14 @@ async def lifespan(app: FastAPI):
     await _seed_identity()
     await _init_conversation_stream()
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CORTEX_CONFIG)
+    _todo_kv = await init_kv(_js, "maki-todo")
+    log.info("Todo KV bucket initialized")
     asyncio.create_task(_response_listener())
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_idle_loop())
     asyncio.create_task(_care_loop())
+    asyncio.create_task(_work_loop())
 
     yield
 
@@ -672,9 +862,7 @@ async def _process_turn(
 
         # Parse and apply any config tags from cortex response
         config_updates = parse_config_tags(response_text)
-        await apply_config_updates(
-            _config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys())
-        )
+        await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
         log.info("Turn complete", extra={"turn_id": turn_id, "chunks": len(chunks)})
 
@@ -689,6 +877,21 @@ async def _process_turn(
         return turn_id, response_text
 
     except TimeoutError:
+        # Publish stuck signal for immune awareness
+        try:
+            await _nc.publish(
+                CORTEX_STUCK,
+                json.dumps(
+                    {
+                        "turn_id": turn_id,
+                        "mode": "normal",
+                        "timeout_seconds": TURN_TIMEOUT,
+                        "user_waiting": True,
+                    }
+                ).encode(),
+            )
+        except Exception:
+            log.exception("Failed to publish stuck signal")
         raise
     except Exception:
         log.exception("Turn failed", extra={"turn_id": turn_id})
