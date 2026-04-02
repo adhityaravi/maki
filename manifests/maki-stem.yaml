@@ -29,12 +29,23 @@ spec:
       labels:
         app: maki-stem
     spec:
+      volumes:
+        - name: github-key
+          secret:
+            secretName: maki-github-app
+            items:
+              - key: private-key.pem
+                path: private-key.pem
       containers:
         - name: stem
           image: ghcr.io/adhityaravi/maki-stem:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
+          volumeMounts:
+            - name: github-key
+              mountPath: /etc/maki-github
+              readOnly: true
           env:
             - name: NATS_URL
               value: "nats://maki-nerve-nats:4222"
@@ -45,6 +56,22 @@ spec:
                   key: token
             - name: TURN_TIMEOUT
               value: "1800"
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: maki-github-app
+                  key: app-id
+            - name: GITHUB_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: maki-github-app
+                  key: installation-id
+            - name: GITHUB_PRIVATE_KEY_PATH
+              value: "/etc/maki-github/private-key.pem"
+            - name: REPO_OWNER
+              value: "adhityaravi"
+            - name: REPO_NAME
+              value: "maki"
           readinessProbe:
             httpGet:
               path: /health
