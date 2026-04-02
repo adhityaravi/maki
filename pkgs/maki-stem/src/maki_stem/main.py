@@ -974,6 +974,17 @@ async def _ears_listener():
             await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
         except Exception:
             log.exception("Error processing Discord message")
+            # Always send done signal so ears stops typing
+            try:
+                error_msg = {
+                    "message_id": data.get("message_id", ""),
+                    "channel_id": data.get("channel_id", ""),
+                    "response": "",
+                    "done": True,
+                }
+                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+            except Exception:
+                log.exception("Failed to send done signal to ears")
 
 
 @app.get("/health")

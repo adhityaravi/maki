@@ -32,6 +32,10 @@ THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-thoughts")
 VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-vitals")
 REMINDERS_CHANNEL_NAME = os.environ.get("REMINDERS_CHANNEL_NAME", "maki-reminders")
 
+# Timeout (seconds) after receiving the last chunk before assuming done.
+# Safety net in case the done signal is lost in transit.
+CHUNK_INACTIVITY_TIMEOUT = 30.0
+
 _nc = None
 _pending = PendingQueues()
 _general_channel_ids: set[int] = set()
@@ -159,14 +163,27 @@ async def on_message(message: discord.Message):
     thinking_emoji = "\U0001f363"  # 🍣
     await message.add_reaction(thinking_emoji)
 
+    received_any = False
     queue = _pending.create(str(message.id))
     try:
         async with message.channel.typing():
             while True:
+                # Use shorter timeout once we've received at least one chunk.
+                # If done signal is lost, we don't hang forever.
+                timeout = CHUNK_INACTIVITY_TIMEOUT if received_any else 1860.0
+
                 try:
-                    data = await asyncio.wait_for(queue.get(), timeout=1860.0)
+                    data = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except TimeoutError:
-                    await message.channel.send("Sorry, I took too long thinking about that. Try again?")
+                    if received_any:
+                        log.warning(
+                            "No done signal received after last chunk, assuming done",
+                            extra={"message_id": str(message.id)},
+                        )
+                    else:
+                        await message.channel.send(
+                            "Sorry, I took too long thinking about that. Try again?"
+                        )
                     break
 
                 # Skip reaction messages from cortex
@@ -178,6 +195,7 @@ async def on_message(message: discord.Message):
 
                 if chunk:
                     await _send_response(message.channel, chunk)
+                    received_any = True
 
                 if done:
                     break
