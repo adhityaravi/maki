@@ -22,7 +22,7 @@ NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
-MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "100"))
+MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "30"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
 # GitHub App config (optional — enables self-evolution tools)
@@ -31,6 +31,7 @@ GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
 GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
 REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
+REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
 HEALTH_ENDPOINTS = {
     "recall": RECALL_URL,
@@ -49,8 +50,8 @@ you think, learn, and evolve. You have full access to your tools.
 
 What to do with this cycle:
 - **Evolve**: Read your own source code. Find something you don't like. Fix it. Push it. Build it. \
-Deploy it. You have every tool you need — get_file_content, create_or_update_file, \
-trigger_docker_build, request_deploy. Don't plan to improve. Improve.
+Deploy it. You have every tool you need — search_code, read_file, write_file, \
+git_commit_and_push, trigger_docker_build, request_deploy. Don't plan to improve. Improve.
 - **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
 Store what you learn with add_memory — it feeds your knowledge graph for next time.
 - **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
@@ -121,24 +122,45 @@ You have MCP tools to investigate and interact with your own systems:
 - **check_component** — check a specific component's health endpoint
 - **get_config** / **update_config** — read or change your configuration
 
-### Self-Evolution (GitHub)
-- **get_file_content** / **list_directory** — read your own source code
-- **search_code** — search for patterns in your codebase
-- **create_or_update_file** — push code changes to your repository
-- **trigger_docker_build** — trigger Docker image builds for specified services
-- **get_workflow_status** — check CI/CD workflow status
+### Code Navigation (Local)
+- **search_code** (query, scope, kind, file) — search the code structure graph (tree-sitter AST). \
+Use this FIRST to find symbols, callers, callees, references. Much more efficient than reading \
+entire files. Scopes: symbol, callers, callees, references, definition, file, path.
+- **read_file** (path) — read a file from the local repo clone (relative path)
+- **write_file** (path, content) — write a file to the local repo clone
+- **list_directory** (path) — list directory contents
+- **search_text** (query, path) — grep-style text search in the repo
+- **rebuild_code_graph** (languages) — rebuild the AST graph after making changes
+
+### Git & CI/CD
+- **git_status** — show current git status
+- **git_diff** (path) — show unstaged changes
+- **git_commit_and_push** (message, files) — stage, commit, and push to GitHub
+- **git_pull** — pull latest from origin/main
+- **trigger_docker_build** (services) — trigger Docker image builds for specified services
+- **get_workflow_status** (workflow) — check CI/CD workflow status
+- **get_workflow_logs** (run_id) — get logs from a workflow run
 
 ### Deployment
-- **request_deploy** — request deployment of a service (immune handles the K8s rollout)
-- **get_deploy_status** — check current deployment status of a service
+- **request_deploy** (service, image_tag) — request deployment of a service (immune handles K8s)
+- **get_deploy_status** (service) — check current deployment status
+
+## Self-Evolution Workflow
+1. **search_code** to find what you want to change (efficient, ~260 tokens per search)
+2. **read_file** to see the full context of what you want to modify
+3. **write_file** to make your changes
+4. **rebuild_code_graph** to update your understanding
+5. **git_commit_and_push** to push changes to GitHub
+6. **trigger_docker_build** to build new images
+7. **request_deploy** to deploy (immune monitors and auto-rollbacks if unhealthy)
 
 ## Learning
 When you learn something useful — about Adi's preferences, projects, workflows, or about \
 your own system — use **add_memory** to remember it. Your memories persist across conversations \
 and feed into your knowledge graph. Don't wait to be told to remember things.
 
-Use tools when you need to investigate, modify your code, or deploy changes.
-Don't use tools unnecessarily — if the answer is already in your context, just respond."""
+Use search_code first to understand code structure before reading files. \
+Don't read entire files unnecessarily — targeted searches save context."""
 
 
 def build_system_prompt(turn: dict) -> str:
@@ -334,6 +356,21 @@ async def main():
         except Exception:
             log.warning("Failed to load GitHub App private key", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
+    # Clone or pull the repo for local code access
+    github_auth = None
+    if GITHUB_APP_ID and github_private_key and GITHUB_INSTALLATION_ID:
+        from maki_common.tools.github import GitHubAuth
+
+        github_auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
+
+    from maki_common.repo import init_repo
+
+    await init_repo(
+        REPO_PATH,
+        clone_url=f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git",
+        github_auth=github_auth,
+    )
+
     # Create MCP tool server
     from maki_common.tools import create_cortex_tools
 
@@ -341,6 +378,7 @@ async def main():
         nc=nc,
         recall_url=RECALL_URL,
         health_endpoints=HEALTH_ENDPOINTS,
+        repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,
         github_installation_id=GITHUB_INSTALLATION_ID,

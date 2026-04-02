@@ -66,6 +66,7 @@ def create_immune_tools(
     config_kv: Any | None = None,
     recall_url: str | None = None,
     deploy_history: dict[str, str] | None = None,
+    repo_path: str | None = None,
 ) -> Any:
     """Create an in-process MCP server with immune-specific tools.
 
@@ -82,6 +83,7 @@ def create_immune_tools(
         config_kv: NATS KV store for config (optional).
         recall_url: Base URL for maki-recall API (optional, enables memory tools).
         deploy_history: Mutable dict mapping deployment name to previous image (for rollbacks).
+        repo_path: Local repo clone path (optional, enables code tools read-only).
     """
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -113,6 +115,13 @@ def create_immune_tools(
 
         all_tools.extend(make_config_tools(config_kv, allowed_keys=IMMUNE_CONFIG_KEYS))
 
+    if repo_path:
+        from maki_common.tools.codegraph_tools import make_codegraph_tools
+        from maki_common.tools.local_code import make_code_tools
+
+        all_tools.extend(make_code_tools(repo_path))
+        all_tools.extend(make_codegraph_tools(repo_path))
+
     sdk_tools = []
     for name, description, params, handler in all_tools:
         decorated = tool(name, description, params)(handler)
@@ -127,20 +136,24 @@ def create_cortex_tools(
     recall_url: str,
     health_endpoints: dict[str, str],
     config_kv: Any | None = None,
+    repo_path: str | None = None,
     github_app_id: str | None = None,
     github_private_key: str | None = None,
     github_installation_id: str | None = None,
     repo_owner: str | None = None,
     repo_name: str | None = None,
 ) -> Any:
-    """Create an in-process MCP server with cortex tools (base + github + deploy).
+    """Create an in-process MCP server with cortex tools.
+
+    Includes: recall, health, deploy, config, local code, codegraph, github CI.
 
     Args:
         nc: NATS client.
         recall_url: Base URL for maki-recall API.
         health_endpoints: Map of component name to health URL.
         config_kv: NATS KV store for config (optional).
-        github_app_id: GitHub App ID (optional, enables GitHub tools).
+        repo_path: Local repo clone path (optional, enables code tools).
+        github_app_id: GitHub App ID (optional, enables GitHub CI tools).
         github_private_key: GitHub App private key PEM string.
         github_installation_id: GitHub App installation ID.
         repo_owner: GitHub repo owner.
@@ -162,11 +175,34 @@ def create_cortex_tools(
 
         all_tools.extend(make_config_tools(config_kv))
 
+    # Local code + CodeGraph tools (replaces GitHub API file tools)
+    github_auth = None
+    if github_app_id and github_private_key and github_installation_id:
+        from maki_common.tools.github import GitHubAuth
+
+        github_auth = GitHubAuth(github_app_id, github_private_key, github_installation_id)
+
+    if repo_path:
+        from maki_common.tools.codegraph_tools import make_codegraph_tools
+        from maki_common.tools.local_code import make_code_edit_tools, make_code_tools
+
+        all_tools.extend(make_code_tools(repo_path))
+        all_tools.extend(
+            make_code_edit_tools(
+                repo_path,
+                github_auth=github_auth,
+                repo_owner=repo_owner or "",
+                repo_name=repo_name or "",
+            )
+        )
+        all_tools.extend(make_codegraph_tools(repo_path))
+
+    # GitHub CI tools (trigger builds, check status) — still needs API
     if github_app_id and github_private_key and github_installation_id and repo_owner and repo_name:
-        from maki_common.tools.github import make_github_tools
+        from maki_common.tools.github import make_github_ci_tools
 
         all_tools.extend(
-            make_github_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
+            make_github_ci_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
         )
 
     sdk_tools = []

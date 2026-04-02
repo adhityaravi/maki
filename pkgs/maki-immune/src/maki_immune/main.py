@@ -37,6 +37,7 @@ HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
+REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
 HEALTH_ENDPOINTS = {
     "maki-stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
@@ -908,6 +909,14 @@ async def main():
     # Load previous deploy history for rollback support
     await _load_deploy_history()
 
+    # Clone or pull the repo for local code access (read-only)
+    from maki_common.repo import init_repo
+
+    await init_repo(
+        REPO_PATH,
+        clone_url="https://github.com/adhityaravi/maki.git",
+    )
+
     try:
         k8s_config.load_incluster_config()
         _k8s_v1 = k8s_client.CoreV1Api()
@@ -935,6 +944,7 @@ async def main():
         config_kv=_config_kv,
         recall_url=RECALL_URL,
         deploy_history=_deploy_history,
+        repo_path=REPO_PATH,
     )
     log.info("Immune MCP tools registered")
 

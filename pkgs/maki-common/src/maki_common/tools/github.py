@@ -1,8 +1,7 @@
-"""GitHub API tools — read, write, and manage the Maki repo."""
+"""GitHub API tools — CI/CD operations (builds, workflow status, logs)."""
 
 from __future__ import annotations
 
-import base64
 import logging
 import time
 from typing import Any
@@ -17,8 +16,11 @@ log = logging.getLogger(__name__)
 API = "https://api.github.com"
 
 
-class _GitHubAuth:
-    """GitHub App authentication — generates installation tokens from JWT."""
+class GitHubAuth:
+    """GitHub App authentication — generates installation tokens from JWT.
+
+    Used by both GitHub CI tools and local git push operations.
+    """
 
     def __init__(self, app_id: str, private_key: str, installation_id: str):
         self._app_id = app_id
@@ -58,128 +60,22 @@ class _GitHubAuth:
         }
 
 
-def make_github_tools(
+def make_github_ci_tools(
     app_id: str,
     private_key: str,
     installation_id: str,
     repo_owner: str,
     repo_name: str,
 ) -> list[tuple[str, str, dict[str, type], Any]]:
-    """Return (name, description, params, handler) tuples for GitHub tools."""
+    """Return (name, description, params, handler) tuples for GitHub CI tools.
 
-    auth = _GitHubAuth(app_id, private_key, installation_id)
+    These tools handle CI/CD operations only (triggering builds, checking
+    workflow status, reading logs). File read/write is handled by local_code tools.
+    """
+
+    auth = GitHubAuth(app_id, private_key, installation_id)
     repo = f"{repo_owner}/{repo_name}"
     client = httpx.AsyncClient(timeout=30.0)
-
-    def _normalize_path(path: str) -> str:
-        """Normalize path for GitHub Contents API (root = empty string)."""
-        return path.strip("/")
-
-    async def get_file_content(args: dict[str, Any]) -> dict[str, Any]:
-        """Read a file from the repository."""
-        path = _normalize_path(args.get("path", ""))
-        ref = args.get("ref", "main")
-        log.info("Tool: get_file_content", extra={"path": path, "ref": ref})
-        try:
-            resp = await client.get(
-                f"{API}/repos/{repo}/contents/{path}",
-                headers=await auth.headers(),
-                params={"ref": ref},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("type") != "file":
-                return mcp_result(f"'{path}' is a {data.get('type')}, not a file. Use list_directory instead.")
-            content = base64.b64decode(data["content"]).decode()
-            return mcp_result(content)
-        except httpx.HTTPStatusError as e:
-            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
-        except Exception as e:
-            return mcp_result(f"Error: {e}")
-
-    async def list_directory(args: dict[str, Any]) -> dict[str, Any]:
-        """List contents of a directory in the repository."""
-        path = _normalize_path(args.get("path", ""))
-        ref = args.get("ref", "main")
-        log.info("Tool: list_directory", extra={"path": path, "ref": ref})
-        try:
-            resp = await client.get(
-                f"{API}/repos/{repo}/contents/{path}",
-                headers=await auth.headers(),
-                params={"ref": ref},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list):
-                return mcp_result(f"'{path}' is a file, not a directory. Use get_file_content instead.")
-            lines = [f"{'d' if item['type'] == 'dir' else 'f'}  {item['name']}" for item in data]
-            return mcp_result("\n".join(lines))
-        except httpx.HTTPStatusError as e:
-            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
-        except Exception as e:
-            return mcp_result(f"Error: {e}")
-
-    async def search_code(args: dict[str, Any]) -> dict[str, Any]:
-        """Search code in the repository."""
-        query = args.get("query", "")
-        log.info("Tool: search_code", extra={"query": query})
-        try:
-            resp = await client.get(
-                f"{API}/search/code",
-                headers=await auth.headers(),
-                params={"q": f"{query} repo:{repo}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", [])[:20]
-            if not items:
-                return mcp_result("No results found.")
-            lines = [f"{item['path']} (score: {item.get('score', '?')})" for item in items]
-            return mcp_result(f"Found {data['total_count']} results:\n" + "\n".join(lines))
-        except httpx.HTTPStatusError as e:
-            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
-        except Exception as e:
-            return mcp_result(f"Error: {e}")
-
-    async def create_or_update_file(args: dict[str, Any]) -> dict[str, Any]:
-        """Create or update a file in the repository on main branch."""
-        path = args.get("path", "")
-        content = args.get("content", "")
-        commit_msg = args.get("message", f"Update {path}")
-        log.info("Tool: create_or_update_file", extra={"path": path, "commit_msg": commit_msg})
-        try:
-            # Get current file SHA if it exists (needed for updates)
-            sha = None
-            resp = await client.get(
-                f"{API}/repos/{repo}/contents/{path}",
-                headers=await auth.headers(),
-                params={"ref": "main"},
-            )
-            if resp.status_code == 200:
-                sha = resp.json().get("sha")
-
-            body: dict[str, Any] = {
-                "message": commit_msg,
-                "content": base64.b64encode(content.encode()).decode(),
-                "branch": "main",
-            }
-            if sha:
-                body["sha"] = sha
-
-            resp = await client.put(
-                f"{API}/repos/{repo}/contents/{path}",
-                headers=await auth.headers(),
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            commit_sha = data["commit"]["sha"][:7]
-            action = "Updated" if sha else "Created"
-            return mcp_result(f"{action} {path} — commit {commit_sha}")
-        except httpx.HTTPStatusError as e:
-            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
-        except Exception as e:
-            return mcp_result(f"Error: {e}")
 
     async def trigger_docker_build(args: dict[str, Any]) -> dict[str, Any]:
         """Trigger the Docker build workflow for specified services."""
@@ -273,8 +169,7 @@ def make_github_tools(
                     output_parts.append(f"=== Job: {job['name']} ({job['conclusion']}) ===\n{log_text}")
                 else:
                     output_parts.append(
-                        f"=== Job: {job['name']} ({job['conclusion']}) === "
-                        f"Failed to fetch logs: {log_resp.status_code}"
+                        f"=== Job: {job['name']} ({job['conclusion']}) === Failed to fetch logs: {log_resp.status_code}"
                     )
 
             if not output_parts:
@@ -287,31 +182,6 @@ def make_github_tools(
             return mcp_result(f"Error: {e}")
 
     return [
-        (
-            "get_file_content",
-            "Read a file from the Maki GitHub repository.",
-            {"path": str, "ref": str},
-            get_file_content,
-        ),
-        (
-            "list_directory",
-            "List contents of a directory in the Maki GitHub repository.",
-            {"path": str, "ref": str},
-            list_directory,
-        ),
-        (
-            "search_code",
-            "Search for code patterns in the Maki GitHub repository.",
-            {"query": str},
-            search_code,
-        ),
-        (
-            "create_or_update_file",
-            "Create or update a file in the Maki GitHub repository on the main branch. "
-            "Provide the full file content, not a diff.",
-            {"path": str, "content": str, "message": str},
-            create_or_update_file,
-        ),
         (
             "trigger_docker_build",
             "Trigger a Docker image build for specified services (comma-separated, e.g. 'cortex,ears'). "

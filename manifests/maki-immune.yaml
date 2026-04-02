@@ -75,12 +75,18 @@ spec:
         app: maki-immune
     spec:
       serviceAccountName: maki-immune
+      volumes:
+        - name: repo
+          emptyDir: {}
       containers:
         - name: immune
           image: ghcr.io/adhityaravi/maki-immune:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
           env:
             - name: NATS_URL
               value: "nats://maki-nerve-nats:4222"
@@ -96,6 +102,8 @@ spec:
                   key: token
             - name: CLAUDE_MODEL
               value: "claude-opus-4-6"
+            - name: REPO_PATH
+              value: "/repo/maki"
           readinessProbe:
             httpGet:
               path: /health

@@ -36,6 +36,8 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        - name: repo
+          emptyDir: {}
       containers:
         - name: cortex
           image: ghcr.io/adhityaravi/maki-cortex:latest
@@ -46,6 +48,8 @@ spec:
             - name: github-key
               mountPath: /etc/maki-github
               readOnly: true
+            - name: repo
+              mountPath: /repo
           env:
             - name: CLAUDE_MODEL
               value: "claude-opus-4-6"
@@ -77,6 +81,8 @@ spec:
               value: "adhityaravi"
             - name: REPO_NAME
               value: "maki"
+            - name: REPO_PATH
+              value: "/repo/maki"
           readinessProbe:
             httpGet:
               path: /health
