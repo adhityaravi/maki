@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from maki_common import (
     PendingQueues,
     configure_logging,
@@ -134,6 +135,8 @@ _reminders_today_date: str = ""
 _work_items_tonight: int = 0
 _work_items_tonight_date: str = ""
 _cortex_session_id: str | None = None
+_active_turns: dict[str, float] = {}  # turn_id → start timestamp
+_turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
 
 
@@ -943,6 +946,7 @@ async def _process_turn(
     _last_activity = time.time()
 
     turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+    _active_turns[turn_id] = time.time()
     log.info("Turn started", extra={"turn_id": turn_id, "message_len": len(message)})
 
     try:
@@ -1044,6 +1048,7 @@ async def _process_turn(
         raise
     finally:
         _pending.remove(turn_id)
+        _active_turns.pop(turn_id, None)
 
 
 async def _store_memory(content: str, source: str, user_id: str, metadata: dict | None):
@@ -1090,30 +1095,20 @@ async def _memory_store_listener():
             log.exception("Error processing memory store request")
 
 
-async def _ears_listener():
-    """Listen for incoming Discord messages via NATS and stream responses to ears."""
-    sub = await _nc.subscribe(EARS_MESSAGE_IN)
-    log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
-    async for msg in sub.messages:
+async def _handle_discord_message(data: dict):
+    """Handle a single Discord message (runs as independent task)."""
+    channel_id = data.get("channel_id", "")
+    message_id = data.get("message_id", "")
+    content = data.get("content", "")
+    forward_to = {"message_id": message_id, "channel_id": channel_id}
+
+    async with _turn_semaphore:
         try:
-            data = json.loads(msg.data.decode())
-            channel_id = data.get("channel_id", "")
-            message_id = data.get("message_id", "")
-            content = data.get("content", "")
-            username = data.get("username", "unknown")
-
-            log.info("Discord message", extra={"username": username, "content_len": len(content)})
-
-            # _process_turn streams chunks to EARS_MESSAGE_OUT via forward_to
-            await _process_turn(
-                content,
-                forward_to={"message_id": message_id, "channel_id": channel_id},
-            )
-
+            await _process_turn(content, forward_to=forward_to)
         except TimeoutError:
             error_msg = {
-                "message_id": data.get("message_id", ""),
-                "channel_id": data.get("channel_id", ""),
+                "message_id": message_id,
+                "channel_id": channel_id,
                 "response": "Sorry, I took too long thinking about that. Try again?",
                 "done": True,
             }
@@ -1122,8 +1117,8 @@ async def _ears_listener():
             log.warning("Turn cancelled", extra={"error": str(e)})
             try:
                 error_msg = {
-                    "message_id": data.get("message_id", ""),
-                    "channel_id": data.get("channel_id", ""),
+                    "message_id": message_id,
+                    "channel_id": channel_id,
                     "response": "I lost my train of thought (my brain restarted). What were you saying?",
                     "done": True,
                 }
@@ -1132,11 +1127,10 @@ async def _ears_listener():
                 log.exception("Failed to send cancelled signal to ears")
         except Exception:
             log.exception("Error processing Discord message")
-            # Always send done signal so ears stops typing
             try:
                 error_msg = {
-                    "message_id": data.get("message_id", ""),
-                    "channel_id": data.get("channel_id", ""),
+                    "message_id": message_id,
+                    "channel_id": channel_id,
                     "response": "",
                     "done": True,
                 }
@@ -1145,9 +1139,30 @@ async def _ears_listener():
                 log.exception("Failed to send done signal to ears")
 
 
+async def _ears_listener():
+    """Listen for incoming Discord messages via NATS and dispatch as tasks."""
+    sub = await _nc.subscribe(EARS_MESSAGE_IN)
+    log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            username = data.get("username", "unknown")
+            log.info("Discord message", extra={"username": username, "content_len": len(data.get("content", ""))})
+            asyncio.create_task(_handle_discord_message(data))
+        except Exception:
+            log.exception("Error dispatching Discord message")
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    now = time.time()
+    for turn_id, started in _active_turns.items():
+        if now - started > TURN_TIMEOUT:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "stuck", "turn_id": turn_id, "running_seconds": int(now - started)},
+            )
+    return {"status": "ok", "active_turns": len(_active_turns)}
 
 
 @app.post("/turn")

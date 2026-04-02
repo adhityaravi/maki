@@ -1315,11 +1315,11 @@ name = "maki-stem"
 version = "0.0.0"
 source = { editable = "pkgs/maki-stem" }
 dependencies = [
-    { name = "maki-common", extra = ["fastapi", "httpx"] },
+    { name = "maki-common", extra = ["fastapi", "github", "httpx"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "maki-common", extras = ["fastapi", "httpx"], editable = "pkgs/maki-common" }]
+requires-dist = [{ name = "maki-common", extras = ["fastapi", "httpx", "github"], editable = "pkgs/maki-common" }]
 
 [[package]]
 name = "maki-synapse"
