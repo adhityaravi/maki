@@ -40,7 +40,7 @@ spec:
           emptyDir: {}
       containers:
         - name: cortex
-          image: ghcr.io/adhityaravi/maki-cortex:latest
+          image: ghcr.io/adhityaravi/maki-cortex:sha-2765241
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -83,6 +83,10 @@ spec:
               value: "maki"
             - name: REPO_PATH
               value: "/repo/maki"
+            - name: CORTEX_MAX_TURNS
+              value: "50"
+            - name: CORTEX_WORK_MAX_TURNS
+              value: "100"
           readinessProbe:
             httpGet:
               path: /health

@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: ears
-          image: ghcr.io/adhityaravi/maki-ears:latest
+          image: ghcr.io/adhityaravi/maki-ears:sha-2765241
           imagePullPolicy: Always
           env:
             - name: NATS_URL
