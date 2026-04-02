@@ -130,7 +130,6 @@ _thoughts_today: int = 0
 _thoughts_today_date: str = ""
 _reminders_today: int = 0
 _reminders_today_date: str = ""
-_todo_kv = None
 _work_items_tonight: int = 0
 _work_items_tonight_date: str = ""
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
@@ -406,27 +405,6 @@ def _in_work_hours(config: dict) -> bool:
     if start > end:  # spans midnight
         return current >= start or current < end
     return start <= current < end
-
-
-async def _get_pending_todos() -> list[dict]:
-    """Read all pending todos from KV, sorted by priority (1=highest)."""
-    todos = []
-    try:
-        keys = await _todo_kv.keys()
-    except Exception:
-        return []
-
-    for key in keys:
-        try:
-            entry = await _todo_kv.get(key)
-            todo = json.loads(entry.value.decode())
-            if todo.get("status") == "pending":
-                todos.append(todo)
-        except Exception:
-            continue
-
-    todos.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", 0)))
-    return todos
 
 
 async def _idle_loop():
@@ -865,7 +843,7 @@ async def _work_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _nc, _js, _config_kv, _todo_kv, _github
+    global _nc, _js, _config_kv, _github
     log.info("maki-stem starting", extra={"nats_url": NATS_URL})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
@@ -874,8 +852,6 @@ async def lifespan(app: FastAPI):
     await _seed_identity()
     await _init_conversation_stream()
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CORTEX_CONFIG)
-    _todo_kv = await init_kv(_js, "maki-todo")
-    log.info("Todo KV bucket initialized")
 
     _github = _init_github_client()
 
