@@ -41,6 +41,37 @@ class GitHubIssueClient:
     def _repo_path(self) -> str:
         return f"{self._owner}/{self._repo}"
 
+    async def find_open_issue(self, title_query: str) -> int | None:
+        """Search for an open issue whose title contains the query string.
+
+        Returns the issue number if found, None otherwise.
+        Used to avoid creating duplicate issues for the same todo.
+        """
+        try:
+            # GitHub search API: search in repo, open issues only
+            search_q = f'repo:{self._repo_path} is:issue is:open "{title_query}" in:title'
+            resp = await self._client.get(
+                f"{API}/search/issues",
+                headers=await self._auth.headers(),
+                params={"q": search_q, "per_page": 5},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+
+            # Find exact or close title match
+            for item in items:
+                if title_query.lower() in item["title"].lower():
+                    log.info(
+                        "Found existing issue",
+                        extra={"number": item["number"], "title": item["title"]},
+                    )
+                    return item["number"]
+
+            return None
+        except Exception:
+            log.exception("Failed to search GitHub issues")
+            return None
+
     async def create_issue(
         self,
         title: str,

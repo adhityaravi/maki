@@ -724,26 +724,36 @@ async def _work_loop():
                 extra={"todo_id": todo_id, "title": todo["title"], "priority": todo["priority"]},
             )
 
-            # Create or find linked GitHub issue for this todo
+            # Find or create linked GitHub issue for this todo
             issue_number = todo.get("github_issue")
             if _github and not issue_number:
-                issue_number = await _github.create_issue(
-                    title=f"[Work] {todo['title']}",
-                    body=(
-                        f"**Priority:** P{todo['priority']}\n"
-                        f"**Description:** {todo.get('description', 'No description')}\n"
-                        f"**Todo ID:** `{todo_id}`\n\n"
-                        f"---\n"
-                        f"*Created by maki work loop*"
-                    ),
-                    labels=["maki-work", "automated"],
-                )
-                if issue_number:
+                # Search for an existing open issue matching this todo title
+                existing = await _github.find_open_issue(todo["title"])
+                if existing:
+                    issue_number = existing
                     todo["github_issue"] = issue_number
                     log.info(
-                        "Work issue created",
+                        "Found existing issue for todo",
                         extra={"todo_id": todo_id, "issue": issue_number},
                     )
+                else:
+                    issue_number = await _github.create_issue(
+                        title=f"[Work] {todo['title']}",
+                        body=(
+                            f"**Priority:** P{todo['priority']}\n"
+                            f"**Description:** {todo.get('description', 'No description')}\n"
+                            f"**Todo ID:** `{todo_id}`\n\n"
+                            f"---\n"
+                            f"*Created by maki work loop*"
+                        ),
+                        labels=["maki-work", "automated"],
+                    )
+                    if issue_number:
+                        todo["github_issue"] = issue_number
+                        log.info(
+                            "Work issue created",
+                            extra={"todo_id": todo_id, "issue": issue_number},
+                        )
 
             # Mark as in_progress
             todo["status"] = "in_progress"
