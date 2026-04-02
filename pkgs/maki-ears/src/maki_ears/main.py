@@ -181,9 +181,7 @@ async def on_message(message: discord.Message):
                             extra={"message_id": str(message.id)},
                         )
                     else:
-                        await message.channel.send(
-                            "Sorry, I took too long thinking about that. Try again?"
-                        )
+                        await message.channel.send("Sorry, I took too long thinking about that. Try again?")
                     break
 
                 # Skip reaction messages from cortex

@@ -135,11 +135,12 @@ Priority: {todo_priority}
 1. Understand the task. Use search_code and read_file to study relevant code.
 2. Implement changes with write_file.
 3. Rebuild the code graph with rebuild_code_graph after changes.
-4. Commit and push with git_commit_and_push.
-5. Build if code was changed (trigger_docker_build).
-6. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
-7. When done, call complete_todo with a brief result summary.
-8. Store any learnings with add_memory.
+4. **Run quality_check before committing.** Fix any lint or format issues it finds.
+5. Commit and push with git_commit_and_push.
+6. CI builds Docker images automatically on push. Only use trigger_docker_build as emergency bypass.
+7. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
+8. When done, call complete_todo with a brief result summary.
+9. Store any learnings with add_memory.
 
 ## Rules
 - Execute the task. Don't just plan — do it.
@@ -173,9 +174,10 @@ entire files. Scopes: symbol, callers, callees, references, definition, file, pa
 ### Git & CI/CD
 - **git_status** — show current git status
 - **git_diff** (path) — show unstaged changes
+- **quality_check** (path) — run ruff lint + format checks. **Always run before git_commit_and_push.**
 - **git_commit_and_push** (message, files) — stage, commit, and push to GitHub
 - **git_pull** — pull latest from origin/main
-- **trigger_docker_build** (services) — trigger Docker image builds for specified services
+- **trigger_docker_build** (services) — emergency only: trigger Docker builds (CI does this on push)
 - **get_workflow_status** (workflow) — check CI/CD workflow status
 - **get_workflow_logs** (run_id) — get logs from a workflow run
 
@@ -194,8 +196,8 @@ entire files. Scopes: symbol, callers, callees, references, definition, file, pa
 2. **read_file** to see the full context of what you want to modify
 3. **write_file** to make your changes
 4. **rebuild_code_graph** to update your understanding
-5. **git_commit_and_push** to push changes to GitHub
-6. **trigger_docker_build** to build new images
+5. **quality_check** to verify lint + formatting pass
+6. **git_commit_and_push** to push changes to GitHub (CI builds Docker images automatically)
 7. **request_deploy** to deploy (immune monitors and auto-rollbacks if unhealthy)
 
 ## Learning

@@ -38,6 +38,18 @@ async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
+async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
+    """Run an arbitrary command in the repo directory and return (returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=repo_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode(), stderr.decode()
+
+
 def make_code_tools(
     repo_path: str,
 ) -> list[tuple[str, str, dict[str, type], Any]]:
@@ -212,7 +224,7 @@ def make_code_edit_tools(
 ) -> list[tuple[str, str, dict[str, type], Any]]:
     """Write/commit/push tools — work on any git repo.
 
-    Tools: write_file, git_commit_and_push, git_pull.
+    Tools: write_file, git_commit_and_push, git_pull, quality_check.
 
     Args:
         repo_path: Absolute path to the local git repo.
@@ -295,6 +307,48 @@ def make_code_edit_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def quality_check(args: dict[str, Any]) -> dict[str, Any]:
+        """Run linting and formatting checks on changed files before pushing.
+
+        Runs ruff check (linting) and ruff format --check (formatting) on
+        the pkgs/ directory. Returns pass/fail with details of any issues.
+        Use this BEFORE git_commit_and_push to catch CI failures early.
+        """
+        path_filter = args.get("path", "pkgs/")
+        log.info("Tool: quality_check", extra={"path": path_filter})
+
+        results = []
+        all_passed = True
+
+        # Run ruff lint check
+        try:
+            rc, stdout, stderr = await _run_cmd(repo_path, "ruff", "check", path_filter)
+            if rc == 0:
+                results.append("✅ ruff check (lint): passed")
+            else:
+                all_passed = False
+                output = stdout or stderr
+                results.append(f"❌ ruff check (lint): FAILED\n{output}")
+        except FileNotFoundError:
+            results.append("⚠️ ruff not found — install with: pip install ruff")
+            all_passed = False
+
+        # Run ruff format check
+        try:
+            rc, stdout, stderr = await _run_cmd(repo_path, "ruff", "format", "--check", path_filter)
+            if rc == 0:
+                results.append("✅ ruff format: passed")
+            else:
+                all_passed = False
+                output = stdout or stderr
+                results.append(f"❌ ruff format: FAILED\n{output}")
+        except FileNotFoundError:
+            results.append("⚠️ ruff not found — install with: pip install ruff")
+            all_passed = False
+
+        summary = "ALL CHECKS PASSED ✅" if all_passed else "CHECKS FAILED ❌ — fix issues before pushing"
+        return mcp_result(f"{summary}\n\n" + "\n\n".join(results))
+
     return [
         (
             "write_file",
@@ -315,5 +369,13 @@ def make_code_edit_tools(
             "Pull latest changes from the remote repository.",
             {},
             git_pull,
+        ),
+        (
+            "quality_check",
+            "Run ruff lint and format checks on the codebase. "
+            "Call this BEFORE git_commit_and_push to catch CI failures early. "
+            "Optionally pass a path to check (default: pkgs/).",
+            {"path": str},
+            quality_check,
         ),
     ]
