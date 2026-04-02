@@ -5,7 +5,10 @@ from maki_common.futures import PendingFutures, PendingQueues
 from maki_common.logging import configure_logging, get_logger
 from maki_common.nats import connect_nats, init_kv, load_kv_config
 
+__version__ = "0.1.0"
+
 __all__ = [
+    "__version__",
     "apply_config_updates",
     "configure_logging",
     "connect_nats",
