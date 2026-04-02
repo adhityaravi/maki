@@ -713,60 +713,40 @@ async def _work_loop():
                 log.info("Work loop: user recently active, skipping")
                 continue
 
-            todos = await _get_pending_todos()
-            if not todos:
+            # Pull work items from GitHub issues (single source of truth)
+            if not _github:
+                log.info("Work loop: GitHub client not available, skipping")
                 continue
 
-            todo = todos[0]
-            todo_id = todo["id"]
+            issues = await _github.list_issues(state="open")
+            if not issues:
+                continue
+
+            issue = issues[0]  # Highest priority (list_issues sorts by P-label)
+            issue_number = issue["number"]
+            issue_title = issue["title"]
+            issue_body = issue.get("body", "") or ""
+
+            # Extract priority from labels (default P3)
+            issue_priority = 3
+            for label in issue.get("labels", []):
+                label_name = label.get("name", "") if isinstance(label, dict) else str(label)
+                if label_name in ("P1", "P2", "P3", "P4", "P5"):
+                    issue_priority = int(label_name[1])
+                    break
+
             log.info(
                 "Work loop: starting task",
-                extra={"todo_id": todo_id, "title": todo["title"], "priority": todo["priority"]},
+                extra={"issue": issue_number, "title": issue_title, "priority": issue_priority},
             )
 
-            # Find or create linked GitHub issue for this todo
-            issue_number = todo.get("github_issue")
-            if _github and not issue_number:
-                # Search for an existing open issue matching this todo title
-                existing = await _github.find_open_issue(todo["title"])
-                if existing:
-                    issue_number = existing
-                    todo["github_issue"] = issue_number
-                    log.info(
-                        "Found existing issue for todo",
-                        extra={"todo_id": todo_id, "issue": issue_number},
-                    )
-                else:
-                    issue_number = await _github.create_issue(
-                        title=f"[Work] {todo['title']}",
-                        body=(
-                            f"**Priority:** P{todo['priority']}\n"
-                            f"**Description:** {todo.get('description', 'No description')}\n"
-                            f"**Todo ID:** `{todo_id}`\n\n"
-                            f"---\n"
-                            f"*Created by maki work loop*"
-                        ),
-                        labels=["maki-work", "automated"],
-                    )
-                    if issue_number:
-                        todo["github_issue"] = issue_number
-                        log.info(
-                            "Work issue created",
-                            extra={"todo_id": todo_id, "issue": issue_number},
-                        )
-
-            # Mark as in_progress
-            todo["status"] = "in_progress"
-            await _todo_kv.put(todo_id, json.dumps(todo).encode())
-
-            # Comment on linked issue that work is starting
-            if _github and issue_number:
-                asyncio.create_task(
-                    _github.comment_issue(
-                        issue_number,
-                        (f"Starting work on this task.\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"),
-                    )
+            # Comment on issue that work is starting
+            asyncio.create_task(
+                _github.comment_issue(
+                    issue_number,
+                    f"🔧 **Starting work on this task.**\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
                 )
+            )
 
             # Load identity
             try:
@@ -785,10 +765,10 @@ async def _work_loop():
                 "graph_context": [],
                 "prompt": None,
                 "work_context": {
-                    "todo_id": todo_id,
-                    "todo_title": todo["title"],
-                    "todo_description": todo.get("description", ""),
-                    "todo_priority": todo["priority"],
+                    "issue_number": issue_number,
+                    "issue_title": issue_title,
+                    "issue_description": issue_body,
+                    "issue_priority": issue_priority,
                 },
             }
 
@@ -796,7 +776,7 @@ async def _work_loop():
 
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
-                log.info("Work turn published", extra={"turn_id": turn_id, "todo_id": todo_id})
+                log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
 
                 response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
                 result_text = response_data.get("response", "")
@@ -805,7 +785,7 @@ async def _work_loop():
                 clean_result = strip_tags(result_text or "")
                 if clean_result and clean_result != "[SILENT]":
                     thought_payload = {
-                        "thought": f"[Night work] Completed: {todo['title']}\n{clean_result}",
+                        "thought": f"[Night work] Completed: {issue_title}\n{clean_result}",
                         "turn_id": turn_id,
                     }
                     await _nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
@@ -814,7 +794,7 @@ async def _work_loop():
                     "Work turn complete",
                     extra={
                         "turn_id": turn_id,
-                        "todo_id": todo_id,
+                        "issue": issue_number,
                         "work_items_tonight": _work_items_tonight,
                         "max": max_items,
                     },
@@ -822,24 +802,23 @@ async def _work_loop():
 
                 asyncio.create_task(
                     _feed_memories(
-                        f"[Night work] Task: {todo['title']} (priority {todo['priority']})",
+                        f"[Night work] Task: {issue_title} (priority P{issue_priority})",
                         clean_result or "Task completed",
                     )
                 )
 
-                # Close linked GitHub issue with result
-                if _github and issue_number:
-                    close_comment = (
-                        f"**Task completed.**\n\n"
-                        f"{clean_result or 'No detailed result.'}\n\n"
-                        f"---\n"
-                        f"Turn: `{turn_id}`\n"
-                        f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-                    )
-                    asyncio.create_task(_github.close_issue(issue_number, comment=close_comment))
+                # Close the GitHub issue with result
+                close_comment = (
+                    f"✅ **Task completed.**\n\n"
+                    f"{clean_result or 'No detailed result.'}\n\n"
+                    f"---\n"
+                    f"Turn: `{turn_id}`\n"
+                    f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+                )
+                asyncio.create_task(_github.close_issue(issue_number, comment=close_comment))
 
             except TimeoutError:
-                log.error("Work turn timed out", extra={"turn_id": turn_id, "todo_id": todo_id})
+                log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
                 # Publish stuck signal for immune
                 await _nc.publish(
                     CORTEX_STUCK,
@@ -852,33 +831,25 @@ async def _work_loop():
                         }
                     ).encode(),
                 )
-                # Revert todo to pending
-                todo["status"] = "pending"
-                await _todo_kv.put(todo_id, json.dumps(todo).encode())
 
-                # Comment on issue about timeout
-                if _github and issue_number:
-                    asyncio.create_task(
-                        _github.comment_issue(
-                            issue_number,
-                            f"**Work timed out** after {WORK_TURN_TIMEOUT}s. "
-                            f"Reverting to pending — will retry next work session.",
-                        )
+                # Comment on issue about timeout (issue stays open for retry)
+                asyncio.create_task(
+                    _github.comment_issue(
+                        issue_number,
+                        f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s. Will retry next work session.",
                     )
+                )
 
             except Exception:
-                log.exception("Work turn failed", extra={"turn_id": turn_id, "todo_id": todo_id})
-                todo["status"] = "pending"
-                await _todo_kv.put(todo_id, json.dumps(todo).encode())
+                log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
 
-                # Comment on issue about failure
-                if _github and issue_number:
-                    asyncio.create_task(
-                        _github.comment_issue(
-                            issue_number,
-                            "**Work failed** due to an error. Reverting to pending — will retry next work session.",
-                        )
+                # Comment on issue about failure (issue stays open for retry)
+                asyncio.create_task(
+                    _github.comment_issue(
+                        issue_number,
+                        "❌ **Work failed** due to an error. Will retry next work session.",
                     )
+                )
 
             finally:
                 _pending.remove(turn_id)
