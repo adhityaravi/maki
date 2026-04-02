@@ -34,7 +34,8 @@ REMINDERS_CHANNEL_NAME = os.environ.get("REMINDERS_CHANNEL_NAME", "maki-reminder
 
 # Timeout (seconds) after receiving the last chunk before assuming done.
 # Safety net in case the done signal is lost in transit.
-CHUNK_INACTIVITY_TIMEOUT = 30.0
+# Set high (10 min) because tool-heavy turns can go minutes without text output.
+CHUNK_INACTIVITY_TIMEOUT = 600.0
 
 _nc = None
 _pending = PendingQueues()
@@ -342,7 +343,7 @@ async def _send_response(channel, text: str):
             if last_newline > 1000:
                 chunk = text[:last_newline]
         await channel.send(chunk)
-        text = text[len(chunk) :]
+        text = text[len(chunk):]
 
 
 async def main():
