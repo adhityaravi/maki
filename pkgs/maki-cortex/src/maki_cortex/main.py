@@ -49,6 +49,31 @@ _active_turn: str | None = None
 _active_turn_mode: str | None = None
 _active_turn_started: float | None = None
 
+# Error patterns that should be silent (not forwarded to Discord)
+_SILENT_ERROR_PATTERNS = [
+    "rate_limit",
+    "rate limit",
+    "overloaded",
+    "max_turns",
+    "MaxTurnsError",
+    "turn limit",
+    "capacity",
+    "quota",
+    "billing",
+    "credit",
+    "limit",
+    "resets",
+    "429",
+    "529",
+    "503",
+]
+
+
+def _is_silent_error(exc: Exception) -> bool:
+    """Check if an error should be silently swallowed instead of sent to Discord."""
+    error_str = str(exc).lower()
+    return any(pattern.lower() in error_str for pattern in _SILENT_ERROR_PATTERNS)
+
 
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
 
@@ -378,19 +403,31 @@ async def handle_turn_request(msg, nc, mcp_server):
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
             log.info("Turn stream complete", extra={"turn_id": turn_id})
 
-    except Exception:
+    except Exception as exc:
         log.exception("Error handling turn request")
         turn_id = "unknown"
         try:
             turn_id = json.loads(msg.data.decode()).get("turn_id", "unknown")
         except Exception:
             pass
-        error_response = {
-            "turn_id": turn_id,
-            "response": "I encountered an error processing this turn. Please try again.",
-            "done": True,
-        }
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
+
+        if _is_silent_error(exc):
+            # Rate limits, turn budget, capacity — stay silent, don't spam Discord
+            log.info(
+                "Silent error — not forwarding to Discord",
+                extra={"turn_id": turn_id, "error": str(exc)[:200]},
+            )
+            # Still send done signal so ears cleans up, but with empty response
+            done_msg = {"turn_id": turn_id, "response": "", "done": True}
+            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        else:
+            # Genuine unexpected error — send a brief message
+            error_response = {
+                "turn_id": turn_id,
+                "response": "Something went wrong on my end. I'll try again next turn.",
+                "done": True,
+            }
+            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
     finally:
         _active_turn = None
         _active_turn_mode = None
