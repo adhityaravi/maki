@@ -27,6 +27,7 @@ from maki_common import (
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
     CONVERSATION_STREAM,
+    CORTEX_HEALTH,
     CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
@@ -132,6 +133,7 @@ _reminders_today: int = 0
 _reminders_today_date: str = ""
 _work_items_tonight: int = 0
 _work_items_tonight_date: str = ""
+_cortex_session_id: str | None = None
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
 
 
@@ -187,6 +189,52 @@ async def _response_listener():
                 log.warning("Response for unknown turn", extra={"turn_id": turn_id})
         except Exception:
             log.exception("Error processing cortex response")
+
+
+async def _cortex_heartbeat_watcher():
+    """Watch cortex heartbeat for session_id changes (restarts).
+
+    When cortex restarts mid-turn, its session_id changes. We detect this
+    and cancel all pending turns immediately instead of waiting 30 minutes
+    for the timeout.
+    """
+    global _cortex_session_id
+    sub = await _nc.subscribe(CORTEX_HEALTH)
+    log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
+    async for msg in sub.messages:
+        try:
+            payload = json.loads(msg.data.decode())
+            session_id = payload.get("session_id")
+            if not session_id:
+                continue
+
+            if _cortex_session_id is None:
+                _cortex_session_id = session_id
+                log.info("Cortex session tracked", extra={"session_id": session_id})
+                continue
+
+            if session_id != _cortex_session_id:
+                old_session = _cortex_session_id
+                _cortex_session_id = session_id
+                pending_keys = _pending.pending_keys()
+                if pending_keys:
+                    cancelled = _pending.cancel_all()
+                    log.warning(
+                        "Cortex restarted — cancelled stale turns",
+                        extra={
+                            "old_session": old_session,
+                            "new_session": session_id,
+                            "cancelled_turns": cancelled,
+                            "turn_ids": pending_keys,
+                        },
+                    )
+                else:
+                    log.info(
+                        "Cortex session changed (no pending turns)",
+                        extra={"old_session": old_session, "new_session": session_id},
+                    )
+        except Exception:
+            log.exception("Error in cortex heartbeat watcher")
 
 
 async def _seed_identity():
@@ -856,6 +904,7 @@ async def lifespan(app: FastAPI):
     _github = _init_github_client()
 
     asyncio.create_task(_response_listener())
+    asyncio.create_task(_cortex_heartbeat_watcher())
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_idle_loop())
@@ -932,6 +981,11 @@ async def _process_turn(
 
             chunk_text = data.get("response", "")
             done = data.get("done", False)
+            cancelled = data.get("cancelled", False)
+
+            if cancelled:
+                log.warning("Turn cancelled (cortex restarted)", extra={"turn_id": turn_id})
+                raise RuntimeError("Turn cancelled: cortex restarted mid-turn")
 
             if chunk_text:
                 chunks.append(chunk_text)
@@ -1064,6 +1118,18 @@ async def _ears_listener():
                 "done": True,
             }
             await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+        except RuntimeError as e:
+            log.warning("Turn cancelled", extra={"error": str(e)})
+            try:
+                error_msg = {
+                    "message_id": data.get("message_id", ""),
+                    "channel_id": data.get("channel_id", ""),
+                    "response": "I lost my train of thought (my brain restarted). What were you saying?",
+                    "done": True,
+                }
+                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+            except Exception:
+                log.exception("Failed to send cancelled signal to ears")
         except Exception:
             log.exception("Error processing Discord message")
             # Always send done signal so ears stops typing

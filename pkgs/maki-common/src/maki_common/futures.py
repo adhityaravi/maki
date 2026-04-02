@@ -90,6 +90,23 @@ class PendingQueues:
         """Remove a queue."""
         self._queues.pop(key, None)
 
+    def cancel_all(self) -> int:
+        """Inject a done signal into all pending queues to unblock consumers.
+
+        Returns the number of queues cancelled.
+        """
+        cancelled = 0
+        for key in list(self._queues):
+            queue = self._queues.get(key)
+            if queue is not None:
+                queue.put_nowait({"response": "", "done": True, "cancelled": True})
+                cancelled += 1
+        return cancelled
+
+    def pending_keys(self) -> list[str]:
+        """Return list of currently pending turn IDs."""
+        return list(self._queues.keys())
+
     def has(self, key: str) -> bool:
         """Check if a queue exists for the given key."""
         return key in self._queues

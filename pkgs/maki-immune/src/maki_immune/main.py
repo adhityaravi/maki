@@ -140,6 +140,12 @@ The metrics above are a starting point. You dig deeper. Always.
 - When you discover something — a root cause, a threshold, a pattern — store it with add_memory. \
 You are building operational knowledge that persists.
 
+## Component Dependencies
+- **Cortex ↔ Stem coupling**: Stem holds pending turns waiting for cortex responses. \
+If you restart or rollback cortex, ALWAYS restart stem too — otherwise stem will be stuck \
+waiting for responses from a cortex that forgot about them. Stem's heartbeat watcher should \
+self-heal, but restart it anyway to be safe.
+
 ## Frequency Tuning
 Tighten when unstable, relax when stable:
 - [CONFIG:heartbeat_interval=900] — tighten patrol (default: 1800s)
@@ -636,6 +642,28 @@ def _normalize_image_tag(tag: str) -> str:
     raise ValueError(f"Invalid image tag '{tag}': expected 'latest', 'sha-<hex>', or a hex commit SHA")
 
 
+async def _restart_dependent(deployment_name: str, reason: str):
+    """Restart a dependent deployment (e.g. stem after cortex rollback)."""
+    if not _k8s_apps_v1:
+        return
+    patch = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {"immune.maki/restartedAt": str(time.time())},
+                }
+            }
+        }
+    }
+    await asyncio.to_thread(
+        _k8s_apps_v1.patch_namespaced_deployment,
+        name=deployment_name,
+        namespace=NAMESPACE,
+        body=patch,
+    )
+    log.info("Restarted dependent deployment", extra={"deployment": deployment_name, "reason": reason})
+
+
 async def _deploy_request_handler(msg):
     """Handle deploy requests from cortex — set image, monitor, rollback if unhealthy."""
     try:
@@ -724,6 +752,13 @@ async def _deploy_request_handler(msg):
                 await _publish_alert(
                     f"Deploy of {deployment_name} → {image_tag} FAILED health check. Rolled back to {previous_image}"
                 )
+
+                # If cortex was rolled back, restart stem to clear stale pending turns
+                if "cortex" in deployment_name:
+                    try:
+                        await _restart_dependent("maki-stem", reason="cortex rollback")
+                    except Exception:
+                        log.exception("Failed to restart stem after cortex rollback")
 
             action = {
                 "type": "deploy",

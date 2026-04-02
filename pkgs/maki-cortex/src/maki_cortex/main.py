@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 from maki_common import configure_logging, connect_nats
 from maki_common.claude import invoke_claude, stream_claude
@@ -41,6 +42,9 @@ HEALTH_ENDPOINTS = {
 }
 
 WORK_MAX_TURNS = int(os.environ.get("CORTEX_WORK_MAX_TURNS", "100"))
+
+# Unique per startup — lets stem detect cortex restarts
+SESSION_ID = uuid.uuid4().hex[:12]
 
 _semaphore = asyncio.Semaphore(1)
 
@@ -445,6 +449,7 @@ async def heartbeat_loop(nc):
                     "status": "ok",
                     "timestamp": time.time(),
                     "model": MODEL,
+                    "session_id": SESSION_ID,
                     "active_turn": _active_turn,
                     "turn_mode": _active_turn_mode,
                     "turn_started": _active_turn_started,
