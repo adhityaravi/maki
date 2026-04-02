@@ -291,7 +291,7 @@ def build_system_prompt(turn: dict) -> str:
             )
         )
 
-    # Work mode — executing a queued todo
+    # Work mode — executing a queued GitHub issue
     if turn.get("mode") == "work":
         work_ctx = turn.get("work_context", {})
         parts.append(
@@ -484,13 +484,6 @@ async def main():
         github_auth=github_auth,
     )
 
-    # Init todo KV bucket
-    from maki_common.nats import init_kv
-
-    js = nc.jetstream()
-    todo_kv = await init_kv(js, "maki-todo")
-    log.info("Todo KV bucket initialized")
-
     # Create MCP tool server
     from maki_common.tools import create_cortex_tools
 
@@ -498,7 +491,6 @@ async def main():
         nc=nc,
         recall_url=RECALL_URL,
         health_endpoints=HEALTH_ENDPOINTS,
-        todo_kv=todo_kv,
         repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,
