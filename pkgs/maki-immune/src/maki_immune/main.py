@@ -307,11 +307,19 @@ async def _check_http_health():
 
 
 async def _check_k8s_pods():
-    """Check K8s pod status in maki namespace, including resource usage."""
+    """Check K8s pod status in maki namespace, including resource usage.
+
+    Groups pods by app label and marks the component unhealthy if ANY pod
+    for that app is unhealthy (e.g. ImagePullBackOff on a new pod while
+    the old pod is still running).
+    """
     if not _k8s_v1:
         return
     try:
         pods = _k8s_v1.list_namespaced_pod(namespace=NAMESPACE)
+
+        # Group pods by app label — multiple pods can exist during rollouts
+        app_pods: dict[str, list[dict]] = {}
         for pod in pods.items:
             app_label = pod.metadata.labels.get("app", "") if pod.metadata.labels else ""
             if not app_label:
@@ -320,11 +328,15 @@ async def _check_k8s_pods():
             phase = pod.status.phase
             ready = True
             restarts = 0
+            waiting_reason = None
             if pod.status.container_statuses:
                 for cs in pod.status.container_statuses:
                     if not cs.ready:
                         ready = False
                     restarts += cs.restart_count
+                    # Detect stuck states like ImagePullBackOff, CrashLoopBackOff
+                    if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                        waiting_reason = cs.state.waiting.reason
 
             # Get resource limits/requests from spec
             mem_limit = None
@@ -335,19 +347,43 @@ async def _check_k8s_pods():
                 mem_limit = limits.get("memory")
                 cpu_limit = limits.get("cpu")
 
-            healthy = phase == "Running" and ready
-            _update_health(
-                f"{app_label}",
-                healthy,
-                {
-                    "phase": phase,
-                    "ready": ready,
-                    "restarts": restarts,
-                    "pod_name": pod.metadata.name,
-                    "mem_limit": mem_limit,
-                    "cpu_limit": cpu_limit,
-                },
-            )
+            pod_info = {
+                "phase": phase,
+                "ready": ready,
+                "restarts": restarts,
+                "pod_name": pod.metadata.name,
+                "mem_limit": mem_limit,
+                "cpu_limit": cpu_limit,
+                "waiting_reason": waiting_reason,
+                "healthy": phase == "Running" and ready and waiting_reason is None,
+            }
+
+            if app_label not in app_pods:
+                app_pods[app_label] = []
+            app_pods[app_label].append(pod_info)
+
+        # Report health per app — unhealthy if ANY pod is unhealthy
+        for app_label, pod_list in app_pods.items():
+            all_healthy = all(p["healthy"] for p in pod_list)
+            # Use the newest pod's details for reporting, but flag unhealthy ones
+            unhealthy_pods = [p for p in pod_list if not p["healthy"]]
+            # Pick the first unhealthy pod for details if any, otherwise the first pod
+            report_pod = unhealthy_pods[0] if unhealthy_pods else pod_list[0]
+            details = {
+                "phase": report_pod["phase"],
+                "ready": report_pod["ready"],
+                "restarts": report_pod["restarts"],
+                "pod_name": report_pod["pod_name"],
+                "mem_limit": report_pod["mem_limit"],
+                "cpu_limit": report_pod["cpu_limit"],
+            }
+            if report_pod["waiting_reason"]:
+                details["waiting_reason"] = report_pod["waiting_reason"]
+            if len(pod_list) > 1:
+                details["total_pods"] = len(pod_list)
+                details["unhealthy_pods"] = len(unhealthy_pods)
+
+            _update_health(app_label, all_healthy, details)
     except Exception:
         log.exception("K8s pod check failed")
 
@@ -577,13 +613,18 @@ def _normalize_image_tag(tag: str) -> str:
 
     Docker workflow tags images as sha-<7char_short_sha>.
     Raw SHA inputs get the sha- prefix added automatically.
+    Rejects inputs that don't look like valid hex commit SHAs.
     """
     if tag == "latest":
         return tag
     if tag.startswith("sha-"):
         return tag
-    # Looks like a raw commit SHA — add the sha- prefix
-    return f"sha-{tag[:7]}"
+    # Validate that it looks like a hex commit SHA before prefixing
+    import re
+
+    if re.fullmatch(r"[0-9a-f]{7,40}", tag):
+        return f"sha-{tag[:7]}"
+    raise ValueError(f"Invalid image tag '{tag}': expected 'latest', 'sha-<hex>', or a hex commit SHA")
 
 
 async def _deploy_request_handler(msg):
@@ -592,7 +633,12 @@ async def _deploy_request_handler(msg):
         request = json.loads(msg.data.decode())
         service = request.get("service", "")
         raw_tag = request.get("image_tag", "latest")
-        image_tag = _normalize_image_tag(raw_tag)
+        try:
+            image_tag = _normalize_image_tag(raw_tag)
+        except ValueError as e:
+            log.warning("Invalid image tag in deploy request", extra={"raw_tag": raw_tag, "error": str(e)})
+            await msg.respond(json.dumps({"status": "error", "message": str(e)}).encode())
+            return
         deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
         image = f"{GHCR_PREFIX}/{deployment_name}:{image_tag}"
 
@@ -696,7 +742,12 @@ async def _deploy_request_handler(msg):
 
 
 async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
-    """Monitor deployment health after image update. Returns True if healthy."""
+    """Monitor deployment health after image update. Returns True if healthy.
+
+    Checks both deployment replica counts AND actual pod states to avoid
+    false positives where old pods satisfy ready_replicas while new pods
+    are stuck in ImagePullBackOff or CrashLoopBackOff.
+    """
     deadline = time.time() + timeout
     # Wait a few seconds for the new pod to start scheduling
     await asyncio.sleep(5)
@@ -710,17 +761,88 @@ async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
             desired = dep.spec.replicas or 1
             ready = status.ready_replicas or 0
             updated = status.updated_replicas or 0
+            available = status.available_replicas or 0
 
-            if ready >= desired and updated >= desired:
+            # Check the Progressing condition for definitive rollout status
+            rollout_complete = False
+            rollout_failed = False
+            if status.conditions:
+                for cond in status.conditions:
+                    if cond.type == "Progressing":
+                        if cond.status == "True" and cond.reason == "NewReplicaSetAvailable":
+                            rollout_complete = True
+                        elif cond.status == "False":
+                            rollout_failed = True
+
+            if rollout_failed:
+                log.warning(
+                    "Rollout failed (Progressing=False)",
+                    extra={"deployment": deployment_name},
+                )
+                return False
+
+            # Also check actual pod states — don't trust replica counts alone
+            pods_healthy = True
+            if _k8s_v1:
+                pods = await asyncio.to_thread(
+                    _k8s_v1.list_namespaced_pod,
+                    namespace=NAMESPACE,
+                    label_selector=f"app={deployment_name}",
+                )
+                for pod in pods.items:
+                    if pod.status.container_statuses:
+                        for cs in pod.status.container_statuses:
+                            if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                                reason = cs.state.waiting.reason
+                                if reason in (
+                                    "ImagePullBackOff",
+                                    "ErrImagePull",
+                                    "CrashLoopBackOff",
+                                    "CreateContainerConfigError",
+                                ):
+                                    log.warning(
+                                        "Pod stuck during rollout",
+                                        extra={
+                                            "deployment": deployment_name,
+                                            "pod": pod.metadata.name,
+                                            "reason": reason,
+                                        },
+                                    )
+                                    pods_healthy = False
+
+            if not pods_healthy:
+                # Don't return False immediately — give it a few cycles in case
+                # it's a transient pull issue. But if we're past 30s, fail fast.
+                if time.time() > deadline - 30:
+                    log.warning(
+                        "Pods stuck past grace period, failing rollout",
+                        extra={"deployment": deployment_name},
+                    )
+                    return False
+
+            elif rollout_complete and ready >= desired and updated >= desired and available >= desired:
                 log.info(
                     "Rollout healthy",
-                    extra={"deployment": deployment_name, "ready": ready, "desired": desired},
+                    extra={
+                        "deployment": deployment_name,
+                        "ready": ready,
+                        "updated": updated,
+                        "available": available,
+                        "desired": desired,
+                    },
                 )
                 return True
 
             log.info(
                 "Rollout in progress",
-                extra={"deployment": deployment_name, "ready": ready, "updated": updated, "desired": desired},
+                extra={
+                    "deployment": deployment_name,
+                    "ready": ready,
+                    "updated": updated,
+                    "available": available,
+                    "desired": desired,
+                    "pods_healthy": pods_healthy,
+                },
             )
         except Exception:
             log.exception("Error checking rollout status")
