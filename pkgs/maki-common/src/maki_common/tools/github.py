@@ -204,3 +204,229 @@ def make_github_ci_tools(
             get_workflow_logs,
         ),
     ]
+
+
+def make_github_issues_tools(
+    app_id: str,
+    private_key: str,
+    installation_id: str,
+    default_owner: str,
+    default_repo: str,
+) -> list[tuple[str, str, dict[str, type], Any]]:
+    """Return (name, description, params, handler) tuples for GitHub Issues tools.
+
+    All tools accept an optional 'repo' param (e.g. 'charmarr/charmarr') to
+    operate on repos other than the default maki repo.
+    """
+
+    auth = GitHubAuth(app_id, private_key, installation_id)
+    client = httpx.AsyncClient(timeout=30.0)
+
+    def _resolve_repo(args: dict[str, Any]) -> str:
+        repo = args.get("repo", "").strip()
+        if repo:
+            # Accept 'owner/repo' or just 'repo' (defaults to same owner)
+            if "/" not in repo:
+                return f"{default_owner}/{repo}"
+            return repo
+        return f"{default_owner}/{default_repo}"
+
+    async def list_issues(args: dict[str, Any]) -> dict[str, Any]:
+        """List issues for a repository."""
+        repo = _resolve_repo(args)
+        state = args.get("state", "open")
+        labels = args.get("labels", "")
+        log.info("Tool: list_issues", extra={"repo": repo, "state": state})
+        try:
+            params: dict[str, Any] = {"per_page": 20, "state": state}
+            if labels:
+                params["labels"] = labels
+            resp = await client.get(
+                f"{API}/repos/{repo}/issues",
+                headers=await auth.headers(),
+                params=params,
+            )
+            resp.raise_for_status()
+            issues = resp.json()
+            if not issues:
+                return mcp_result(f"No {state} issues found in {repo}.")
+            lines = []
+            for issue in issues:
+                # Skip pull requests (GitHub API returns them as issues too)
+                if issue.get("pull_request"):
+                    continue
+                label_tags = ", ".join(lb["name"] for lb in issue.get("labels", []))
+                label_str = f" [{label_tags}]" if label_tags else ""
+                assignee = issue.get("assignee")
+                assignee_str = f" @{assignee['login']}" if assignee else ""
+                lines.append(f"#{issue['number']} {issue['title']}{label_str}{assignee_str} ({issue['state']})")
+            if not lines:
+                return mcp_result(f"No {state} issues found in {repo} (only PRs).")
+            return mcp_result(f"Issues in {repo}:\n" + "\n".join(lines))
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def get_issue(args: dict[str, Any]) -> dict[str, Any]:
+        """Get details and comments for a specific issue."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        log.info("Tool: get_issue", extra={"repo": repo, "number": number})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        try:
+            resp = await client.get(
+                f"{API}/repos/{repo}/issues/{number}",
+                headers=await auth.headers(),
+            )
+            resp.raise_for_status()
+            issue = resp.json()
+
+            label_tags = ", ".join(lb["name"] for lb in issue.get("labels", []))
+            assignee = issue.get("assignee")
+            parts = [
+                f"#{issue['number']} {issue['title']}",
+                f"State: {issue['state']}",
+                f"Author: @{issue['user']['login']}",
+            ]
+            if label_tags:
+                parts.append(f"Labels: {label_tags}")
+            if assignee:
+                parts.append(f"Assignee: @{assignee['login']}")
+            if issue.get("body"):
+                parts.append(f"\n{issue['body']}")
+
+            # Fetch comments
+            if issue.get("comments", 0) > 0:
+                comments_resp = await client.get(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    params={"per_page": 20},
+                )
+                if comments_resp.status_code == 200:
+                    comments = comments_resp.json()
+                    parts.append(f"\n--- Comments ({len(comments)}) ---")
+                    for c in comments:
+                        body = c["body"]
+                        if len(body) > 500:
+                            body = body[:500] + "..."
+                        parts.append(f"@{c['user']['login']} ({c['created_at']}):\n{body}")
+
+            return mcp_result("\n".join(parts))
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def create_issue(args: dict[str, Any]) -> dict[str, Any]:
+        """Create a new issue."""
+        repo = _resolve_repo(args)
+        title = args.get("title", "")
+        body = args.get("body", "")
+        labels = args.get("labels", "")
+        log.info("Tool: create_issue", extra={"repo": repo, "title": title})
+        if not title:
+            return mcp_result("Error: 'title' is required.")
+        try:
+            payload: dict[str, Any] = {"title": title}
+            if body:
+                payload["body"] = body
+            if labels:
+                payload["labels"] = [lb.strip() for lb in labels.split(",")]
+            resp = await client.post(
+                f"{API}/repos/{repo}/issues",
+                headers=await auth.headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            issue = resp.json()
+            return mcp_result(f"Created #{issue['number']}: {issue['title']}\n{issue['html_url']}")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def close_issue(args: dict[str, Any]) -> dict[str, Any]:
+        """Close an issue."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        comment = args.get("comment", "")
+        log.info("Tool: close_issue", extra={"repo": repo, "number": number})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        try:
+            # Add closing comment if provided
+            if comment:
+                await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+            resp = await client.patch(
+                f"{API}/repos/{repo}/issues/{number}",
+                headers=await auth.headers(),
+                json={"state": "closed"},
+            )
+            resp.raise_for_status()
+            return mcp_result(f"Closed #{number} in {repo}.")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def comment_issue(args: dict[str, Any]) -> dict[str, Any]:
+        """Add a comment to an issue."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        body = args.get("body", "")
+        log.info("Tool: comment_issue", extra={"repo": repo, "number": number})
+        if not number or not body:
+            return mcp_result("Error: 'number' and 'body' are required.")
+        try:
+            resp = await client.post(
+                f"{API}/repos/{repo}/issues/{number}/comments",
+                headers=await auth.headers(),
+                json={"body": body},
+            )
+            resp.raise_for_status()
+            comment = resp.json()
+            return mcp_result(f"Comment added to #{number}: {comment['html_url']}")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    return [
+        (
+            "list_issues",
+            "List issues for a GitHub repo. Defaults to maki repo. "
+            "Use 'repo' param for other repos (e.g. 'charmarr/charmarr', 'charmarr/charmarr-lib').",
+            {"repo": str, "state": str, "labels": str},
+            list_issues,
+        ),
+        (
+            "get_issue",
+            "Get details and comments for a specific issue by number.",
+            {"repo": str, "number": str},
+            get_issue,
+        ),
+        (
+            "create_issue",
+            "Create a new issue. Labels are comma-separated.",
+            {"repo": str, "title": str, "body": str, "labels": str},
+            create_issue,
+        ),
+        (
+            "close_issue",
+            "Close an issue, optionally with a closing comment.",
+            {"repo": str, "number": str, "comment": str},
+            close_issue,
+        ),
+        (
+            "comment_issue",
+            "Add a comment to an issue.",
+            {"repo": str, "number": str, "body": str},
+            comment_issue,
+        ),
+    ]

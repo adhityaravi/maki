@@ -206,10 +206,15 @@ def create_cortex_tools(
 
     # GitHub CI tools (trigger builds, check status) — still needs API
     if github_app_id and github_private_key and github_installation_id and repo_owner and repo_name:
-        from maki_common.tools.github import make_github_ci_tools
+        from maki_common.tools.github import make_github_ci_tools, make_github_issues_tools
 
         all_tools.extend(
             make_github_ci_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
+        )
+        all_tools.extend(
+            make_github_issues_tools(
+                github_app_id, github_private_key, github_installation_id, repo_owner, repo_name
+            )
         )
 
     sdk_tools = []
