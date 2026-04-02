@@ -343,7 +343,7 @@ async def _send_response(channel, text: str):
             if last_newline > 1000:
                 chunk = text[:last_newline]
         await channel.send(chunk)
-        text = text[len(chunk):]
+        text = text[len(chunk) :]
 
 
 async def main():

@@ -212,9 +212,7 @@ def create_cortex_tools(
             make_github_ci_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
         )
         all_tools.extend(
-            make_github_issues_tools(
-                github_app_id, github_private_key, github_installation_id, repo_owner, repo_name
-            )
+            make_github_issues_tools(github_app_id, github_private_key, github_installation_id, repo_owner, repo_name)
         )
 
     sdk_tools = []
