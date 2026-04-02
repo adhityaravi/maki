@@ -16,6 +16,9 @@ log = logging.getLogger(__name__)
 
 API = "https://api.github.com"
 
+# Priority label ordering for work loop task selection.
+PRIORITY_ORDER = {"P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5}
+
 
 class GitHubIssueClient:
     """Async GitHub issue client for creating, commenting, and closing issues.
@@ -40,6 +43,57 @@ class GitHubIssueClient:
     @property
     def _repo_path(self) -> str:
         return f"{self._owner}/{self._repo}"
+
+    async def list_issues(
+        self,
+        state: str = "open",
+        labels: str = "",
+        per_page: int = 30,
+    ) -> list[dict[str, Any]]:
+        """List issues from the repo, optionally filtered by state and labels.
+
+        Returns issues sorted by priority label (P1 first). Issues without
+        a priority label are sorted last.
+        """
+        try:
+            params: dict[str, Any] = {
+                "state": state,
+                "per_page": per_page,
+                "sort": "created",
+                "direction": "asc",
+            }
+            if labels:
+                params["labels"] = labels
+
+            resp = await self._client.get(
+                f"{API}/repos/{self._repo_path}/issues",
+                headers=await self._auth.headers(),
+                params=params,
+            )
+            resp.raise_for_status()
+            issues = resp.json()
+
+            # Filter out pull requests (GitHub API returns PRs as issues too)
+            issues = [i for i in issues if "pull_request" not in i]
+
+            # Sort by priority label
+            def _priority_key(issue: dict[str, Any]) -> int:
+                for label in issue.get("labels", []):
+                    name = label.get("name", "") if isinstance(label, dict) else str(label)
+                    if name in PRIORITY_ORDER:
+                        return PRIORITY_ORDER[name]
+                return 99  # No priority label → lowest
+
+            issues.sort(key=_priority_key)
+
+            log.info(
+                "Listed GitHub issues",
+                extra={"count": len(issues), "state": state},
+            )
+            return issues
+        except Exception:
+            log.exception("Failed to list GitHub issues")
+            return []
 
     async def find_open_issue(self, title_query: str) -> int | None:
         """Search for an open issue whose title contains the query string.
