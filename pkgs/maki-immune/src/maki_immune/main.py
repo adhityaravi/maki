@@ -22,9 +22,11 @@ from maki_common.subjects import (
     CORTEX_STUCK,
     DEPLOY_REQUEST,
     DEPLOY_STATUS_REQUEST,
+    EARS_IMMUNE_OUT,
     EARS_VITALS_OUT,
     IMMUNE_ACTION,
     IMMUNE_ALERT,
+    IMMUNE_COMMAND,
     IMMUNE_STATE_REQUEST,
 )
 
@@ -575,6 +577,13 @@ async def _publish_vitals(digest: str):
     log.info("Vitals digest published", extra={"digest_len": len(digest)})
 
 
+async def _publish_immune_response(message_id: str, response: str):
+    """Publish immune command response back to ears for #maki-immune."""
+    payload = {"message_id": message_id, "response": response}
+    await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
+    log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
+
+
 # --- State Request Handler ---
 
 
@@ -940,6 +949,89 @@ Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...
         log.exception("Claude escalation failed", extra={"component": component})
 
 
+async def _handle_immune_command(msg):
+    """Handle direct commands from Adi via #maki-immune Discord channel.
+
+    This is the backdoor — when cortex is down or unresponsive, Adi can
+    send commands directly to immune through Discord. Immune uses its own
+    Claude instance to investigate and act, completely bypassing cortex.
+    """
+    try:
+        payload = json.loads(msg.data.decode())
+        message_id = payload.get("message_id", "")
+        command = payload.get("command", "")
+        username = payload.get("username", "unknown")
+
+        log.info(
+            "Immune command received",
+            extra={"message_id": message_id, "command": command[:100], "username": username},
+        )
+
+        system_state = _build_system_state()
+        recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
+        config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
+        config_str = json.dumps(config, indent=2)
+
+        prompt = IMMUNE_SYSTEM_PROMPT.format(
+            system_state=system_state,
+            recent_actions=recent_actions_str,
+            config=config_str,
+        )
+        prompt += f"""
+
+## DIRECT COMMAND FROM ADI
+
+Adi is talking to you directly through the #maki-immune backdoor channel.
+This means cortex may be down or unresponsive. Treat this as highest priority.
+
+Adi says: {command}
+
+Investigate and act on this command. Use your tools — read logs, check pods, restart things,
+whatever is needed. Respond with a clear summary of what you found and what you did.
+
+Put your full response in [RESPONSE:...] tags. This will be sent back to Adi in Discord.
+Also use [DIGEST:...] for anything that should go to #maki-vitals."""
+
+        try:
+            response = await invoke_claude(
+                prompt,
+                model=MODEL,
+                semaphore=_semaphore,
+                max_turns=MAX_CLAUDE_TURNS,
+                mcp_servers={"maki-immune": _mcp_server},
+            )
+
+            config_updates = parse_config_tags(response)
+            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
+
+            # Extract response for Adi
+            responses = parse_tagged(response, "RESPONSE")
+            if responses:
+                reply = "\n\n".join(responses)
+            else:
+                # If Claude didn't use RESPONSE tags, send the full response
+                reply = response
+
+            await _publish_immune_response(message_id, reply)
+
+            # Also publish any digests/alerts
+            for digest in parse_tagged(response, "DIGEST"):
+                await _publish_vitals(digest)
+            for alert in parse_tagged(response, "ALERT"):
+                await _publish_alert(alert)
+
+            log.info("Immune command handled", extra={"message_id": message_id})
+
+        except Exception:
+            log.exception("Immune command Claude invocation failed")
+            await _publish_immune_response(
+                message_id, "Failed to process command — Claude invocation error. Check immune logs."
+            )
+
+    except Exception:
+        log.exception("Immune command handler error")
+
+
 def _build_system_state() -> str:
     """Build system state summary for Claude, including latency and resource data."""
     lines = []
@@ -1142,6 +1234,9 @@ async def main():
 
     await _nc.subscribe(CORTEX_STUCK, cb=_cortex_stuck_handler)
     log.info("Subscribed", extra={"subject": CORTEX_STUCK})
+
+    await _nc.subscribe(IMMUNE_COMMAND, cb=_handle_immune_command)
+    log.info("Subscribed", extra={"subject": IMMUNE_COMMAND})
 
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_immune_heartbeat_loop())
