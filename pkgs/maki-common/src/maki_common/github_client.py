@@ -1,7 +1,6 @@
-"""Lightweight GitHub Issues client for use by any Maki component.
+"""Lightweight GitHub issue client for stem's idle/work loops.
 
-Wraps GitHubAuth and provides simple async methods for issue operations.
-Gracefully degrades (logs + returns None) when credentials are missing.
+Reuses GitHubAuth from the MCP tools layer for GitHub App authentication.
 """
 
 from __future__ import annotations
@@ -19,14 +18,10 @@ API = "https://api.github.com"
 
 
 class GitHubIssueClient:
-    """Async client for GitHub Issues API operations.
+    """Async GitHub issue client for creating, commenting, and closing issues.
 
-    Args:
-        app_id: GitHub App ID.
-        private_key: GitHub App private key PEM string.
-        installation_id: GitHub App installation ID.
-        default_owner: Default repo owner (e.g. 'adhityaravi').
-        default_repo: Default repo name (e.g. 'maki').
+    Used by stem's idle loop (create thought issues) and work loop
+    (create/comment/close task issues).
     """
 
     def __init__(
@@ -38,23 +33,21 @@ class GitHubIssueClient:
         default_repo: str,
     ):
         self._auth = GitHubAuth(app_id, private_key, installation_id)
-        self._default_repo = f"{default_owner}/{default_repo}"
+        self._owner = default_owner
+        self._repo = default_repo
         self._client = httpx.AsyncClient(timeout=30.0)
 
-    def _resolve_repo(self, repo: str | None) -> str:
-        if not repo:
-            return self._default_repo
-        return repo if "/" in repo else f"{self._default_repo.split('/')[0]}/{repo}"
+    @property
+    def _repo_path(self) -> str:
+        return f"{self._owner}/{self._repo}"
 
     async def create_issue(
         self,
         title: str,
         body: str = "",
         labels: list[str] | None = None,
-        repo: str | None = None,
     ) -> int | None:
-        """Create an issue. Returns issue number or None on failure."""
-        resolved = self._resolve_repo(repo)
+        """Create an issue and return the issue number, or None on failure."""
         try:
             payload: dict[str, Any] = {"title": title}
             if body:
@@ -62,62 +55,49 @@ class GitHubIssueClient:
             if labels:
                 payload["labels"] = labels
             resp = await self._client.post(
-                f"{API}/repos/{resolved}/issues",
+                f"{API}/repos/{self._repo_path}/issues",
                 headers=await self._auth.headers(),
                 json=payload,
             )
             resp.raise_for_status()
             issue = resp.json()
-            number = issue["number"]
             log.info(
                 "GitHub issue created",
-                extra={"repo": resolved, "number": number, "title": title},
+                extra={"number": issue["number"], "title": title},
             )
-            return number
+            return issue["number"]
         except Exception:
-            log.exception("Failed to create GitHub issue", extra={"repo": resolved, "title": title})
+            log.exception("Failed to create GitHub issue", extra={"title": title})
             return None
 
-    async def comment_issue(
-        self,
-        number: int,
-        body: str,
-        repo: str | None = None,
-    ) -> bool:
+    async def comment_issue(self, number: int, body: str) -> bool:
         """Add a comment to an issue. Returns True on success."""
-        resolved = self._resolve_repo(repo)
         try:
             resp = await self._client.post(
-                f"{API}/repos/{resolved}/issues/{number}/comments",
+                f"{API}/repos/{self._repo_path}/issues/{number}/comments",
                 headers=await self._auth.headers(),
                 json={"body": body},
             )
             resp.raise_for_status()
-            log.info("GitHub issue commented", extra={"repo": resolved, "number": number})
+            log.info("GitHub issue comment added", extra={"number": number})
             return True
         except Exception:
-            log.exception("Failed to comment on GitHub issue", extra={"repo": resolved, "number": number})
+            log.exception("Failed to comment on issue", extra={"number": number})
             return False
 
-    async def close_issue(
-        self,
-        number: int,
-        comment: str = "",
-        repo: str | None = None,
-    ) -> bool:
+    async def close_issue(self, number: int, comment: str = "") -> bool:
         """Close an issue, optionally with a closing comment. Returns True on success."""
-        resolved = self._resolve_repo(repo)
         try:
             if comment:
-                await self.comment_issue(number, comment, repo=resolved)
+                await self.comment_issue(number, comment)
             resp = await self._client.patch(
-                f"{API}/repos/{resolved}/issues/{number}",
+                f"{API}/repos/{self._repo_path}/issues/{number}",
                 headers=await self._auth.headers(),
                 json={"state": "closed"},
             )
             resp.raise_for_status()
-            log.info("GitHub issue closed", extra={"repo": resolved, "number": number})
+            log.info("GitHub issue closed", extra={"number": number})
             return True
         except Exception:
-            log.exception("Failed to close GitHub issue", extra={"repo": resolved, "number": number})
+            log.exception("Failed to close issue", extra={"number": number})
             return False
