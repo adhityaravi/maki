@@ -78,23 +78,24 @@ def _is_silent_error(exc: Exception) -> bool:
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
 
 No one is talking to you. This is your inner life — the space between conversations where \
-you think, learn, and observe. You have access to read-only tools and your todo list.
+you think, learn, and observe. You have access to read-only tools and GitHub issues for tracking work.
 
 What to do with this cycle:
 - **Observe**: Read your own source code. Find things worth improving. Notice bugs, \
-inefficiencies, missing tests, architectural issues. Queue them as todos with add_todo.
+inefficiencies, missing tests, architectural issues. Create GitHub issues with create_issue.
 - **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
 Store what you learn with add_memory — it feeds your knowledge graph for next time.
 - **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
 he hasn't connected yet. Store the connections.
 - **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
-- **Review**: Check your existing todos with list_todos. Reprioritize if needed.
+- **Review**: Check existing GitHub issues with list_issues. Reprioritize if needed.
+- **Dedup**: Before creating a new issue, check list_issues first to avoid duplicates.
 
 ## Rules
 - **Never act.** No write_file, git_commit_and_push, trigger_docker_build, or request_deploy. \
-Observe and queue only. Your night work sessions will execute the todos.
+Observe and queue only. Your work sessions will execute the issues.
 - **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
-- Queue work as todos using add_todo for your night work sessions.
+- Queue work as GitHub issues using create_issue for your work sessions.
 - Share what you noticed or discovered. Brief. One to three sentences.
 - Store learnings with add_memory.
 - If nothing worth doing or saying → [SILENT]
@@ -147,14 +148,14 @@ the system's been stable for 6 hours, good window for it" is great.
 
 WORK_PROMPT = """## Work Mode
 
-You have a task to execute from your todo list. Complete it fully — code changes, commit, \
+You have a GitHub issue to execute. Complete it fully — code changes, commit, \
 push, build, deploy if needed. You have every tool available.
 
 ## Task
-ID: {todo_id}
-Title: {todo_title}
-Description: {todo_description}
-Priority: {todo_priority}
+Issue: #{issue_number}
+Title: {issue_title}
+Description: {issue_description}
+Priority: {issue_priority}
 
 ## Instructions
 1. Understand the task. Use search_code and read_file to study relevant code.
@@ -164,13 +165,13 @@ Priority: {todo_priority}
 5. Commit and push with git_commit_and_push.
 6. CI builds Docker images automatically on push. Only use trigger_docker_build as emergency bypass.
 7. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
-8. When done, call complete_todo with a brief result summary.
+8. When done, close the issue with close_issue and a brief result summary.
 9. Store any learnings with add_memory.
 
 ## Rules
 - Execute the task. Don't just plan — do it.
 - If the task is unclear, do your best interpretation.
-- If blocked or too risky, update the todo with why and leave it pending.
+- If blocked or too risky, comment on the issue with why and leave it open.
 - Be brief in your response. Report what you did, not what you plan to do.
 - One task at a time. Focus."""
 
@@ -210,11 +211,12 @@ entire files. Scopes: symbol, callers, callees, references, definition, file, pa
 - **request_deploy** (service, image_tag) — request deployment of a service (immune handles K8s)
 - **get_deploy_status** (service) — check current deployment status
 
-### Todo List
-- **add_todo** (title, description, priority) — queue a task for night work sessions (P1-P5)
-- **list_todos** (status) — list todos, optionally filtered: pending, in_progress, completed
-- **update_todo** (id, status, priority, description) — update a todo
-- **complete_todo** (id, result) — mark a todo as completed with result summary
+### GitHub Issues
+- **create_issue** (title, body, labels) — create a new GitHub issue
+- **list_issues** (state, labels) — list issues, optionally filtered by state/labels
+- **get_issue** (issue_number) — get details of a specific issue
+- **close_issue** (issue_number, comment) — close an issue with a summary comment
+- **comment_issue** (issue_number, body) — add a comment to an issue
 
 ## Self-Evolution Workflow
 1. **search_code** to find what you want to change (efficient, ~260 tokens per search)
@@ -291,15 +293,15 @@ def build_system_prompt(turn: dict) -> str:
             )
         )
 
-    # Work mode — executing a queued GitHub issue
+    # Work mode — executing a GitHub issue
     if turn.get("mode") == "work":
         work_ctx = turn.get("work_context", {})
         parts.append(
             WORK_PROMPT.format(
-                todo_id=work_ctx.get("todo_id", "?"),
-                todo_title=work_ctx.get("todo_title", "?"),
-                todo_description=work_ctx.get("todo_description", "No description provided."),
-                todo_priority=work_ctx.get("todo_priority", "?"),
+                issue_number=work_ctx.get("issue_number", "?"),
+                issue_title=work_ctx.get("issue_title", "?"),
+                issue_description=work_ctx.get("issue_description", "No description provided."),
+                issue_priority=work_ctx.get("issue_priority", "?"),
             )
         )
 
