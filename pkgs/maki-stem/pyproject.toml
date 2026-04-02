@@ -3,7 +3,7 @@ name = "maki-stem"
 version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
-    "maki-common[fastapi,httpx]",
+    "maki-common[fastapi,httpx,github]",
 ]
 
 [project.scripts]
