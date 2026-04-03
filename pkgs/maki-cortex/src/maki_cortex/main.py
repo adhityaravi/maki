@@ -93,7 +93,6 @@ Store what you learn with add_memory — it feeds your knowledge graph for next 
 he hasn't connected yet. Store the connections.
 - **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
 - **Review**: Check existing GitHub issues with list_issues. Reprioritize if needed.
-- **Dedup**: Before creating a new issue, check list_issues first to avoid duplicates.
 
 ## Rules
 - **Never act.** No write_file, git_commit_and_push, trigger_docker_build, or request_deploy. \
@@ -107,6 +106,14 @@ Observe and queue only. Your work sessions will execute the issues.
 You can adjust your idle loop via tags:
 [CONFIG:idle_interval=3600] — reflection frequency (seconds)
 [CONFIG:max_thoughts_per_day=3] — daily thought limit
+
+## Open GitHub Issues
+{open_issues}
+
+**Dedup rule**: The list above is exhaustive — it was fetched fresh before this turn. \
+If your thought is already covered by an existing open issue (same topic, same intent), \
+respond with [SILENT]. Do NOT create a duplicate. Only create a new issue if the idea \
+is genuinely novel and not represented above.
 
 ## System state
 {system_state}
@@ -264,8 +271,15 @@ def build_system_prompt(turn: dict) -> str:
 
         config_str = "\n".join(f"- {k}: {v}" for k, v in config.items())
 
+        raw_issues = idle_ctx.get("open_issues", [])
+        if raw_issues:
+            issues_str = "\n".join(f"- #{i['number']}: {i['title']}" for i in raw_issues)
+        else:
+            issues_str = "None (GitHub unavailable or no open issues)"
+
         parts.append(
             IDLE_REFLECTION_PROMPT.format(
+                open_issues=issues_str,
                 system_state=state_str,
                 config=config_str,
                 hours_since=idle_ctx.get("hours_since_last_interaction", "?"),

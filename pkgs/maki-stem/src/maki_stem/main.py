@@ -551,6 +551,16 @@ async def _idle_loop():
             memories, graph_context = await _search_memories("recent activity and interests")
             system_state = await _gather_system_state()
 
+            # Fetch open issues for dedup — injected into cortex prompt so it doesn't
+            # need to call list_issues itself and can suppress duplicates reliably.
+            open_issues: list[dict] = []
+            if _github:
+                try:
+                    issues = await _github.list_issues(state="open")
+                    open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in (issues or [])]
+                except Exception:
+                    log.warning("Failed to fetch open issues for idle dedup")
+
             turn_id = f"idle-{uuid.uuid4().hex[:8]}"
             idle_payload = {
                 "turn_id": turn_id,
@@ -570,6 +580,7 @@ async def _idle_loop():
                     },
                     "current_config": config,
                     "system_state": system_state,
+                    "open_issues": open_issues,
                 },
             }
 
