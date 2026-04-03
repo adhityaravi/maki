@@ -259,6 +259,47 @@ async def _save_deploy_history(deployment_name: str, previous_image: str):
         log.warning("Failed to persist deploy history to KV", extra={"deployment": deployment_name})
 
 
+async def _fetch_rollback_logs(deployment_name: str) -> str:
+    """Fetch last 30 log lines from the failing pod before rollback.
+
+    Attached to rollback alerts so we're not blind to why a deploy failed.
+    Returns empty string silently on any error — never blocks the rollback.
+    """
+    if not _k8s_v1:
+        return ""
+    try:
+        pods = await asyncio.to_thread(
+            _k8s_v1.list_namespaced_pod,
+            namespace=NAMESPACE,
+            label_selector=f"app={deployment_name}",
+        )
+        # Prefer the unready pod — that's the one that failed
+        target_pod = None
+        for pod in pods.items:
+            ready = all(cs.ready for cs in (pod.status.container_statuses or []))
+            if not ready:
+                target_pod = pod.metadata.name
+                break
+        if not target_pod and pods.items:
+            target_pod = pods.items[-1].metadata.name
+        if not target_pod:
+            return ""
+        logs = await asyncio.to_thread(
+            _k8s_v1.read_namespaced_pod_log,
+            name=target_pod,
+            namespace=NAMESPACE,
+            tail_lines=30,
+        )
+        if not logs:
+            return ""
+        if len(logs) > 1500:
+            logs = logs[-1500:]
+        return f"\n```\n{logs.strip()}\n```"
+    except Exception:
+        log.debug("Could not fetch rollback logs", exc_info=True)
+        return ""
+
+
 # --- Health State Tracking ---
 
 
@@ -770,8 +811,10 @@ async def _deploy_request_handler(msg):
                     "status": "rolled_back",
                     "message": f"Deploy of {image} failed health check, rolled back to {previous_image}",
                 }
+                _rollback_logs = await _fetch_rollback_logs(deployment_name)
                 await _publish_alert(
-                    f"Deploy of {deployment_name} → {image_tag} FAILED health check. Rolled back to {previous_image}"
+                    f"Deploy of {deployment_name} → {image_tag} FAILED health check. "
+                    f"Rolled back to {previous_image}{_rollback_logs}"
                 )
 
                 # If cortex was rolled back, restart stem to clear stale pending turns
@@ -1003,9 +1046,11 @@ async def _deploy_propagate_handler(msg):
                     namespace=NAMESPACE,
                     body=rollback_patch,
                 )
+                _rollback_logs = await _fetch_rollback_logs(deployment_name)
                 await _publish_alert(
                     f"Propagated deploy of {deployment_name} → {image_tag} FAILED on {INSTANCE_ID}. "
                     f"Rolled back to {previous_image}. Canary ({canary}) was healthy — investigate."
+                    f"{_rollback_logs}"
                 )
 
             action = {
