@@ -507,7 +507,7 @@ async def main():
     )
     log.info("MCP tools registered")
 
-    sub = await nc.subscribe(CORTEX_TURN_REQUEST)
+    sub = await nc.subscribe(CORTEX_TURN_REQUEST, queue="maki-cortex")
     log.info("Subscribed", extra={"subject": CORTEX_TURN_REQUEST})
 
     asyncio.create_task(heartbeat_loop(nc))

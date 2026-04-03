@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import nats
@@ -59,3 +60,53 @@ async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, An
         except Exception:
             config[key] = default
     return config
+
+
+async def try_claim_loop(kv: KeyValue, key: str, interval: float, instance_id: str) -> bool:
+    """Try to claim a periodic loop iteration via NATS KV CAS.
+
+    Prevents multiple instances from running the same timed loop concurrently.
+    Uses optimistic locking — first instance to update wins, others skip.
+
+    Args:
+        kv: KV bucket (e.g. maki-lock).
+        key: Claim key (e.g. "loop.stem.idle").
+        interval: Minimum seconds between claims.
+        instance_id: Unique ID for this process instance.
+
+    Returns:
+        True if this instance should run, False if another claimed it.
+    """
+    now = time.time()
+    claim = json.dumps({"instance": instance_id, "claimed_at": now}).encode()
+
+    try:
+        entry = await kv.get(key)
+        data = json.loads(entry.value.decode())
+        if now - data.get("claimed_at", 0) < interval:
+            return False
+        # Claim expired — try to take over via CAS
+        await kv.update(key, claim, entry.revision)
+        return True
+    except nats.js.errors.KeyNotFoundError:
+        try:
+            await kv.create(key, claim)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def kv_put_float(kv: KeyValue, key: str, value: float) -> None:
+    """Store a float in NATS KV."""
+    await kv.put(key, json.dumps(value).encode())
+
+
+async def kv_get_float(kv: KeyValue, key: str, default: float = 0.0) -> float:
+    """Read a float from NATS KV."""
+    try:
+        entry = await kv.get(key)
+        return json.loads(entry.value.decode())
+    except Exception:
+        return default

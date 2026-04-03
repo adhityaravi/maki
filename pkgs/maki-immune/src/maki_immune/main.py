@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import httpx
 from kubernetes import client as k8s_client
@@ -20,6 +21,7 @@ from maki_common.health import tcp_health_server
 from maki_common.subjects import (
     CORTEX_HEALTH,
     CORTEX_STUCK,
+    DEPLOY_PROPAGATE,
     DEPLOY_REQUEST,
     DEPLOY_STATUS_REQUEST,
     EARS_IMMUNE_OUT,
@@ -53,6 +55,7 @@ CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
 
 DEFAULT_CONFIG = {
     "heartbeat_interval": 1800,
@@ -445,8 +448,12 @@ def _check_cortex_heartbeat():
 
 
 async def _health_monitor_loop():
-    """Continuous health monitoring — no Claude, triggers reflexes."""
-    log.info("Health monitor loop started", extra={"interval": CHECK_INTERVAL})
+    """Continuous health monitoring — no Claude, triggers reflexes.
+
+    NOT deduplicated — each immune instance monitors its own local cluster.
+    K8s API and HTTP health checks resolve to local pods via in-cluster DNS.
+    """
+    log.info("Health monitor loop started", extra={"interval": CHECK_INTERVAL, "instance_id": INSTANCE_ID})
 
     while True:
         try:
@@ -724,7 +731,21 @@ async def _deploy_request_handler(msg):
             if healthy:
                 result = {"status": "success", "message": f"Deployed {deployment_name} with {image}", "image": image}
                 log.info("Deploy succeeded", extra={"deployment": deployment_name})
-                await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy")
+                await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy on {INSTANCE_ID}")
+
+                # Propagate to other clusters — they'll deploy independently
+                await _nc.publish(
+                    DEPLOY_PROPAGATE,
+                    json.dumps(
+                        {
+                            "service": service,
+                            "image_tag": image_tag,
+                            "deployment_name": deployment_name,
+                            "image": image,
+                            "canary_instance": INSTANCE_ID,
+                        }
+                    ).encode(),
+                )
             else:
                 # Rollback to previous image
                 log.warning("Deploy unhealthy, rolling back", extra={"deployment": deployment_name})
@@ -895,6 +916,116 @@ async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
 
     log.warning("Rollout timed out", extra={"deployment": deployment_name, "timeout": timeout})
     return False
+
+
+async def _deploy_propagate_handler(msg):
+    """Handle deploy propagation from canary — deploy same image locally.
+
+    Broadcast subscription (not queue grouped) — every immune receives this.
+    Each skips if it was the canary that already deployed.
+    Deploys locally, monitors health, rolls back if unhealthy.
+    Canary failure never reaches here — propagation only happens on success.
+    """
+    try:
+        request = json.loads(msg.data.decode())
+        canary = request.get("canary_instance", "")
+        deployment_name = request.get("deployment_name", "")
+        image = request.get("image", "")
+        image_tag = request.get("image_tag", "")
+
+        # Skip if we were the canary — we already deployed
+        if canary == INSTANCE_ID:
+            return
+
+        log.info(
+            "Deploy propagation received from canary",
+            extra={"canary": canary, "deployment": deployment_name, "image": image},
+        )
+
+        if not _k8s_apps_v1:
+            log.error("K8s client not available, cannot propagate deploy")
+            return
+
+        if not await _acquire_lock("immune-deploy", ttl=180):
+            await _publish_alert(f"Cannot propagate deploy of {deployment_name} — lock held")
+            return
+
+        try:
+            dep = await asyncio.to_thread(
+                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
+            )
+            previous_image = dep.spec.template.spec.containers[0].image
+
+            # Already on this image — skip
+            if previous_image == image:
+                log.info("Already on target image, skipping", extra={"deployment": deployment_name})
+                return
+
+            await _save_deploy_history(deployment_name, previous_image)
+
+            patch = {
+                "spec": {
+                    "template": {
+                        "spec": {"containers": [{"name": dep.spec.template.spec.containers[0].name, "image": image}]}
+                    }
+                }
+            }
+            await asyncio.to_thread(
+                _k8s_apps_v1.patch_namespaced_deployment, name=deployment_name, namespace=NAMESPACE, body=patch
+            )
+            log.info("Propagated deploy applied", extra={"deployment": deployment_name, "image": image})
+
+            healthy = await _monitor_rollout(deployment_name, timeout=60)
+
+            if healthy:
+                result_status = "success"
+                log.info("Propagated deploy healthy", extra={"deployment": deployment_name})
+                await _publish_vitals(
+                    f"Propagated deploy of {deployment_name} → {image_tag} — healthy on {INSTANCE_ID}"
+                )
+            else:
+                result_status = "rolled_back"
+                log.warning("Propagated deploy unhealthy, rolling back", extra={"deployment": deployment_name})
+                rollback_patch = {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [
+                                    {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
+                                ]
+                            }
+                        }
+                    }
+                }
+                await asyncio.to_thread(
+                    _k8s_apps_v1.patch_namespaced_deployment,
+                    name=deployment_name,
+                    namespace=NAMESPACE,
+                    body=rollback_patch,
+                )
+                await _publish_alert(
+                    f"Propagated deploy of {deployment_name} → {image_tag} FAILED on {INSTANCE_ID}. "
+                    f"Rolled back to {previous_image}. Canary ({canary}) was healthy — investigate."
+                )
+
+            action = {
+                "type": "deploy_propagation",
+                "deployment": deployment_name,
+                "image": image,
+                "result": result_status,
+                "canary_instance": canary,
+                "instance": INSTANCE_ID,
+                "timestamp": time.time(),
+            }
+            _recent_actions.append(action)
+            if len(_recent_actions) > 50:
+                _recent_actions.pop(0)
+            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+        finally:
+            await _release_lock("immune-deploy")
+
+    except Exception:
+        log.exception("Deploy propagation error")
 
 
 async def _deploy_status_handler(msg):
@@ -1114,7 +1245,7 @@ def _build_system_state() -> str:
 
 async def _immune_heartbeat_loop():
     """Periodic holistic patrol with Claude reasoning."""
-    log.info("Immune heartbeat loop started")
+    log.info("Immune heartbeat loop started", extra={"instance_id": INSTANCE_ID})
     last_patrol = time.time()
 
     while True:
@@ -1258,19 +1389,22 @@ async def main():
     )
     log.info("Immune MCP tools registered")
 
-    await _nc.subscribe(IMMUNE_STATE_REQUEST, cb=_state_request_handler)
+    await _nc.subscribe(IMMUNE_STATE_REQUEST, queue="maki-immune", cb=_state_request_handler)
     log.info("Subscribed", extra={"subject": IMMUNE_STATE_REQUEST})
 
-    await _nc.subscribe(DEPLOY_REQUEST, cb=_deploy_request_handler)
+    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=_deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
 
-    await _nc.subscribe(DEPLOY_STATUS_REQUEST, cb=_deploy_status_handler)
+    await _nc.subscribe(DEPLOY_PROPAGATE, cb=_deploy_propagate_handler)
+    log.info("Subscribed", extra={"subject": DEPLOY_PROPAGATE})
+
+    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=_deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
 
-    await _nc.subscribe(CORTEX_STUCK, cb=_cortex_stuck_handler)
+    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=_cortex_stuck_handler)
     log.info("Subscribed", extra={"subject": CORTEX_STUCK})
 
-    await _nc.subscribe(IMMUNE_COMMAND, cb=_handle_immune_command)
+    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=_handle_immune_command)
     log.info("Subscribed", extra={"subject": IMMUNE_COMMAND})
 
     asyncio.create_task(_health_monitor_loop())

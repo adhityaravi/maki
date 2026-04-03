@@ -40,7 +40,7 @@ spec:
           emptyDir: {}
       containers:
         - name: cortex
-          image: ghcr.io/adhityaravi/maki-cortex:sha-2765241
+          image: ghcr.io/adhityaravi/maki-cortex:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

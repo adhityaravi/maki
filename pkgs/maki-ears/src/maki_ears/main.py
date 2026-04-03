@@ -8,9 +8,10 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 
 import discord
-from maki_common import PendingQueues, configure_logging, connect_nats
+from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_MESSAGE_IN,
@@ -41,8 +42,16 @@ IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
 CHUNK_INACTIVITY_TIMEOUT = 600.0
 
 _nc = None
+_js = None
+_dedup_kv = None
+_lock_kv = None
 _pending = PendingQueues()
 _immune_pending = PendingQueues()
+DEDUP_BUCKET = "maki-ears-dedup"
+LOCK_BUCKET = "maki-lock"
+LEADER_KEY = "ears.leader"
+LEADER_TTL = 15  # seconds — must renew before this expires
+INSTANCE_ID = f"ears-{uuid.uuid4().hex[:8]}"
 _general_channel_ids: set[int] = set()
 _thoughts_channel_ids: set[int] = set()
 _vitals_channel_ids: set[int] = set()
@@ -121,6 +130,14 @@ async def on_message(message: discord.Message):
         await _handle_immune_command(message, content)
         return
 
+    # Dedup: if another ears instance already published this message, skip
+    msg_key = f"msg.{message.id}"
+    try:
+        await _dedup_kv.create(msg_key, b"1")
+    except Exception:
+        log.info("Dedup: message already claimed by another instance", extra={"message_id": str(message.id)})
+        return
+
     payload = {
         "message_id": str(message.id),
         "channel_id": str(message.channel.id),
@@ -183,6 +200,14 @@ async def on_message(message: discord.Message):
 
 async def _handle_immune_command(message: discord.Message, content: str):
     """Handle messages in #maki-immune — forward to immune as direct commands."""
+    # Dedup: if another ears instance already published this command, skip
+    msg_key = f"msg.{message.id}"
+    try:
+        await _dedup_kv.create(msg_key, b"1")
+    except Exception:
+        log.info("Dedup: immune command already claimed", extra={"message_id": str(message.id)})
+        return
+
     payload = {
         "message_id": str(message.id),
         "command": content,
@@ -262,7 +287,7 @@ async def _immune_response_listener():
 
 async def _thought_listener():
     """Subscribe to NATS for proactive thoughts and post to #maki-thoughts."""
-    sub = await _nc.subscribe(EARS_THOUGHT_OUT)
+    sub = await _nc.subscribe(EARS_THOUGHT_OUT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": EARS_THOUGHT_OUT})
     async for msg in sub.messages:
         try:
@@ -290,7 +315,7 @@ async def _thought_listener():
 
 async def _vitals_listener():
     """Subscribe to NATS for health digests and post to #maki-vitals."""
-    sub = await _nc.subscribe(EARS_VITALS_OUT)
+    sub = await _nc.subscribe(EARS_VITALS_OUT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": EARS_VITALS_OUT})
     async for msg in sub.messages:
         try:
@@ -314,7 +339,7 @@ async def _vitals_listener():
 
 async def _alert_listener():
     """Subscribe to immune alerts and post to #maki-vitals."""
-    sub = await _nc.subscribe(IMMUNE_ALERT)
+    sub = await _nc.subscribe(IMMUNE_ALERT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": IMMUNE_ALERT})
     async for msg in sub.messages:
         try:
@@ -339,7 +364,7 @@ async def _alert_listener():
 
 async def _reminder_listener():
     """Subscribe to NATS for care reminders and post to #maki-reminders."""
-    sub = await _nc.subscribe(EARS_REMINDER_OUT)
+    sub = await _nc.subscribe(EARS_REMINDER_OUT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": EARS_REMINDER_OUT})
     async for msg in sub.messages:
         try:
@@ -380,13 +405,68 @@ async def _send_response(channel, text: str):
         text = text[len(chunk) :]
 
 
-async def main():
-    global _nc
+async def _try_acquire_leadership() -> bool:
+    """Try to become the ears leader via NATS KV CAS."""
+    import json as _json
+    import time as _time
 
-    log.info("maki-ears starting", extra={"nats_url": NATS_URL})
+    now = _time.time()
+    claim = _json.dumps({"instance": INSTANCE_ID, "claimed_at": now}).encode()
+
+    try:
+        entry = await _lock_kv.get(LEADER_KEY)
+        data = _json.loads(entry.value.decode())
+        # If current leader's claim is fresh, we're not the leader
+        if now - data.get("claimed_at", 0) < LEADER_TTL:
+            if data.get("instance") == INSTANCE_ID:
+                # We're already the leader — renew
+                await _lock_kv.update(LEADER_KEY, claim, entry.revision)
+                return True
+            return False
+        # Claim expired — try to take over
+        await _lock_kv.update(LEADER_KEY, claim, entry.revision)
+        return True
+    except Exception:
+        try:
+            await _lock_kv.create(LEADER_KEY, claim)
+            return True
+        except Exception:
+            return False
+
+
+async def _leader_renewal_loop():
+    """Renew leadership claim every LEADER_TTL/2 seconds while Discord is connected."""
+    interval = LEADER_TTL / 2
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if not await _try_acquire_leadership():
+                log.warning("Lost leadership, shutting down Discord bot")
+                await _bot.close()
+                return
+        except Exception:
+            log.exception("Leader renewal error")
+
+
+async def main():
+    global _nc, _js, _dedup_kv, _lock_kv
+
+    log.info("maki-ears starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    _js = _nc.jetstream()
 
+    _lock_kv = await init_kv(_js, LOCK_BUCKET)
+
+    # Dedup bucket with 5-minute TTL — prevents duplicate Discord event processing
+    try:
+        _dedup_kv = await _js.key_value(DEDUP_BUCKET)
+    except Exception:
+        _dedup_kv = await _js.create_key_value(bucket=DEDUP_BUCKET, ttl=300)
+
+    # NATS listeners run always — harmless when not leader
+    # (response listeners silently drop unmatched messages,
+    #  outbound listeners have no channels to post to without Discord)
     asyncio.create_task(_response_listener())
     asyncio.create_task(_immune_response_listener())
     asyncio.create_task(_thought_listener())
@@ -394,11 +474,25 @@ async def main():
     asyncio.create_task(_alert_listener())
     asyncio.create_task(_reminder_listener())
 
-    try:
-        await _bot.start(DISCORD_TOKEN)
-    finally:
-        await _nc.close()
-        log.info("NATS connection closed")
+    # Leader election loop — only the leader connects to Discord
+    while True:
+        if await _try_acquire_leadership():
+            log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
+            asyncio.create_task(_leader_renewal_loop())
+
+            try:
+                await _bot.start(DISCORD_TOKEN)
+            except Exception:
+                log.exception("Discord bot disconnected")
+            finally:
+                log.info("Discord bot stopped, returning to standby")
+        else:
+            log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
+
+        await asyncio.sleep(LEADER_TTL)
+
+    await _nc.close()
+    log.info("NATS connection closed")
 
 
 def cli():

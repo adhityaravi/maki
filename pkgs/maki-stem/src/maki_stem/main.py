@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import httpx
+import nats.js.api
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from maki_common import (
@@ -21,9 +22,12 @@ from maki_common import (
     configure_logging,
     connect_nats,
     init_kv,
+    kv_get_float,
+    kv_put_float,
     load_kv_config,
     parse_config_tags,
     strip_tags,
+    try_claim_loop,
 )
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
@@ -51,11 +55,12 @@ TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
 KV_BUCKET = "maki-identity"
 KV_KEY = "identity"
+LOCK_BUCKET = "maki-lock"
 
 STREAM_NAME = "maki-conversation"
 STREAM_MAX_MSGS = int(os.environ.get("STREAM_MAX_MSGS", "200"))
 CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "20"))
-INSTANCE_ID = os.environ.get("INSTANCE_ID", "dev-01")
+INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
 
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
@@ -125,9 +130,9 @@ _nc = None
 _kv = None
 _js = None
 _config_kv = None
+_lock_kv = None
 _pending = PendingQueues()
 _conversation_history: list[dict] = []
-_last_activity: float = time.time()
 _thoughts_today: int = 0
 _thoughts_today_date: str = ""
 _reminders_today: int = 0
@@ -282,6 +287,51 @@ async def _init_conversation_stream():
     except Exception:
         log.exception("Error loading conversation history")
         log.info("Starting with empty conversation history")
+
+
+async def _conversation_sync_listener():
+    """Live subscriber to conversation stream — keeps _conversation_history in sync.
+
+    Ensures that all stem instances see turns processed by any instance.
+    Uses a durable push consumer so we don't miss messages while running.
+    """
+    # Use deliver_last_per_subject to start from where we left off (after startup replay)
+    # Subscribe with a unique durable name per instance to get independent delivery
+    consumer_name = f"stem-sync-{INSTANCE_ID}"
+    try:
+        sub = await _js.subscribe(
+            CONVERSATION_STREAM,
+            durable=consumer_name,
+            deliver_policy=nats.js.api.DeliverPolicy.LAST_PER_SUBJECT,
+        )
+    except Exception:
+        # Fallback: ordered consumer starting from now (may miss some, but won't crash)
+        sub = await _js.subscribe(CONVERSATION_STREAM, ordered_consumer=True)
+
+    log.info("Conversation sync listener started", extra={"instance_id": INSTANCE_ID})
+    async for msg in sub.messages:
+        try:
+            turn_doc = json.loads(msg.data.decode())
+            turn_id = turn_doc.get("turn_id", "")
+
+            # Skip if we already have this turn (we added it locally in _publish_turn_to_stream)
+            if any(t.get("turn_id") == turn_id for t in _conversation_history[-50:]):
+                await msg.ack()
+                continue
+
+            _conversation_history.append(turn_doc)
+
+            # Keep bounded
+            while len(_conversation_history) > STREAM_MAX_MSGS:
+                _conversation_history.pop(0)
+
+            log.info(
+                "Conversation synced from stream",
+                extra={"turn_id": turn_id, "instance": turn_doc.get("instance_id", "?")},
+            )
+            await msg.ack()
+        except Exception:
+            log.exception("Error syncing conversation")
 
 
 async def _publish_turn_to_stream(turn_id: str, user_message: str, cortex_response: str):
@@ -462,8 +512,7 @@ async def _idle_loop():
     """Proactive idle heartbeat loop — Maki's inner life."""
     global _thoughts_today, _thoughts_today_date
 
-    log.info("Idle loop started", extra={"check_interval": IDLE_CHECK_INTERVAL})
-    last_idle_turn = time.time()
+    log.info("Idle loop started", extra={"check_interval": IDLE_CHECK_INTERVAL, "instance_id": INSTANCE_ID})
 
     while True:
         await asyncio.sleep(IDLE_CHECK_INTERVAL)
@@ -472,10 +521,11 @@ async def _idle_loop():
             config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
             idle_interval = config.get("idle_interval", 7200)
 
-            if time.time() - last_idle_turn < idle_interval:
+            if not await try_claim_loop(_lock_kv, "loop.stem.idle", idle_interval, INSTANCE_ID):
                 continue
 
-            if time.time() - _last_activity < RECENTLY_ACTIVE_THRESHOLD:
+            last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
+            if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
                 continue
 
             if _in_quiet_hours(config):
@@ -491,7 +541,6 @@ async def _idle_loop():
                 continue
 
             log.info("Idle loop triggered — starting reflection")
-            last_idle_turn = time.time()
 
             try:
                 entry = await _kv.get(KV_KEY)
@@ -513,8 +562,8 @@ async def _idle_loop():
                 "prompt": None,
                 "mission_results": None,
                 "idle_context": {
-                    "last_interaction": datetime.fromtimestamp(_last_activity, tz=UTC).isoformat(),
-                    "hours_since_last_interaction": round((time.time() - _last_activity) / 3600, 1),
+                    "last_interaction": datetime.fromtimestamp(last_activity, tz=UTC).isoformat(),
+                    "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
                     "time_context": {
                         "local_time": datetime.now().strftime("%H:%M"),
                         "day_of_week": datetime.now().strftime("%A"),
@@ -608,8 +657,7 @@ async def _care_loop():
     """Proactive care loop — Maki checking in on Adi."""
     global _reminders_today, _reminders_today_date
 
-    log.info("Care loop started", extra={"check_interval": CARE_CHECK_INTERVAL})
-    last_care = time.time()
+    log.info("Care loop started", extra={"check_interval": CARE_CHECK_INTERVAL, "instance_id": INSTANCE_ID})
 
     while True:
         await asyncio.sleep(CARE_CHECK_INTERVAL)
@@ -618,10 +666,11 @@ async def _care_loop():
             config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
             care_interval = config.get("care_interval", 1800)
 
-            if time.time() - last_care < care_interval:
+            if not await try_claim_loop(_lock_kv, "loop.stem.care", care_interval, INSTANCE_ID):
                 continue
 
-            if time.time() - _last_activity < RECENTLY_ACTIVE_THRESHOLD:
+            last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
+            if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
                 continue
 
             if _in_quiet_hours(config):
@@ -637,7 +686,6 @@ async def _care_loop():
                 continue
 
             log.info("Care loop triggered — checking in")
-            last_care = time.time()
 
             # Search memories for follow-ups, commitments, recent activity
             memories, graph_context = await _search_memories(
@@ -665,7 +713,7 @@ async def _care_loop():
                 "graph_context": graph_context,
                 "prompt": None,
                 "care_context": {
-                    "hours_since_last_interaction": round((time.time() - _last_activity) / 3600, 1),
+                    "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
                     "time_context": {
                         "local_time": datetime.now().strftime("%H:%M"),
                         "day_of_week": datetime.now().strftime("%A"),
@@ -727,6 +775,10 @@ async def _work_loop():
             if not _in_work_hours(config):
                 continue
 
+            work_interval = config.get("work_interval", WORK_CHECK_INTERVAL)
+            if not await try_claim_loop(_lock_kv, "loop.stem.work", work_interval, INSTANCE_ID):
+                continue
+
             # Reset nightly counter if date changed
             tonight = datetime.now().strftime("%Y-%m-%d")
             if tonight != _work_items_tonight_date:
@@ -738,7 +790,8 @@ async def _work_loop():
                 continue
 
             # Only work if user has been inactive
-            if time.time() - _last_activity < USER_INACTIVE_THRESHOLD:
+            last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
+            if time.time() - last_activity < USER_INACTIVE_THRESHOLD:
                 log.info("Work loop: user recently active, skipping")
                 continue
 
@@ -894,8 +947,8 @@ async def _work_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _nc, _js, _config_kv, _github
-    log.info("maki-stem starting", extra={"nats_url": NATS_URL})
+    global _nc, _js, _config_kv, _lock_kv, _github
+    log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
@@ -903,11 +956,13 @@ async def lifespan(app: FastAPI):
     await _seed_identity()
     await _init_conversation_stream()
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CORTEX_CONFIG)
+    _lock_kv = await init_kv(_js, LOCK_BUCKET)
 
     _github = _init_github_client()
 
     asyncio.create_task(_response_listener())
     asyncio.create_task(_cortex_heartbeat_watcher())
+    asyncio.create_task(_conversation_sync_listener())
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_idle_loop())
@@ -942,8 +997,7 @@ async def _process_turn(
     If forward_to is provided (dict with message_id, channel_id),
     streams each chunk to EARS_MESSAGE_OUT as it arrives from cortex.
     """
-    global _last_activity
-    _last_activity = time.time()
+    await kv_put_float(_lock_kv, "stem.last_activity", time.time())
 
     turn_id = f"turn-{uuid.uuid4().hex[:8]}"
     _active_turns[turn_id] = time.time()
@@ -1076,7 +1130,7 @@ async def _memory_store_listener():
     {"content": "...", "user_id": "...", "metadata": {...}}
     Each memory is stored concurrently as a background task.
     """
-    sub = await _nc.subscribe(MEMORY_STORE)
+    sub = await _nc.subscribe(MEMORY_STORE, queue="maki-stem")
     log.info("Subscribed", extra={"subject": MEMORY_STORE})
     async for msg in sub.messages:
         try:
@@ -1141,7 +1195,7 @@ async def _handle_discord_message(data: dict):
 
 async def _ears_listener():
     """Listen for incoming Discord messages via NATS and dispatch as tasks."""
-    sub = await _nc.subscribe(EARS_MESSAGE_IN)
+    sub = await _nc.subscribe(EARS_MESSAGE_IN, queue="maki-stem")
     log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
     async for msg in sub.messages:
         try:

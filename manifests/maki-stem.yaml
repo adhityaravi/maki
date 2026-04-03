@@ -38,7 +38,7 @@ spec:
                 path: private-key.pem
       containers:
         - name: stem
-          image: ghcr.io/adhityaravi/maki-stem:sha-2765241
+          image: ghcr.io/adhityaravi/maki-stem:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000

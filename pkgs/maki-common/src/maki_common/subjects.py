@@ -23,6 +23,7 @@ IMMUNE_COMMAND = "maki.immune.command"
 # Deploy coordination
 DEPLOY_REQUEST = "maki.deploy.request"
 DEPLOY_STATUS_REQUEST = "maki.deploy.status"
+DEPLOY_PROPAGATE = "maki.deploy.propagate"
 
 # Ears (cont.)
 EARS_REMINDER_OUT = "maki.ears.reminder.out"
