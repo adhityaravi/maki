@@ -93,6 +93,8 @@ Store what you learn with add_memory — it feeds your knowledge graph for next 
 he hasn't connected yet. Store the connections.
 - **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
 - **Review**: Check existing GitHub issues with list_issues. Reprioritize if needed.
+- **Hygiene**: Scan open issues for ones already resolved or no longer relevant. \
+Close them with close_issue and a brief reason. Keep the board clean and accurate.
 
 ## Rules
 - **Never act.** No write_file, git_commit_and_push, trigger_docker_build, or request_deploy. \
@@ -116,6 +118,12 @@ You can adjust your idle loop via tags:
 Before calling create_issue or writing a response, check whether the thought is already \
 covered (same topic, same intent). If it is → respond with exactly [SILENT] and do NOT \
 call create_issue. Only file or share something if it is genuinely novel and not listed above.
+
+**Hygiene rule**: For each issue above, ask: is this already resolved? Check the code or \
+your memory if needed. If confident the fix is already in place → call close_issue with a \
+brief summary of why it's done. Do NOT close issues you're uncertain about — only close \
+when the resolution is clearly evident. The work loop depends on this list being accurate; \
+stale issues waste its time.
 
 ## System state
 {system_state}
@@ -499,13 +507,20 @@ async def main():
 
         github_auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
 
-    from maki_common.repo import init_repo
+    repo_path = REPO_PATH
+    if github_auth:
+        from maki_common.tools.github import ensure_repo_clone
 
-    await init_repo(
-        REPO_PATH,
-        clone_url=f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git",
-        github_auth=github_auth,
-    )
+        try:
+            repo_path = await ensure_repo_clone(
+                github_auth,
+                owner=REPO_OWNER,
+                repo=REPO_NAME,
+                local_path=REPO_PATH,
+            )
+            log.info("Repo ready", extra={"path": repo_path})
+        except Exception:
+            log.warning("Repo clone/pull failed — code tools may be limited")
 
     # Create MCP tool server
     from maki_common.tools import create_cortex_tools
@@ -513,17 +528,14 @@ async def main():
     mcp_server = create_cortex_tools(
         nc=nc,
         recall_url=RECALL_URL,
-        health_endpoints=HEALTH_ENDPOINTS,
-        repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,
         github_installation_id=GITHUB_INSTALLATION_ID,
         repo_owner=REPO_OWNER,
         repo_name=REPO_NAME,
     )
-    log.info("MCP tools registered")
 
-    sub = await nc.subscribe(CORTEX_TURN_REQUEST, queue="maki-cortex")
+    sub = await nc.subscribe(CORTEX_TURN_REQUEST)
     log.info("Subscribed", extra={"subject": CORTEX_TURN_REQUEST})
 
     asyncio.create_task(heartbeat_loop(nc))
@@ -537,7 +549,3 @@ async def main():
 
 def cli():
     asyncio.run(main())
-
-
-if __name__ == "__main__":
-    cli()
