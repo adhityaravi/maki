@@ -32,6 +32,7 @@ jobs:
       immune: ${{ steps.filter.outputs.immune }}
       recall: ${{ steps.filter.outputs.recall }}
       synapse: ${{ steps.filter.outputs.synapse }}
+      vault: ${{ steps.filter.outputs.vault }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -62,6 +63,8 @@ jobs:
               - 'pkgs/maki-synapse/**'
               - 'pkgs/maki-common/**'
               - 'images/maki-synapse/**'
+            vault:
+              - 'images/maki-vault/**'
 
   build:
     runs-on: ubuntu-latest
@@ -69,7 +72,7 @@ jobs:
     if: always() && !failure() && !cancelled()
     strategy:
       matrix:
-        service: [cortex, ears, stem, immune, recall, synapse]
+        service: [cortex, ears, stem, immune, recall, synapse, vault]
     steps:
       - name: Check if should build
         id: should-build

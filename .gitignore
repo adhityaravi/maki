@@ -190,6 +190,21 @@ cython_debug/
 
 *.pem
 
+# Terraform / OpenTofu
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terragrunt-cache/
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# SOPS decrypted secrets (never commit)
+infra/secrets.yaml
+
 # Ruff stuff:
 .ruff_cache/
 

@@ -1,3 +1,3 @@
 creation_rules:
-  - path_regex: (manifests|infra)/secrets\.enc\.yaml$
+  - path_regex: secrets(\.enc)?\.yaml$
     age: age17zqyk4za0q6md4tp0grlmlxnhppjvsnfalx987wsl8fgmhfx4fzq3g69m3
