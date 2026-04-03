@@ -505,44 +505,38 @@ async def main():
         except Exception:
             log.warning("Failed to load GitHub App private key", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
+    # Clone or pull the repo for local code access
     github_auth = None
-    if github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
+    if GITHUB_APP_ID and github_private_key and GITHUB_INSTALLATION_ID:
         from maki_common.tools.github import GitHubAuth
 
-        github_auth = GitHubAuth(
-            app_id=int(GITHUB_APP_ID),
-            private_key=github_private_key,
-            installation_id=int(GITHUB_INSTALLATION_ID),
-            owner=REPO_OWNER,
-            repo=REPO_NAME,
-        )
-        log.info("GitHub App auth configured", extra={"app_id": GITHUB_APP_ID})
+        github_auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
 
-    repo_path = REPO_PATH
-    if github_auth:
-        from maki_common.tools.github import ensure_repo_clone
+    from maki_common.repo import init_repo
 
-        try:
-            repo_path = await ensure_repo_clone(
-                github_auth,
-                owner=REPO_OWNER,
-                repo=REPO_NAME,
-                base_path="/repo",
-            )
-            log.info("Repo cloned/updated", extra={"path": repo_path})
-        except Exception:
-            log.warning("Failed to clone/update repo — using default path", extra={"path": repo_path})
-
-    from maki_common.tools import build_mcp_server
-
-    mcp_server = build_mcp_server(
+    await init_repo(
+        REPO_PATH,
+        clone_url=f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git",
         github_auth=github_auth,
-        repo_path=repo_path,
-        recall_url=RECALL_URL,
-        health_endpoints=HEALTH_ENDPOINTS,
     )
 
-    sub = await nc.subscribe(CORTEX_TURN_REQUEST)
+    # Create MCP tool server
+    from maki_common.tools import create_cortex_tools
+
+    mcp_server = create_cortex_tools(
+        nc=nc,
+        recall_url=RECALL_URL,
+        health_endpoints=HEALTH_ENDPOINTS,
+        repo_path=REPO_PATH,
+        github_app_id=GITHUB_APP_ID,
+        github_private_key=github_private_key,
+        github_installation_id=GITHUB_INSTALLATION_ID,
+        repo_owner=REPO_OWNER,
+        repo_name=REPO_NAME,
+    )
+    log.info("MCP tools registered")
+
+    sub = await nc.subscribe(CORTEX_TURN_REQUEST, queue="maki-cortex")
     log.info("Subscribed to turn requests", extra={"subject": CORTEX_TURN_REQUEST})
 
     asyncio.create_task(heartbeat_loop(nc))
