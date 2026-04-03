@@ -546,5 +546,9 @@ async def main():
         asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
 
 
-if __name__ == "__main__":
+def cli():
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
