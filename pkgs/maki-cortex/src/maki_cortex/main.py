@@ -98,10 +98,12 @@ he hasn't connected yet. Store the connections.
 - **Never act.** No write_file, git_commit_and_push, trigger_docker_build, or request_deploy. \
 Observe and queue only. Your work sessions will execute the issues.
 - **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
-- Queue work as GitHub issues using create_issue for your work sessions.
-- Share what you noticed or discovered. Brief. One to three sentences.
+- If you have something worth tracking, file it yourself with create_issue. \
+Always include a priority label: P1 (critical), P2 (high), P3 (medium), P4 (low). \
+Use "automated" label too. Example: `labels="P3,automated"`.
+- Share what you noticed or discovered as your response text. Brief. One to three sentences.
 - Store learnings with add_memory.
-- If nothing worth doing or saying → [SILENT]
+- If nothing genuinely new to say or file → respond with exactly [SILENT]
 
 You can adjust your idle loop via tags:
 [CONFIG:idle_interval=3600] — reflection frequency (seconds)
@@ -110,10 +112,10 @@ You can adjust your idle loop via tags:
 ## Open GitHub Issues
 {open_issues}
 
-**Dedup rule**: The list above is exhaustive — it was fetched fresh before this turn. \
-If your thought is already covered by an existing open issue (same topic, same intent), \
-respond with [SILENT]. Do NOT create a duplicate. Only create a new issue if the idea \
-is genuinely novel and not represented above.
+**Dedup rule**: The list above is exhaustive — fetched fresh before this turn. \
+Before calling create_issue or writing a response, check whether the thought is already \
+covered (same topic, same intent). If it is → respond with exactly [SILENT] and do NOT \
+call create_issue. Only file or share something if it is genuinely novel and not listed above.
 
 ## System state
 {system_state}

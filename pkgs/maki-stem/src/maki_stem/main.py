@@ -598,7 +598,8 @@ async def _idle_loop():
                 await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
                 clean_thought = strip_tags(thought or "")
-                if clean_thought == "[SILENT]":
+                # Robust [SILENT] check — LLM may include surrounding text
+                if "[SILENT]" in clean_thought:
                     clean_thought = ""
 
                 if clean_thought:
@@ -621,10 +622,8 @@ async def _idle_loop():
                             clean_thought,
                         )
                     )
-
-                    # Create GitHub issue for the thought
-                    if _github:
-                        asyncio.create_task(_create_idle_thought_issue(clean_thought, turn_id))
+                    # Issue creation is handled by the LLM via create_issue MCP tool.
+                    # Stem no longer deterministically files every thought as an issue.
                 else:
                     log.info("Idle reflection produced no thought", extra={"turn_id": turn_id})
 
