@@ -1327,3 +1327,13 @@ async def turn(req: TurnRequest):
         raise HTTPException(status_code=503, detail="NATS not connected")
     _, response = await _process_turn(req.message)
     return {"response": response}
+
+
+def cli():
+    import uvicorn
+
+    uvicorn.run("maki_stem.main:app", host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    cli()
