@@ -1508,7 +1508,7 @@ def health():
         ("memory_store", _sub_memory_store),
         ("ears", _sub_ears),
     ]:
-        if sub is None or sub.is_closed:
+        if sub is None or getattr(sub, "_closed", False):
             dead_subs.append(name)
     if dead_subs:
         return JSONResponse(
