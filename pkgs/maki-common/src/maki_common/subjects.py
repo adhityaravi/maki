@@ -5,6 +5,7 @@ CORTEX_TURN_REQUEST = "maki.cortex.turn.request"
 CORTEX_TURN_RESPONSE = "maki.cortex.turn.response"
 CORTEX_HEALTH = "maki.cortex.health"
 CORTEX_STUCK = "maki.cortex.stuck"
+CORTEX_TOKEN_USAGE = "maki.cortex.token.usage"
 
 # Ears (Discord interface)
 EARS_MESSAGE_IN = "maki.ears.message.in"

@@ -12,9 +12,9 @@ import time
 import uuid
 
 from maki_common import configure_logging, connect_nats
-from maki_common.claude import invoke_claude, stream_claude
+from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
-from maki_common.subjects import CORTEX_HEALTH, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
+from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -77,6 +77,29 @@ def _is_silent_error(exc: Exception) -> bool:
     """Check if an error should be silently swallowed instead of sent to Discord."""
     error_str = str(exc).lower()
     return any(pattern.lower() in error_str for pattern in _SILENT_ERROR_PATTERNS)
+
+
+async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
+    """Publish token usage metrics to NATS for immune and other subscribers."""
+    try:
+        payload = {
+            "turn_id": turn_id,
+            "timestamp": time.time(),
+            "session_id": SESSION_ID,
+            **usage.to_log_dict(),
+        }
+        await nc.publish(CORTEX_TOKEN_USAGE, json.dumps(payload).encode())
+        log.info(
+            "Token usage published",
+            extra={
+                "turn_id": turn_id,
+                "total_tokens": usage.total_tokens,
+                "total_cost_usd": usage.total_cost_usd,
+                "mode": usage.mode,
+            },
+        )
+    except Exception:
+        log.exception("Failed to publish token usage", extra={"turn_id": turn_id})
 
 
 IDLE_REFLECTION_PROMPT = """## Reflection Mode
@@ -367,24 +390,29 @@ async def handle_turn_request(msg, nc, mcp_server):
         if is_idle or is_care or is_work:
             # Single-shot with tools — idle/care/work modes
             effective_max_turns = WORK_MAX_TURNS if is_work else MAX_TURNS
-            response_text = await invoke_claude(
+            response_text, usage = await invoke_claude(
                 full_prompt,
                 model=MODEL,
                 semaphore=_semaphore,
                 max_turns=effective_max_turns,
                 mcp_servers={"maki": mcp_server},
+                mode=mode,
             )
             response = {"turn_id": turn_id, "response": response_text, "done": True}
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
             log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
+            await _publish_token_usage(nc, turn_id, usage)
         else:
             # Normal turn: streaming with tools
+            usage_out: list[TokenUsage] = []
             async with _semaphore:
                 async for chunk in stream_claude(
                     full_prompt,
                     model=MODEL,
                     max_turns=MAX_TURNS,
                     mcp_servers={"maki": mcp_server},
+                    mode=mode,
+                    usage_out=usage_out,
                 ):
                     response = {"turn_id": turn_id, "response": chunk, "done": False}
                     await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
@@ -394,6 +422,8 @@ async def handle_turn_request(msg, nc, mcp_server):
             done_msg = {"turn_id": turn_id, "response": "", "done": True}
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
             log.info("Turn stream complete", extra={"turn_id": turn_id})
+            if usage_out:
+                await _publish_token_usage(nc, turn_id, usage_out[0])
 
     except Exception as exc:
         log.exception("Error handling turn request")
@@ -502,7 +532,6 @@ async def main():
     log.info("Subscribed to turn requests", extra={"subject": CORTEX_TURN_REQUEST})
 
     asyncio.create_task(heartbeat_loop(nc))
-    log.info("Heartbeat loop started")
 
     async for msg in sub.messages:
         asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
@@ -510,7 +539,3 @@ async def main():
 
 def cli():
     asyncio.run(main())
-
-
-if __name__ == "__main__":
-    cli()
