@@ -82,6 +82,8 @@ HEALTH_ENDPOINTS = {
 }
 
 CARE_CHECK_INTERVAL = int(os.environ.get("CARE_CHECK_INTERVAL", "60"))
+MAX_RECENT_REMINDERS = 5  # how many past reminders to inject as dedup context
+CARE_REMINDERS_KEY = "care.recent_reminders"  # NATS KV key for reminder history
 
 WORK_CHECK_INTERVAL = int(os.environ.get("WORK_CHECK_INTERVAL", "300"))
 WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minutes
@@ -888,6 +890,26 @@ IDLE_LOOP_SPEC = LoopSpec(
 )
 
 
+async def _get_recent_reminders() -> list[str]:
+    """Load the last MAX_RECENT_REMINDERS reminder texts from NATS KV."""
+    try:
+        entry = await _lock_kv.get(CARE_REMINDERS_KEY)
+        return json.loads(entry.value.decode())
+    except Exception:
+        return []
+
+
+async def _put_recent_reminder(text: str) -> None:
+    """Append a reminder text to the KV history, capped at MAX_RECENT_REMINDERS."""
+    try:
+        recent = await _get_recent_reminders()
+        recent.append(text[:300])
+        recent = recent[-MAX_RECENT_REMINDERS:]
+        await _lock_kv.put(CARE_REMINDERS_KEY, json.dumps(recent).encode())
+    except Exception:
+        log.warning("Failed to persist recent reminder to KV", exc_info=True)
+
+
 async def _care_should_run(config: dict) -> bool:
     """Guard checks for the care loop: activity threshold, quiet hours, daily cap."""
     global _reminders_today, _reminders_today_date
@@ -920,6 +942,7 @@ async def _care_body(spec: LoopSpec, config: dict) -> None:
         identity = DEFAULT_IDENTITY
 
     memories, graph_context = await _search_memories("Adi's wellbeing, habits, recent concerns")
+    recent_reminders = await _get_recent_reminders()
 
     turn_id = f"care-{uuid.uuid4().hex[:8]}"
     care_payload = {
@@ -936,6 +959,7 @@ async def _care_body(spec: LoopSpec, config: dict) -> None:
             "time_context": {
                 "local_time": datetime.now().strftime("%H:%M"),
             },
+            "recent_reminders": recent_reminders,
         },
     }
 
@@ -951,6 +975,7 @@ async def _care_body(spec: LoopSpec, config: dict) -> None:
         if clean_reminder:
             reminder_payload = {"reminder": clean_reminder, "turn_id": turn_id}
             await _nc.publish(EARS_REMINDER_OUT, json.dumps(reminder_payload).encode())
+            asyncio.create_task(_put_recent_reminder(clean_reminder))
             global _reminders_today
             _reminders_today += 1
             log.info(
