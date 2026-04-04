@@ -326,8 +326,15 @@ def make_code_edit_tools(
                 if rc != 0:
                     return mcp_result(f"Error staging {f}: {stderr}")
 
-            # Commit
-            rc, stdout, stderr = await _run_git(repo_path, "commit", "-m", message)
+            # Commit — always as makiself[bot] regardless of local git config
+            rc, stdout, stderr = await _run_git(
+                repo_path,
+                "commit",
+                "--author",
+                "makiself[bot] <makiself[bot]@users.noreply.github.com>",
+                "-m",
+                message,
+            )
             if rc != 0:
                 return mcp_result(f"Commit failed: {stderr}")
 

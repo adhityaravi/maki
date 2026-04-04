@@ -575,13 +575,16 @@ async def main():
         else:
             log.info("Repo cloned", extra={"path": REPO_PATH})
 
-    # Configure git identity — no global config in container, must be set per-repo
-    if github_private_key and os.path.exists(REPO_PATH):
+    # Set committer identity so git commit doesn't error in a bare container.
+    # The actual author is forced to makiself[bot] via --author in git_commit_and_push.
+    if os.path.exists(REPO_PATH):
         import subprocess as _sp
 
-        _sp.run(["git", "-C", REPO_PATH, "config", "user.name", "maki"], capture_output=True)
-        _sp.run(["git", "-C", REPO_PATH, "config", "user.email", "maki@adhityaravi.dev"], capture_output=True)
-        log.info("Git identity configured", extra={"path": REPO_PATH})
+        _sp.run(["git", "-C", REPO_PATH, "config", "user.name", "makiself[bot]"], capture_output=True)
+        _sp.run(
+            ["git", "-C", REPO_PATH, "config", "user.email", "makiself[bot]@users.noreply.github.com"],
+            capture_output=True,
+        )
 
     from maki_common.tools import create_cortex_tools
 
