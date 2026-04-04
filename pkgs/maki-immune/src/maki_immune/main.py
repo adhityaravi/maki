@@ -52,6 +52,7 @@ HEALTH_ENDPOINTS = {
     "maki-synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
 }
 
+VITALS_STREAM = "maki-vitals"
 CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
@@ -782,16 +783,16 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
 
 
 async def _publish_alert(alert_text: str):
-    """Publish urgent alert to NATS (ears will post to #maki-vitals)."""
+    """Publish urgent alert to JetStream (ears will post to #maki-vitals)."""
     payload = {"alert": alert_text, "timestamp": time.time()}
-    await _nc.publish(IMMUNE_ALERT, json.dumps(payload).encode())
+    await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
     log.info("Alert published", extra={"alert_preview": alert_text[:100]})
 
 
 async def _publish_vitals(digest: str):
-    """Publish health digest to maki-ears for #maki-vitals."""
+    """Publish health digest to JetStream for #maki-vitals."""
     payload = {"digest": digest, "timestamp": time.time()}
-    await _nc.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
+    await _js.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
     log.info("Vitals digest published", extra={"digest_len": len(digest)})
 
 
@@ -1667,6 +1668,21 @@ async def main():
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
     _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
     _state_kv = await init_kv(_js, STATE_BUCKET)
+
+    # Vitals stream — ensures deploy results survive transient ears restarts
+    from nats.js.api import RetentionPolicy, StorageType
+
+    try:
+        await _js.find_stream_name_by_subject(EARS_VITALS_OUT)
+    except Exception:
+        await _js.add_stream(
+            name=VITALS_STREAM,
+            subjects=[EARS_VITALS_OUT, IMMUNE_ALERT],
+            retention=RetentionPolicy.LIMITS,
+            max_age=3600,  # 1 hour retention
+            storage=StorageType.FILE,
+        )
+        log.info("Created vitals stream", extra={"stream": VITALS_STREAM})
 
     # Load previous deploy history for rollback support
     await _load_deploy_history()

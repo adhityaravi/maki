@@ -314,14 +314,15 @@ async def _thought_listener():
 
 
 async def _vitals_listener():
-    """Subscribe to NATS for health digests and post to #maki-vitals."""
-    sub = await _nc.subscribe(EARS_VITALS_OUT, queue="maki-ears")
-    log.info("Subscribed", extra={"subject": EARS_VITALS_OUT})
+    """Consume health digests from JetStream and post to #maki-vitals."""
+    sub = await _js.subscribe(EARS_VITALS_OUT, durable=f"ears-vitals-{INSTANCE_ID}", deliver_policy="new")
+    log.info("JetStream subscribed", extra={"subject": EARS_VITALS_OUT})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
             digest = data.get("digest", "")
             if not digest:
+                await msg.ack()
                 continue
 
             log.info("Health digest received", extra={"digest_len": len(digest)})
@@ -333,19 +334,21 @@ async def _vitals_listener():
 
             if not _vitals_channel_ids:
                 log.warning("No vitals channel available, digest dropped")
+            await msg.ack()
         except Exception:
             log.exception("Error processing vitals")
 
 
 async def _alert_listener():
-    """Subscribe to immune alerts and post to #maki-vitals."""
-    sub = await _nc.subscribe(IMMUNE_ALERT, queue="maki-ears")
-    log.info("Subscribed", extra={"subject": IMMUNE_ALERT})
+    """Consume immune alerts from JetStream and post to #maki-vitals."""
+    sub = await _js.subscribe(IMMUNE_ALERT, durable=f"ears-alert-{INSTANCE_ID}", deliver_policy="new")
+    log.info("JetStream subscribed", extra={"subject": IMMUNE_ALERT})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
             alert = data.get("alert", "")
             if not alert:
+                await msg.ack()
                 continue
 
             alert_text = f"**ALERT** {alert}"
@@ -358,6 +361,7 @@ async def _alert_listener():
 
             if not _vitals_channel_ids:
                 log.warning("No vitals channel available, alert dropped")
+            await msg.ack()
         except Exception:
             log.exception("Error processing alert")
 
