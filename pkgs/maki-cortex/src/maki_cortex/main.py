@@ -489,45 +489,51 @@ async def heartbeat_loop(nc):
 async def main():
     log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS})
 
-    nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
-
-    # Start health server immediately — before any slow startup steps (git clone etc.)
-    # so the readiness probe can connect during initialization.
+    # Health server first — readiness probe must succeed immediately regardless of
+    # how long NATS or git clone take. Nothing below should block the probe.
     await tcp_health_server(port=HEALTH_PORT)
-    log.info("Health server started early", extra={"port": HEALTH_PORT})
+    log.info("Health server started", extra={"port": HEALTH_PORT})
+
+    nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
 
     # Load GitHub App private key if configured
     github_private_key = None
-    if GITHUB_PRIVATE_KEY_PATH:
-        try:
-            with open(GITHUB_PRIVATE_KEY_PATH) as f:
-                github_private_key = f.read()
-            log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
-        except Exception:
-            log.warning("Failed to load GitHub App private key", extra={"path": GITHUB_PRIVATE_KEY_PATH})
+    if GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
+        with open(GITHUB_PRIVATE_KEY_PATH) as f:
+            github_private_key = f.read()
+        log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
-    # Clone or pull the repo for local code access
-    github_auth = None
-    if GITHUB_APP_ID and github_private_key and GITHUB_INSTALLATION_ID:
-        from maki_common.tools.github import GitHubAuth
+    # Clone or pull the repo for self-evolution tools
+    if github_private_key and os.path.exists(REPO_PATH):
+        log.info("Repo already present", extra={"path": REPO_PATH})
+    elif github_private_key:
+        import subprocess
 
-        github_auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
+        from maki_common.tools.local_code import get_github_token
 
-    from maki_common.repo import init_repo
+        token = await get_github_token(
+            app_id=GITHUB_APP_ID,
+            private_key=github_private_key,
+            installation_id=GITHUB_INSTALLATION_ID,
+        )
+        repo_url = f"https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
+        log.info("Cloning repo", extra={"path": REPO_PATH})
+        os.makedirs(os.path.dirname(REPO_PATH), exist_ok=True)
+        result = subprocess.run(
+            ["git", "clone", repo_url, REPO_PATH],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log.error("Git clone failed", extra={"stderr": result.stderr})
+        else:
+            log.info("Repo cloned", extra={"path": REPO_PATH})
 
-    await init_repo(
-        REPO_PATH,
-        clone_url=f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git",
-        github_auth=github_auth,
-    )
-
-    # Create MCP tool server
     from maki_common.tools import create_cortex_tools
 
     mcp_server = create_cortex_tools(
         nc=nc,
         recall_url=RECALL_URL,
-        health_endpoints=HEALTH_ENDPOINTS,
         repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,
@@ -541,6 +547,7 @@ async def main():
     log.info("Subscribed to turn requests", extra={"subject": CORTEX_TURN_REQUEST})
 
     asyncio.create_task(heartbeat_loop(nc))
+    log.info("Heartbeat loop started")
 
     async for msg in sub.messages:
         asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
