@@ -535,6 +535,7 @@ async def main():
     mcp_server = create_cortex_tools(
         nc=nc,
         recall_url=RECALL_URL,
+        health_endpoints=HEALTH_ENDPOINTS,
         repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,

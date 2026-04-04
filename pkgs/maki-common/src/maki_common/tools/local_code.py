@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -62,20 +63,29 @@ def make_code_tools(
     async def read_file(args: dict[str, Any]) -> dict[str, Any]:
         """Read a file from the repository."""
         path = args.get("path", "")
-        log.info("Tool: read_file", extra={"path": path})
+        offset = int(args.get("offset", 0) or 0)
+        limit = int(args.get("limit", 0) or 0)
+        log.info("Tool: read_file", extra={"path": path, "offset": offset, "limit": limit})
         resolved = _safe_path(repo_path, path)
         if not resolved:
             return mcp_result(f"Error: path '{path}' is outside the repository.")
         if not resolved.is_file():
             return mcp_result(f"Error: '{path}' does not exist or is not a file.")
         try:
-            lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
-            total = len(lines)
-            if total > MAX_READ_LINES:
-                lines = lines[:MAX_READ_LINES]
-                numbered = "\n".join(f"{i + 1:>6}\t{line}" for i, line in enumerate(lines))
-                return mcp_result(f"{numbered}\n\n... truncated ({total} total lines, showing first {MAX_READ_LINES})")
-            numbered = "\n".join(f"{i + 1:>6}\t{line}" for i, line in enumerate(lines))
+            all_lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+            total = len(all_lines)
+
+            # Apply offset (1-based) and limit
+            start = max(0, offset - 1) if offset > 0 else 0
+            max_lines = limit if limit > 0 else MAX_READ_LINES
+            end = min(start + max_lines, total)
+            lines = all_lines[start:end]
+
+            numbered = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(lines))
+            if end < total:
+                return mcp_result(f"{numbered}\n\n... truncated ({total} total lines, showing {start + 1}-{end})")
+            if start > 0:
+                return mcp_result(f"{numbered}\n\n(lines {start + 1}-{end} of {total})")
             return mcp_result(numbered)
         except Exception as e:
             return mcp_result(f"Error reading file: {e}")
@@ -157,36 +167,28 @@ def make_code_tools(
         except Exception as e:
             return mcp_result(f"Error searching: {e}")
 
-    async def git_status(args: dict[str, Any]) -> dict[str, Any]:
-        """Show git status."""
-        log.info("Tool: git_status")
-        rc, stdout, stderr = await _run_git(repo_path, "status", "--short")
+    async def git_run(args: dict[str, Any]) -> dict[str, Any]:
+        """Run an arbitrary git command."""
+        raw_args = args.get("args", "")
+        log.info("Tool: git_run", extra={"args": raw_args})
+        if not raw_args.strip():
+            return mcp_result("Error: args is required (e.g. 'status', 'log --oneline -10').")
+        try:
+            parts = shlex.split(raw_args)
+        except ValueError as e:
+            return mcp_result(f"Error parsing args: {e}")
+        rc, stdout, stderr = await _run_git(repo_path, *parts)
         if rc != 0:
-            return mcp_result(f"Error: {stderr}")
-        return mcp_result(stdout if stdout.strip() else "Working tree clean.")
-
-    async def git_diff(args: dict[str, Any]) -> dict[str, Any]:
-        """Show git diff of changes."""
-        path = args.get("path", "")
-        log.info("Tool: git_diff", extra={"path": path})
-        cmd = ["diff"]
-        if path:
-            resolved = _safe_path(repo_path, path)
-            if not resolved:
-                return mcp_result(f"Error: path '{path}' is outside the repository.")
-            cmd.append("--")
-            cmd.append(path)
-        rc, stdout, stderr = await _run_git(repo_path, *cmd)
-        if rc != 0:
-            return mcp_result(f"Error: {stderr}")
-        return mcp_result(stdout if stdout.strip() else "No changes.")
+            return mcp_result(f"Exit {rc}: {stderr}" if stderr.strip() else f"Exit {rc}: {stdout}")
+        return mcp_result(stdout if stdout.strip() else "(no output)")
 
     return [
         (
             "read_file",
             f"Read a file from the repository. Path is relative to repo root. "
-            f"Returns line-numbered content (max {MAX_READ_LINES} lines).",
-            {"path": str},
+            f"Returns line-numbered content (max {MAX_READ_LINES} lines per call). "
+            f"Use 'offset' (1-based line number) and 'limit' to read specific sections of large files.",
+            {"path": str, "offset": str, "limit": str},
             read_file,
         ),
         (
