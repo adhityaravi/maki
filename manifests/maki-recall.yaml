@@ -29,6 +29,22 @@ spec:
       labels:
         app: maki-recall
     spec:
+      initContainers:
+        - name: wait-for-tailscale
+          image: alpine/curl:8.7.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Tailscale to be ready..."
+              until curl -sf --unix-socket /var/run/tailscale/tailscaled.sock http://local-tailscaled.sock/localapi/v0/status | grep -q '"BackendState":"Running"'; do
+                echo "Tailscale not ready yet, retrying in 2s..."
+                sleep 2
+              done
+              echo "Tailscale is ready."
+          volumeMounts:
+            - name: tailscale-socket
+              mountPath: /var/run/tailscale
       containers:
         - name: mem0
           image: ghcr.io/adhityaravi/maki-recall:latest
@@ -90,3 +106,7 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+        - name: tailscale-socket
+          hostPath:
+            path: /var/run/tailscale
+            type: DirectoryOrCreate
