@@ -504,15 +504,22 @@ async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
         memories = memories[:MEMORY_MAX_COUNT]
 
         graph_context = []
+        skipped_dangling = 0
         for rel in data.get("relations", []):
-            source = rel.get("source", "?")
-            relationship = rel.get("relationship", "?")
-            target = rel.get("target", "?")
+            source = rel.get("source") or ""
+            relationship = rel.get("relationship") or ""
+            target = rel.get("target") or ""
+            # Skip dangling or unresolved relationships — any missing endpoint is noise
+            if not source or not relationship or not target or source == "?" or target == "?" or relationship == "?":
+                skipped_dangling += 1
+                continue
             graph_context.append(f"{source} --{relationship}--> {target}")
+        if skipped_dangling:
+            log.warning("Skipped dangling graph relations", extra={"count": skipped_dangling, "query": query})
 
         log.info(
             "Memory search complete",
-            extra={"memories": len(memories), "relations": len(graph_context)},
+            extra={"memories": len(memories), "relations": len(graph_context), "dangling_skipped": skipped_dangling},
         )
         return memories, graph_context
 
