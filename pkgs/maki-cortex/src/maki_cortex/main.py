@@ -575,6 +575,14 @@ async def main():
         else:
             log.info("Repo cloned", extra={"path": REPO_PATH})
 
+    # Configure git identity — no global config in container, must be set per-repo
+    if github_private_key and os.path.exists(REPO_PATH):
+        import subprocess as _sp
+
+        _sp.run(["git", "-C", REPO_PATH, "config", "user.name", "maki"], capture_output=True)
+        _sp.run(["git", "-C", REPO_PATH, "config", "user.email", "maki@adhityaravi.dev"], capture_output=True)
+        log.info("Git identity configured", extra={"path": REPO_PATH})
+
     from maki_common.tools import create_cortex_tools
 
     mcp_server = create_cortex_tools(
