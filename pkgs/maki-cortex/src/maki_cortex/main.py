@@ -65,9 +65,11 @@ _SILENT_ERROR_PATTERNS = [
     "quota",
     "billing",
     "credit",
+    "limit",
     "resets",
     "429",
     "529",
+    "503",
 ]
 
 
@@ -357,7 +359,10 @@ def build_system_prompt(turn: dict) -> str:
             conv_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation\n" + "\n".join(conv_lines))
 
-    parts.append(TOOLS_PROMPT)
+    # Only include the tools listing for modes that use MCP tools directly —
+    # normal turns use the Claude API with MCP tools and don't need the text listing
+    if turn.get("mode") in ("idle_reflection", "care", "work"):
+        parts.append(TOOLS_PROMPT)
 
     return "\n\n".join(parts)
 
