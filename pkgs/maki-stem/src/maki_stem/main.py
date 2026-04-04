@@ -463,22 +463,29 @@ async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
 
 async def _feed_memories(user_message: str, cortex_response: str):
     """Feed interaction to maki-recall for autonomous memory extraction."""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{RECALL_URL}/memories",
-                json={
-                    "messages": [
-                        {"role": "user", "content": user_message},
-                        {"role": "assistant", "content": cortex_response},
-                    ],
-                    "user_id": MEMORY_USER_ID,
-                },
-            )
-            resp.raise_for_status()
-            log.info("Memory feed complete")
-    except Exception:
-        log.exception("Failed to feed memories")
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{RECALL_URL}/memories",
+                    json={
+                        "messages": [
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": cortex_response},
+                        ],
+                        "user_id": MEMORY_USER_ID,
+                    },
+                )
+                resp.raise_for_status()
+                log.info("Memory feed complete", extra={"attempt": attempt + 1})
+                return
+        except httpx.ReadTimeout:
+            log.warning("Memory feed timed out", extra={"attempt": attempt + 1})
+            if attempt == 0:
+                await asyncio.sleep(2.0)
+        except Exception:
+            log.exception("Failed to feed memories")
+            return
 
 
 async def _gather_system_state() -> dict:
@@ -1234,20 +1241,27 @@ async def _process_turn(
 
 async def _store_memory(content: str, source: str, user_id: str, metadata: dict | None):
     """Store a single memory via recall REST API (runs as background task)."""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            payload = {
-                "messages": [{"role": "assistant", "content": content}],
-                "user_id": user_id,
-            }
-            if metadata:
-                payload["metadata"] = metadata
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                payload = {
+                    "messages": [{"role": "assistant", "content": content}],
+                    "user_id": user_id,
+                }
+                if metadata:
+                    payload["metadata"] = metadata
 
-            resp = await client.post(f"{RECALL_URL}/memories", json=payload)
-            resp.raise_for_status()
-            log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content)})
-    except Exception:
-        log.exception("Failed to store memory", extra={"source": source})
+                resp = await client.post(f"{RECALL_URL}/memories", json=payload)
+                resp.raise_for_status()
+                log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content), "attempt": attempt + 1})
+                return
+        except httpx.ReadTimeout:
+            log.warning("Memory store timed out", extra={"source": source, "attempt": attempt + 1})
+            if attempt == 0:
+                await asyncio.sleep(2.0)
+        except Exception:
+            log.exception("Failed to store memory", extra={"source": source})
+            return
 
 
 async def _memory_store_listener():
