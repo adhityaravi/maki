@@ -90,6 +90,9 @@ GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
 REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
 
+# Labels that the autonomous work loop must never pick up
+WORK_SKIP_LABELS = {"draft", "human"}
+
 DEFAULT_CORTEX_CONFIG = {
     "idle_interval": 7200,
     "care_interval": 1800,
@@ -180,6 +183,15 @@ def _truncate_for_title(text: str, max_len: int = 80) -> str:
     if len(first_line) > max_len:
         return first_line[: max_len - 3] + "..."
     return first_line
+
+
+def _issue_has_skip_label(issue: dict) -> bool:
+    """Return True if the issue carries any label that the work loop must skip."""
+    for lbl in issue.get("labels", []):
+        name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
+        if name.lower() in WORK_SKIP_LABELS:
+            return True
+    return False
 
 
 async def _response_listener():
@@ -879,6 +891,12 @@ async def _work_loop():
 
             issues = await _github.list_issues(state="open")
             if not issues:
+                continue
+
+            # Skip issues gated for human review or still in draft
+            issues = [i for i in issues if not _issue_has_skip_label(i)]
+            if not issues:
+                log.info("All open issues are draft or human-gated — skipping work cycle")
                 continue
 
             issue = issues[0]  # Highest priority (list_issues sorts by P-label)
