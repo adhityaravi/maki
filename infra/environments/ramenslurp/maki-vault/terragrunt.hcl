@@ -24,6 +24,7 @@ dependencies {
 inputs = {
   namespace          = dependency.namespace.outputs.name
   storage_class      = local.env.locals.storage_class
+  storage_size       = local.env.locals.vault_storage_size
   image_registry     = local.env.locals.image_registry
   patroni_name         = local.env.locals.patroni_name
   patroni_connect_host = local.env.locals.patroni_connect_host

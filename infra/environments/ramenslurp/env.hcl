@@ -3,6 +3,7 @@ locals {
   kube_context     = "ramen"
   resource_profile = "primary"
   storage_class    = "csi-rawfile-default"
+  vault_storage_size = "50Gi"
 
   # NATS cluster — routes to peer nodes
   nats_url         = "nats://maki-nerve-nats:4222"
