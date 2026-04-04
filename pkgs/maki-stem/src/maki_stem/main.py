@@ -14,6 +14,7 @@ from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 
 import httpx
 import nats.js.api
@@ -476,6 +477,23 @@ def _build_session_summary() -> str:
     return "\n".join(lines)
 
 
+def _deduplicate_memories(memories: list[dict], similarity_threshold: float = 0.82) -> list[dict]:
+    """Remove near-duplicate memories, keeping the highest-scoring (first) copy.
+
+    Uses SequenceMatcher ratio on memory text. O(n²) but n is capped at MEMORY_MAX_COUNT
+    so this is always fast (~15 comparisons max).
+    """
+    unique: list[dict] = []
+    for candidate in memories:
+        text = candidate.get("text", "")
+        is_dup = any(
+            SequenceMatcher(None, text, existing.get("text", "")).ratio() >= similarity_threshold for existing in unique
+        )
+        if not is_dup:
+            unique.append(candidate)
+    return unique
+
+
 async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
     """Query maki-recall for relevant memories and graph context.
 
@@ -502,6 +520,8 @@ async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
                 )
         # Cap at max count (already sorted by score descending from recall)
         memories = memories[:MEMORY_MAX_COUNT]
+        # Deduplicate near-identical memories (keeps highest-scoring, which come first)
+        memories = _deduplicate_memories(memories)
 
         graph_context = []
         skipped_dangling = 0
