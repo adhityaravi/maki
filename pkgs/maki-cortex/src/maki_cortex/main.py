@@ -65,11 +65,9 @@ _SILENT_ERROR_PATTERNS = [
     "quota",
     "billing",
     "credit",
-    "limit",
     "resets",
     "429",
     "529",
-    "503",
 ]
 
 
