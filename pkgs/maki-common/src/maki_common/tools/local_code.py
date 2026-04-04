@@ -296,7 +296,12 @@ def make_code_edit_tools(
             # Fire episodic memory callback — non-blocking, never fail the commit
             if on_commit_success is not None:
                 try:
-                    await on_commit_success(sha, message, repo_name)
+                    repo_url = (
+                        f"https://github.com/{repo_owner}/{repo_name}"
+                        if repo_owner and repo_name
+                        else repo_name
+                    )
+                    await on_commit_success(sha, message, repo_url)
                 except Exception:
                     log.warning("on_commit_success callback failed", exc_info=True)
 

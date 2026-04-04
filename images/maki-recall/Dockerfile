@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
 
 COPY pkgs/maki-common /build/pkgs/maki-common
 COPY pkgs/maki-recall /build/pkgs/maki-recall
