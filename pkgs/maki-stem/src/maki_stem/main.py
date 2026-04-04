@@ -1057,7 +1057,8 @@ async def lifespan(app: FastAPI):
     global _nc, _js, _config_kv, _lock_kv, _github
     log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
-    _nc, _js = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    _js = _nc.jetstream()
 
     await _seed_identity()
     await _init_conversation_stream()
