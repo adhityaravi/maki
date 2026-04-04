@@ -186,6 +186,9 @@ _cortex_turn_mode: str | None = None
 _cortex_turn_started: float | None = None
 _last_incident_time: float = 0
 _semaphore = asyncio.Semaphore(1)
+# In-memory set of image tags that failed health checks and were rolled back.
+# Cleared on process restart (intentional — restart implies fresh state).
+_failed_image_blacklist: set[str] = set()
 
 
 # --- Infrastructure Lock ---
@@ -732,6 +735,35 @@ async def _deploy_request_handler(msg):
             extra={"service": service, "raw_tag": raw_tag, "normalized_tag": image_tag, "image": image},
         )
 
+        # Blacklist check — reject known-bad images unless force=true or tag is "latest"
+        force = request.get("force", False)
+        if image_tag != "latest" and not force and image_tag in _failed_image_blacklist:
+            log.warning(
+                "Deploy rejected: image tag is blacklisted (failed a previous health check)",
+                extra={"image_tag": image_tag, "deployment": deployment_name},
+            )
+            result = {
+                "status": "blacklisted",
+                "message": (
+                    f"Image {image_tag} is blacklisted — it failed a health check in this session. "
+                    "Use force=true to override."
+                ),
+            }
+            await _nc.publish(
+                IMMUNE_ACTION,
+                json.dumps(
+                    {
+                        "type": "deploy_rejected",
+                        "deployment": deployment_name,
+                        "image_tag": image_tag,
+                        "reason": "blacklisted",
+                        "timestamp": time.time(),
+                    }
+                ).encode(),
+            )
+            await msg.respond(json.dumps(result).encode())
+            return
+
         if not _k8s_apps_v1:
             await msg.respond(json.dumps({"status": "error", "message": "K8s client not available"}).encode())
             return
@@ -811,6 +843,13 @@ async def _deploy_request_handler(msg):
                     "status": "rolled_back",
                     "message": f"Deploy of {image} failed health check, rolled back to {previous_image}",
                 }
+                # Blacklist this tag so it won't be re-deployed in subsequent cycles
+                if image_tag != "latest":
+                    _failed_image_blacklist.add(image_tag)
+                    log.warning(
+                        "Image tag added to blacklist after failed health check",
+                        extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
+                    )
                 _rollback_logs = await _fetch_rollback_logs(deployment_name)
                 await _publish_alert(
                     f"Deploy of {deployment_name} → {image_tag} FAILED health check. "
@@ -980,6 +1019,27 @@ async def _deploy_propagate_handler(msg):
         if canary == INSTANCE_ID:
             return
 
+        # Blacklist check — skip if this tag failed a health check on this instance
+        if image_tag and image_tag != "latest" and image_tag in _failed_image_blacklist:
+            log.warning(
+                "Propagated deploy skipped: image tag is blacklisted (failed a previous health check)",
+                extra={"image_tag": image_tag, "deployment": deployment_name, "canary": canary},
+            )
+            await _nc.publish(
+                IMMUNE_ACTION,
+                json.dumps(
+                    {
+                        "type": "deploy_propagation_skipped",
+                        "deployment": deployment_name,
+                        "image_tag": image_tag,
+                        "reason": "blacklisted",
+                        "instance": INSTANCE_ID,
+                        "timestamp": time.time(),
+                    }
+                ).encode(),
+            )
+            return
+
         log.info(
             "Deploy propagation received from canary",
             extra={"canary": canary, "deployment": deployment_name, "image": image},
@@ -1029,6 +1089,13 @@ async def _deploy_propagate_handler(msg):
             else:
                 result_status = "rolled_back"
                 log.warning("Propagated deploy unhealthy, rolling back", extra={"deployment": deployment_name})
+                # Blacklist this tag so it won't be retried on this instance
+                if image_tag and image_tag != "latest":
+                    _failed_image_blacklist.add(image_tag)
+                    log.warning(
+                        "Image tag added to blacklist after failed propagated health check",
+                        extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
+                    )
                 rollback_patch = {
                     "spec": {
                         "template": {
@@ -1177,6 +1244,27 @@ async def _handle_immune_command(msg):
             "Immune command received",
             extra={"message_id": message_id, "command": command[:100], "username": username},
         )
+
+        # Handle blacklist management commands directly (no Claude needed)
+        cmd_lower = command.strip().lower()
+        if cmd_lower in ("clear-blacklist", "clear blacklist"):
+            cleared = list(_failed_image_blacklist)
+            _failed_image_blacklist.clear()
+            reply = f"Blacklist cleared. Removed {len(cleared)} entr{'y' if len(cleared) == 1 else 'ies'}: " + (
+                ", ".join(cleared) if cleared else "none"
+            )
+            log.info("Failed-image blacklist cleared via immune command", extra={"cleared": cleared})
+            await _publish_immune_response(message_id, reply)
+            return
+        if cmd_lower in ("show-blacklist", "show blacklist", "list-blacklist", "list blacklist"):
+            if _failed_image_blacklist:
+                reply = f"Blacklisted image tags ({len(_failed_image_blacklist)}): " + ", ".join(
+                    sorted(_failed_image_blacklist)
+                )
+            else:
+                reply = "Blacklist is empty."
+            await _publish_immune_response(message_id, reply)
+            return
 
         system_state = _build_system_state()
         recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
