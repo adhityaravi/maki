@@ -12,15 +12,14 @@ locals {
     "nats-route://maki-nerve-ramen.xantu-city.ts.net:6222",
   ]
 
-  # Local PostgreSQL
-  postgres_host = "maki-vault"
+  # PostgreSQL — local first, then peers for leader failover
+  postgres_host = "maki-vault,maki-vault-sushi.xantu-city.ts.net,maki-vault-ramen.xantu-city.ts.net"
 
   # Neo4j over tailnet (lives on sushitrash, accessed remotely)
   neo4j_uri    = "bolt://maki-graph-sushi.xantu-city.ts.net:7687"
   enable_graph = false
 
-  # Ears OFF until quorum established
-  ears_replicas = 0
+  ears_replicas = 1
 
   # Claude model
   claude_model = "claude-sonnet-4-6"
