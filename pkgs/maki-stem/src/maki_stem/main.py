@@ -1253,7 +1253,10 @@ async def _store_memory(content: str, source: str, user_id: str, metadata: dict 
 
                 resp = await client.post(f"{RECALL_URL}/memories", json=payload)
                 resp.raise_for_status()
-                log.info("Memory stored via NATS", extra={"source": source, "content_len": len(content), "attempt": attempt + 1})
+                log.info(
+                    "Memory stored via NATS",
+                    extra={"source": source, "content_len": len(content), "attempt": attempt + 1},
+                )
                 return
         except httpx.ReadTimeout:
             log.warning("Memory store timed out", extra={"source": source, "attempt": attempt + 1})

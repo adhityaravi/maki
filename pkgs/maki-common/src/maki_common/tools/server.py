@@ -186,9 +186,9 @@ def create_cortex_tools(
         github_auth = GitHubAuth(github_app_id, github_private_key, github_installation_id)
 
     if repo_path:
+        from maki_common.subjects import MEMORY_STORE
         from maki_common.tools.codegraph_tools import make_codegraph_tools
         from maki_common.tools.local_code import make_code_edit_tools, make_code_tools
-        from maki_common.subjects import MEMORY_STORE
 
         async def _on_commit_success(sha: str, message: str) -> None:
             """Publish an episodic memory to NATS after every successful push."""
