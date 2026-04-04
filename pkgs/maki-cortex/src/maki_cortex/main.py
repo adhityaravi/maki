@@ -202,6 +202,10 @@ Title: {issue_title}
 Description: {issue_description}
 Priority: {issue_priority}
 
+## Context
+Relevant memories for this task have been preloaded — check the "Relevant memories" and \
+"Relationships" sections above before starting. Use them to inform your approach.
+
 ## Instructions
 1. Understand the task. Use search_code and read_file to study relevant code.
 2. Implement changes with write_file.
