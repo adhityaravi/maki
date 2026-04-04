@@ -54,6 +54,9 @@ HEALTH_ENDPOINTS = {
 CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
+STATE_BUCKET = "maki-immune-state"
+RECENT_ACTIONS_KEY = "recent_actions"
+RECENT_ACTIONS_MAX = 100
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
 
@@ -172,6 +175,7 @@ _js = None
 _config_kv = None
 _lock_kv = None
 _deploy_history_kv = None
+_state_kv = None
 _k8s_v1 = None
 _k8s_apps_v1 = None
 _mcp_server = None
@@ -260,6 +264,38 @@ async def _save_deploy_history(deployment_name: str, previous_image: str):
         await _deploy_history_kv.put(deployment_name, previous_image.encode())
     except Exception:
         log.warning("Failed to persist deploy history to KV", extra={"deployment": deployment_name})
+
+
+# --- Recent Actions State ---
+
+
+async def _load_recent_actions():
+    """Load recent_actions from KV on startup. Starts with empty list if missing."""
+    global _recent_actions
+    try:
+        entry = await _state_kv.get(RECENT_ACTIONS_KEY)
+        loaded = json.loads(entry.value.decode())
+        if isinstance(loaded, list):
+            _recent_actions = loaded[-RECENT_ACTIONS_MAX:]
+            log.info("Recent actions loaded from KV", extra={"entries": len(_recent_actions)})
+    except Exception:
+        log.info("No recent actions found in KV (first run)")
+
+
+async def _persist_recent_actions():
+    """Persist current _recent_actions list to KV (fire-and-forget, errors logged)."""
+    try:
+        await _state_kv.put(
+            RECENT_ACTIONS_KEY,
+            json.dumps(_recent_actions[-RECENT_ACTIONS_MAX:], default=str).encode(),
+        )
+    except Exception:
+        log.warning("Failed to persist recent_actions to KV")
+
+
+def _schedule_persist_recent_actions():
+    """Schedule _persist_recent_actions as a background task (fire-and-forget)."""
+    asyncio.ensure_future(_persist_recent_actions())
 
 
 async def _fetch_rollback_logs(deployment_name: str) -> str:
@@ -597,8 +633,9 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
             "timestamp": now,
         }
         _recent_actions.append(action)
-        if len(_recent_actions) > 50:
+        if len(_recent_actions) > RECENT_ACTIONS_MAX:
             _recent_actions.pop(0)
+        _schedule_persist_recent_actions()
 
         log.info(
             "Reflex restart",
@@ -871,8 +908,9 @@ async def _deploy_request_handler(msg):
                 "timestamp": time.time(),
             }
             _recent_actions.append(action)
-            if len(_recent_actions) > 50:
+            if len(_recent_actions) > RECENT_ACTIONS_MAX:
                 _recent_actions.pop(0)
+            _schedule_persist_recent_actions()
             await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
 
             await msg.respond(json.dumps(result).encode())
@@ -1130,8 +1168,9 @@ async def _deploy_propagate_handler(msg):
                 "timestamp": time.time(),
             }
             _recent_actions.append(action)
-            if len(_recent_actions) > 50:
+            if len(_recent_actions) > RECENT_ACTIONS_MAX:
                 _recent_actions.pop(0)
+            _schedule_persist_recent_actions()
             await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
         finally:
             await _release_lock("immune-deploy")
@@ -1469,7 +1508,7 @@ async def _cortex_stuck_handler(msg):
 
 
 async def main():
-    global _nc, _js, _config_kv, _lock_kv, _deploy_history_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
+    global _nc, _js, _config_kv, _lock_kv, _deploy_history_kv, _state_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
 
     log.info("maki-immune starting", extra={"nats_url": NATS_URL, "model": MODEL})
 
@@ -1479,9 +1518,13 @@ async def main():
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
     _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
+    _state_kv = await init_kv(_js, STATE_BUCKET)
 
     # Load previous deploy history for rollback support
     await _load_deploy_history()
+
+    # Load recent action history for continuity across restarts
+    await _load_recent_actions()
 
     # Clone or pull the repo for local code access (read-only)
     from maki_common.repo import init_repo
