@@ -28,6 +28,7 @@ def _build_pg_uri() -> str:
     host_port = ",".join(f"{h}:{port}" for h in hosts.split(","))
     return f"postgresql://{user}:{password}@{host_port}/{db}?target_session_attrs=read-write"
 
+
 config: dict[str, Any] = {
     "version": "v1.1",
     "vector_store": {

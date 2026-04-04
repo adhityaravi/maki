@@ -1137,7 +1137,7 @@ Determine root cause and take corrective action if possible.
 Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...]."""
 
     try:
-        response = await invoke_claude(
+        response, _usage = await invoke_claude(
             prompt,
             model=MODEL,
             semaphore=_semaphore,
@@ -1204,7 +1204,7 @@ Put your full response in [RESPONSE:...] tags. This will be sent back to Adi in 
 Also use [DIGEST:...] for anything that should go to #maki-vitals."""
 
         try:
-            response = await invoke_claude(
+            response, _usage = await invoke_claude(
                 prompt,
                 model=MODEL,
                 semaphore=_semaphore,
@@ -1316,7 +1316,7 @@ async def _immune_heartbeat_loop():
                 config=config_str,
             )
 
-            response = await invoke_claude(
+            response, _usage = await invoke_claude(
                 prompt,
                 model=MODEL,
                 semaphore=_semaphore,

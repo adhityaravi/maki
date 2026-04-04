@@ -168,7 +168,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     try:
         log.info("Invoking Claude", extra={"tools": bool(req.tools), "user_prompt_len": len(user_prompt)})
-        text = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
+        text, _usage = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
         log.info("Claude response", extra={"response_len": len(text)})
     except Exception as e:
         log.exception("Claude invocation failed")
