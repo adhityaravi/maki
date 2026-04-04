@@ -18,7 +18,7 @@ dependency "namespace" {
 }
 
 dependencies {
-  paths = ["../secrets", "../maki-vault", "../maki-embed", "../maki-synapse", "../maki-graph"]
+  paths = ["../secrets", "../maki-vault", "../maki-embed", "../maki-synapse"]
 }
 
 inputs = {

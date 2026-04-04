@@ -24,5 +24,6 @@ dependencies {
 inputs = {
   namespace           = dependency.namespace.outputs.name
   storage_class       = local.env.locals.storage_class
+  nats_server_name    = local.env.locals.nats_server_name
   nats_cluster_routes = local.env.locals.nats_cluster_routes
 }

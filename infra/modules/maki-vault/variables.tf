@@ -9,7 +9,7 @@ variable "storage_class" {
 
 variable "storage_size" {
   type    = string
-  default = "5Gi"
+  default = "100Gi"
 }
 
 variable "image_registry" {
@@ -36,6 +36,12 @@ variable "raft_partner_addrs" {
   type        = list(string)
   default     = []
   description = "List of partner hostname:2222 for Raft. Empty = standalone."
+}
+
+variable "patroni_connect_host" {
+  type        = string
+  default     = ""
+  description = "Tailnet FQDN for this node (used in connect_address). Empty = use patroni_name."
 }
 
 variable "resources" {

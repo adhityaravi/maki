@@ -9,5 +9,6 @@ resource "helm_release" "nats" {
     storage_class          = var.storage_class
     jetstream_storage_size = var.jetstream_storage_size
     nats_cluster_routes    = var.nats_cluster_routes
+    nats_server_name       = var.nats_server_name
   })]
 }

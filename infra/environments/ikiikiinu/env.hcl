@@ -1,15 +1,15 @@
 locals {
-  machine          = "ramenslurp"
-  kube_context     = "ramen"
+  machine          = "ikiikiinu"
+  kube_context     = "inu"
   resource_profile = "primary"
-  storage_class    = "csi-rawfile-default"
+  storage_class    = "microk8s-hostpath"
 
   # NATS cluster — routes to peer nodes
   nats_url         = "nats://maki-nerve-nats:4222"
-  nats_server_name = "nerve-ramen"
+  nats_server_name = "nerve-inu"
   nats_cluster_routes = [
     "nats-route://maki-nerve-sushi.xantu-city.ts.net:6222",
-    "nats-route://maki-nerve-inu.xantu-city.ts.net:6222",
+    "nats-route://maki-nerve-ramen.xantu-city.ts.net:6222",
   ]
 
   # Local PostgreSQL
@@ -19,7 +19,8 @@ locals {
   neo4j_uri    = "bolt://maki-graph-sushi.xantu-city.ts.net:7687"
   enable_graph = false
 
-  ears_replicas = 1
+  # Ears OFF until quorum established
+  ears_replicas = 0
 
   # Claude model
   claude_model = "claude-sonnet-4-6"
@@ -27,12 +28,12 @@ locals {
   # Image registry
   image_registry = "ghcr.io/adhityaravi"
 
-  # Patroni — 3-node Raft cluster
-  patroni_name         = "ramen"
-  patroni_connect_host = "maki-vault-ramen.xantu-city.ts.net"
-  raft_self_addr       = "maki-vault-ramen.xantu-city.ts.net:2222"
+  # Patroni — join existing Raft cluster
+  patroni_name         = "inu"
+  patroni_connect_host = "maki-vault-inu.xantu-city.ts.net"
+  raft_self_addr       = "maki-vault-inu.xantu-city.ts.net:2222"
   raft_partner_addrs = [
     "maki-vault-sushi.xantu-city.ts.net:2222",
-    "maki-vault-inu.xantu-city.ts.net:2222",
+    "maki-vault-ramen.xantu-city.ts.net:2222",
   ]
 }

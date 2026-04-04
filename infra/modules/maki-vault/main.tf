@@ -12,13 +12,14 @@ resource "kubernetes_config_map" "patroni" {
 
       raft = {
         data_dir      = "/var/lib/raft"
-        self_addr     = var.raft_self_addr != "" ? var.raft_self_addr : "127.0.0.1:2222"
+        self_addr     = var.raft_self_addr
+        bind_addr     = "0.0.0.0:2222"
         partner_addrs = var.raft_partner_addrs
       }
 
       restapi = {
         listen          = "0.0.0.0:8008"
-        connect_address = "${var.patroni_name}:8008"
+        connect_address = "${var.patroni_connect_host}:8008"
       }
 
       bootstrap = {
@@ -43,7 +44,7 @@ resource "kubernetes_config_map" "patroni" {
 
       postgresql = {
         listen          = "0.0.0.0:5432"
-        connect_address = "${var.patroni_name}:5432"
+        connect_address = "${var.patroni_connect_host}:5432"
         data_dir        = "/var/lib/postgresql/data/pgdata"
         pgpass          = "/tmp/pgpass"
         authentication = {
@@ -54,6 +55,11 @@ resource "kubernetes_config_map" "patroni" {
             username = "replicator"
           }
         }
+        pg_hba = [
+          "local all all trust",
+          "host all all 0.0.0.0/0 md5",
+          "host replication replicator 0.0.0.0/0 md5",
+        ]
         parameters = {
           max_connections       = 100
           shared_buffers        = "128MB"
@@ -103,7 +109,8 @@ resource "kubernetes_service" "vault" {
     selector = {
       app = "maki-vault"
     }
-    cluster_ip = "None"
+    cluster_ip                  = "None"
+    publish_not_ready_addresses = true
   }
 }
 
@@ -231,10 +238,7 @@ resource "kubernetes_stateful_set" "vault" {
             default_mode = "0755"
           }
         }
-        volume {
-          name = "raft-data"
-          empty_dir {}
-        }
+        # raft-data provided by volumeClaimTemplate below
       }
     }
     volume_claim_template {
@@ -247,6 +251,20 @@ resource "kubernetes_stateful_set" "vault" {
         resources {
           requests = {
             storage = var.storage_size
+          }
+        }
+      }
+    }
+    volume_claim_template {
+      metadata {
+        name = "raft-data"
+      }
+      spec {
+        access_modes       = ["ReadWriteOnce"]
+        storage_class_name = var.storage_class
+        resources {
+          requests = {
+            storage = "1Gi"
           }
         }
       }
