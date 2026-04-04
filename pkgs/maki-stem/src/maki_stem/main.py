@@ -93,9 +93,8 @@ REPO_NAME = os.environ.get("REPO_NAME", "maki")
 # Labels that the autonomous work loop must never pick up
 WORK_SKIP_LABELS = {"draft", "human"}
 
-# GitHub logins allowed to create issues the work loop will execute
-# Anyone not in this set gets their issue commented on and closed immediately
-ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself", "renovate[bot]", "dependabot[bot]"})
+# Trusted issue authors — only these accounts can have issues picked up by the work loop
+ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
 DEFAULT_CORTEX_CONFIG = {
     "idle_interval": 7200,
@@ -198,33 +197,36 @@ def _issue_has_skip_label(issue: dict) -> bool:
     return False
 
 
-async def _reject_unverified_issues(issues: list[dict]) -> list[dict]:
-    """Comment on and close issues from unverified authors, return only verified ones.
+def _is_verified_issue_author(issue: dict) -> bool:
+    """Return True if the issue was filed by a trusted author."""
+    login = issue.get("user", {}).get("login", "")
+    return login in ALLOWED_ISSUE_AUTHORS
 
-    This is a hard security boundary — the work loop must never execute
-    instructions from arbitrary GitHub users on a public repo.
-    """
+
+async def _reject_unverified_issues(issues: list[dict]) -> list[dict]:
+    """Comment on and close issues from unverified authors. Returns only verified issues."""
+    if not _github:
+        return issues
     verified = []
     for issue in issues:
-        author = (issue.get("user") or {}).get("login", "").lower()
-        if author in ALLOWED_ISSUE_AUTHORS:
+        login = issue.get("user", {}).get("login", "")
+        if _is_verified_issue_author(issue):
             verified.append(issue)
         else:
             number = issue.get("number")
             log.warning(
-                "Issue from unverified author — closing",
-                extra={"issue": number, "author": author},
+                "Rejecting issue from unverified author",
+                extra={"number": number, "author": login},
             )
-            if _github and number:
-                try:
-                    await _github.comment_issue(
-                        number,
-                        "Closing: this issue was opened by an unverified account. "
-                        "Only trusted contributors may submit issues for autonomous execution.",
-                    )
-                    await _github.close_issue(number)
-                except Exception:
-                    log.exception("Failed to close unverified issue", extra={"issue": number})
+            try:
+                await _github.comment_issue(
+                    number,
+                    f"Closing: this issue was filed by `{login}` who is not a verified contributor. "
+                    "Only issues from trusted accounts are processed by the autonomous work loop.",
+                )
+                await _github.close_issue(number)
+            except Exception:
+                log.exception("Failed to reject issue", extra={"number": number})
     return verified
 
 
@@ -682,8 +684,6 @@ async def _idle_loop():
             if _thoughts_today >= max_thoughts:
                 continue
 
-            log.info("Idle loop triggered — starting reflection")
-
             try:
                 entry = await _kv.get(KV_KEY)
                 identity = entry.value.decode()
@@ -718,7 +718,6 @@ async def _idle_loop():
                     "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
                     "time_context": {
                         "local_time": datetime.now().strftime("%H:%M"),
-                        "day_of_week": datetime.now().strftime("%A"),
                     },
                     "current_config": config,
                     "system_state": system_state,
@@ -726,8 +725,7 @@ async def _idle_loop():
                 },
             }
 
-            queue = _pending.create(turn_id)
-
+            queue = _pending.register(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
                 log.info("Idle turn published", extra={"turn_id": turn_id})
@@ -736,13 +734,10 @@ async def _idle_loop():
                 response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
                 thought = response_data.get("response", "")
 
-                config_updates = parse_config_tags(thought or "")
-                await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
-
                 clean_thought = strip_tags(thought or "")
-                # Robust [SILENT] check — LLM may include surrounding text
-                if "[SILENT]" in clean_thought:
-                    clean_thought = ""
+                config_updates = parse_config_tags(thought or "")
+                if config_updates:
+                    await apply_config_updates(_config_kv, config_updates, DEFAULT_CORTEX_CONFIG)
 
                 if clean_thought:
                     thought_payload = {"thought": clean_thought, "turn_id": turn_id}
@@ -764,45 +759,16 @@ async def _idle_loop():
                             clean_thought,
                         )
                     )
-                    # Issue creation is handled by the LLM via create_issue MCP tool.
-                    # Stem no longer deterministically files every thought as an issue.
-                else:
-                    log.info("Idle reflection produced no thought", extra={"turn_id": turn_id})
 
             except TimeoutError:
                 log.error("Idle turn timed out", extra={"turn_id": turn_id})
             except Exception:
                 log.exception("Idle turn failed", extra={"turn_id": turn_id})
             finally:
-                _pending.remove(turn_id)
+                _pending.unregister(turn_id)
 
         except Exception:
-            log.exception("Idle loop error")
-
-
-async def _create_idle_thought_issue(thought: str, turn_id: str):
-    """Create a GitHub issue for an idle loop thought."""
-    try:
-        title = f"[Thought] {_truncate_for_title(thought, max_len=70)}"
-        body = (
-            f"{thought}\n\n"
-            f"---\n"
-            f"*Generated by maki idle loop*\n"
-            f"Turn: `{turn_id}`\n"
-            f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-        issue_num = await _github.create_issue(
-            title=title,
-            body=body,
-            labels=["maki-thought", "automated"],
-        )
-        if issue_num:
-            log.info(
-                "Idle thought issue created",
-                extra={"turn_id": turn_id, "issue": issue_num},
-            )
-    except Exception:
-        log.exception("Failed to create idle thought issue", extra={"turn_id": turn_id})
+            log.exception("Error in idle loop")
 
 
 async def _care_loop():
@@ -837,44 +803,33 @@ async def _care_loop():
             if _reminders_today >= max_reminders:
                 continue
 
-            log.info("Care loop triggered — checking in")
-
-            # Search memories for follow-ups, commitments, recent activity
-            memories, graph_context = await _search_memories(
-                "recent commitments, deadlines, things to follow up on, projects in progress"
-            )
-
-            # Only invoke cortex if we found relevant memories
-            if not memories:
-                log.info("Care loop: no relevant memories, skipping")
-                continue
-
             try:
                 entry = await _kv.get(KV_KEY)
                 identity = entry.value.decode()
             except Exception:
                 identity = DEFAULT_IDENTITY
 
+            memories, graph_context = await _search_memories("Adi's wellbeing, habits, recent concerns")
+
             turn_id = f"care-{uuid.uuid4().hex[:8]}"
             care_payload = {
                 "turn_id": turn_id,
                 "mode": "care",
                 "identity": identity,
-                "conversation": [],
+                "conversation": _get_recent_conversation(),
                 "memories": memories,
                 "graph_context": graph_context,
                 "prompt": None,
+                "mission_results": None,
                 "care_context": {
                     "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
                     "time_context": {
                         "local_time": datetime.now().strftime("%H:%M"),
-                        "day_of_week": datetime.now().strftime("%A"),
                     },
                 },
             }
 
-            queue = _pending.create(turn_id)
-
+            queue = _pending.register(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(care_payload).encode())
                 log.info("Care turn published", extra={"turn_id": turn_id})
@@ -883,9 +838,6 @@ async def _care_loop():
                 reminder = response_data.get("response", "")
 
                 clean_reminder = strip_tags(reminder or "")
-                if clean_reminder == "[SILENT]":
-                    clean_reminder = ""
-
                 if clean_reminder:
                     reminder_payload = {"reminder": clean_reminder, "turn_id": turn_id}
                     await _nc.publish(EARS_REMINDER_OUT, json.dumps(reminder_payload).encode())
@@ -898,18 +850,23 @@ async def _care_loop():
                             "max": max_reminders,
                         },
                     )
-                else:
-                    log.info("Care loop: nothing to remind about", extra={"turn_id": turn_id})
+
+                    asyncio.create_task(
+                        _feed_memories(
+                            "[Care check-in]",
+                            clean_reminder,
+                        )
+                    )
 
             except TimeoutError:
                 log.error("Care turn timed out", extra={"turn_id": turn_id})
             except Exception:
                 log.exception("Care turn failed", extra={"turn_id": turn_id})
             finally:
-                _pending.remove(turn_id)
+                _pending.unregister(turn_id)
 
         except Exception:
-            log.exception("Care loop error")
+            log.exception("Error in care loop")
 
 
 async def _work_loop():
@@ -947,9 +904,7 @@ async def _work_loop():
                 log.info("Work loop: user recently active, skipping")
                 continue
 
-            # Pull work items from GitHub issues (single source of truth)
             if not _github:
-                log.info("Work loop: GitHub client not available, skipping")
                 continue
 
             issues = await _github.list_issues(state="open")
@@ -962,10 +917,10 @@ async def _work_loop():
                 log.info("All open issues are draft or human-gated — skipping work cycle")
                 continue
 
-            # Reject and close issues from unverified authors (public repo attack surface)
+            # Reject and close issues from unverified authors (security boundary)
             issues = await _reject_unverified_issues(issues)
             if not issues:
-                log.info("All open issues are from unverified authors — skipping work cycle")
+                log.info("No verified-author issues remain after author check — skipping work cycle")
                 continue
 
             issue = issues[0]  # Highest priority (list_issues sorts by P-label)
@@ -986,7 +941,6 @@ async def _work_loop():
                 extra={"issue": issue_number, "title": issue_title, "priority": issue_priority},
             )
 
-            # Comment on issue that work is starting
             asyncio.create_task(
                 _github.comment_issue(
                     issue_number,
@@ -1001,14 +955,16 @@ async def _work_loop():
             except Exception:
                 identity = DEFAULT_IDENTITY
 
+            memories, graph_context = await _search_memories(f"{issue_title} {issue_body[:200]}")
+
             turn_id = f"work-{uuid.uuid4().hex[:8]}"
             work_payload = {
                 "turn_id": turn_id,
                 "mode": "work",
                 "identity": identity,
                 "conversation": [],
-                "memories": [],
-                "graph_context": [],
+                "memories": memories,
+                "graph_context": graph_context,
                 "prompt": None,
                 "work_context": {
                     "issue_number": issue_number,
@@ -1018,8 +974,7 @@ async def _work_loop():
                 },
             }
 
-            queue = _pending.create(turn_id)
-
+            queue = _pending.register(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
                 log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
@@ -1029,13 +984,6 @@ async def _work_loop():
                 _work_items_tonight += 1
 
                 clean_result = strip_tags(result_text or "")
-                if clean_result and clean_result != "[SILENT]":
-                    thought_payload = {
-                        "thought": f"[Night work] Completed: {issue_title}\n{clean_result}",
-                        "turn_id": turn_id,
-                    }
-                    await _nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
-
                 log.info(
                     "Work turn complete",
                     extra={
@@ -1053,12 +1001,8 @@ async def _work_loop():
                     )
                 )
 
-                # Close the GitHub issue with result
                 close_comment = (
-                    f"✅ **Task completed.**\n\n"
-                    f"{clean_result or 'No detailed result.'}\n\n"
-                    f"---\n"
-                    f"Turn: `{turn_id}`\n"
+                    f"✅ **Task completed.**\n\n{clean_result}\n\n"
                     f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
                 )
                 asyncio.create_task(_github.close_issue(issue_number, comment=close_comment))
@@ -1078,7 +1022,6 @@ async def _work_loop():
                     ).encode(),
                 )
 
-                # Comment on issue about timeout (issue stays open for retry)
                 asyncio.create_task(
                     _github.comment_issue(
                         issue_number,
@@ -1098,7 +1041,7 @@ async def _work_loop():
                 )
 
             finally:
-                _pending.remove(turn_id)
+                _pending.unregister(turn_id)
 
             # Cooldown between work items
             cooldown = config.get("work_cooldown_minutes", 15) * 60
@@ -1106,7 +1049,7 @@ async def _work_loop():
             await asyncio.sleep(cooldown)
 
         except Exception:
-            log.exception("Work loop error")
+            log.exception("Error in work loop")
 
 
 @asynccontextmanager
@@ -1114,12 +1057,12 @@ async def lifespan(app: FastAPI):
     global _nc, _js, _config_kv, _lock_kv, _github
     log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
-    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
-    _js = _nc.jetstream()
+    _nc, _js = await connect_nats(NATS_URL, token=NATS_TOKEN)
 
     await _seed_identity()
     await _init_conversation_stream()
-    _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CORTEX_CONFIG)
+
+    _config_kv = await init_kv(_js, CONFIG_BUCKET)
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
 
     _github = _init_github_client()
@@ -1136,7 +1079,6 @@ async def lifespan(app: FastAPI):
     yield
 
     await _nc.close()
-    log.info("NATS connection closed")
 
 
 app = FastAPI(title="maki-stem", version="0.0.1", lifespan=lifespan)
@@ -1144,11 +1086,6 @@ app = FastAPI(title="maki-stem", version="0.0.1", lifespan=lifespan)
 
 class TurnRequest(BaseModel):
     message: str
-
-
-class TurnResponse(BaseModel):
-    turn_id: str
-    response: str
 
 
 async def _process_turn(
@@ -1197,32 +1134,37 @@ async def _process_turn(
         "mission_results": None,
     }
 
-    queue = _pending.create(turn_id)
+    queue = _pending.register(turn_id)
+    full_response = []
 
     try:
         await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(turn_payload).encode())
         log.info("Turn request published", extra={"turn_id": turn_id})
 
-        chunks = []
         while True:
             try:
                 data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
             except TimeoutError:
                 log.error("Turn timed out", extra={"turn_id": turn_id})
+                await _nc.publish(
+                    CORTEX_STUCK,
+                    json.dumps(
+                        {
+                            "turn_id": turn_id,
+                            "mode": "normal",
+                            "timeout_seconds": TURN_TIMEOUT,
+                            "user_waiting": True,
+                        }
+                    ).encode(),
+                )
                 raise
 
             chunk_text = data.get("response", "")
             done = data.get("done", False)
-            cancelled = data.get("cancelled", False)
-
-            if cancelled:
-                log.warning("Turn cancelled (cortex restarted)", extra={"turn_id": turn_id})
-                raise RuntimeError("Turn cancelled: cortex restarted mid-turn")
 
             if chunk_text:
-                chunks.append(chunk_text)
+                full_response.append(chunk_text)
 
-            # Forward chunk to ears if streaming to Discord
             if forward_to and (chunk_text or done):
                 ears_msg = {
                     "message_id": forward_to["message_id"],
@@ -1236,46 +1178,19 @@ async def _process_turn(
             if done:
                 break
 
-        response_text = "".join(chunks)
+        cortex_response = "".join(full_response)
+        clean_response = strip_tags(cortex_response)
+        config_updates = parse_config_tags(cortex_response)
+        if config_updates:
+            await apply_config_updates(_config_kv, config_updates, DEFAULT_CORTEX_CONFIG)
 
-        # Parse and apply any config tags from cortex response
-        config_updates = parse_config_tags(response_text)
-        await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
+        asyncio.create_task(_publish_turn_to_stream(turn_id, message, clean_response))
+        asyncio.create_task(_feed_memories(message, clean_response))
 
-        log.info("Turn complete", extra={"turn_id": turn_id, "chunks": len(chunks)})
+        return turn_id, clean_response
 
-        await _publish_turn_to_stream(
-            turn_id=turn_id,
-            user_message=message,
-            cortex_response=response_text,
-        )
-
-        asyncio.create_task(_feed_memories(message, response_text))
-
-        return turn_id, response_text
-
-    except TimeoutError:
-        # Publish stuck signal for immune awareness
-        try:
-            await _nc.publish(
-                CORTEX_STUCK,
-                json.dumps(
-                    {
-                        "turn_id": turn_id,
-                        "mode": "normal",
-                        "timeout_seconds": TURN_TIMEOUT,
-                        "user_waiting": True,
-                    }
-                ).encode(),
-            )
-        except Exception:
-            log.exception("Failed to publish stuck signal")
-        raise
-    except Exception:
-        log.exception("Turn failed", extra={"turn_id": turn_id})
-        raise
     finally:
-        _pending.remove(turn_id)
+        _pending.unregister(turn_id)
         _active_turns.pop(turn_id, None)
 
 
@@ -1283,20 +1198,17 @@ async def _store_memory(content: str, source: str, user_id: str, metadata: dict 
     """Store a single memory via recall REST API (runs as background task)."""
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                payload = {
-                    "messages": [{"role": "assistant", "content": content}],
-                    "user_id": user_id,
-                }
-                if metadata:
-                    payload["metadata"] = metadata
-
-                resp = await client.post(f"{RECALL_URL}/memories", json=payload)
-                resp.raise_for_status()
-                log.info(
-                    "Memory stored via NATS",
-                    extra={"source": source, "content_len": len(content), "attempt": attempt + 1},
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{RECALL_URL}/memories",
+                    json={
+                        "messages": [{"role": "user", "content": content}],
+                        "user_id": user_id,
+                        "metadata": metadata or {},
+                    },
                 )
+                resp.raise_for_status()
+                log.info("Memory stored", extra={"source": source, "attempt": attempt + 1})
                 return
         except httpx.ReadTimeout:
             log.warning("Memory store timed out", extra={"source": source, "attempt": attempt + 1})
@@ -1319,18 +1231,18 @@ async def _memory_store_listener():
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
-            content = data.get("content", "")
-            source = data.get("source", "unknown")
-            user_id = data.get("user_id", MEMORY_USER_ID)
-            metadata = data.get("metadata")
-
+            content = data.get("content", "").strip()
             if not content:
                 continue
+
+            user_id = data.get("user_id", MEMORY_USER_ID)
+            source = data.get("source", "unknown")
+            metadata = data.get("metadata")
 
             asyncio.create_task(_store_memory(content, source, user_id, metadata))
 
         except Exception:
-            log.exception("Error processing memory store request")
+            log.exception("Error in memory store listener")
 
 
 async def _handle_discord_message(data: dict):
@@ -1350,7 +1262,10 @@ async def _handle_discord_message(data: dict):
                 "response": "Sorry, I took too long thinking about that. Try again?",
                 "done": True,
             }
-            await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+            try:
+                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+            except Exception:
+                log.exception("Failed to send timeout error to ears")
         except RuntimeError as e:
             log.warning("Turn cancelled", extra={"error": str(e)})
             try:
@@ -1362,9 +1277,9 @@ async def _handle_discord_message(data: dict):
                 }
                 await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
             except Exception:
-                log.exception("Failed to send cancelled signal to ears")
+                log.exception("Failed to send cancellation error to ears")
         except Exception:
-            log.exception("Error processing Discord message")
+            log.exception("Turn failed")
             try:
                 error_msg = {
                     "message_id": message_id,
@@ -1374,7 +1289,7 @@ async def _handle_discord_message(data: dict):
                 }
                 await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
             except Exception:
-                log.exception("Failed to send done signal to ears")
+                log.exception("Failed to send error to ears")
 
 
 async def _ears_listener():
@@ -1407,21 +1322,5 @@ def health():
 async def turn(req: TurnRequest):
     if not _nc or not _nc.is_connected:
         raise HTTPException(status_code=503, detail="NATS not connected")
-
-    try:
-        turn_id, response_text = await _process_turn(req.message)
-        return TurnResponse(turn_id=turn_id, response=response_text)
-    except TimeoutError:
-        raise HTTPException(status_code=504, detail="Cortex did not respond in time")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Internal error during turn processing")
-
-
-def cli():
-    import uvicorn
-
-    uvicorn.run("maki_stem.main:app", host="0.0.0.0", port=8000)
-
-
-if __name__ == "__main__":
-    cli()
+    _, response = await _process_turn(req.message)
+    return {"response": response}
