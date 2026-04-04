@@ -725,7 +725,7 @@ async def _idle_loop():
                 },
             }
 
-            queue = _pending.register(turn_id)
+            queue = _pending.create(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
                 log.info("Idle turn published", extra={"turn_id": turn_id})
@@ -737,7 +737,9 @@ async def _idle_loop():
                 clean_thought = strip_tags(thought or "")
                 config_updates = parse_config_tags(thought or "")
                 if config_updates:
-                    await apply_config_updates(_config_kv, config_updates, DEFAULT_CORTEX_CONFIG)
+                    await apply_config_updates(
+                        _config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys())
+                    )
 
                 if clean_thought:
                     thought_payload = {"thought": clean_thought, "turn_id": turn_id}
@@ -765,7 +767,7 @@ async def _idle_loop():
             except Exception:
                 log.exception("Idle turn failed", extra={"turn_id": turn_id})
             finally:
-                _pending.unregister(turn_id)
+                _pending.remove(turn_id)
 
         except Exception:
             log.exception("Error in idle loop")
@@ -829,7 +831,7 @@ async def _care_loop():
                 },
             }
 
-            queue = _pending.register(turn_id)
+            queue = _pending.create(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(care_payload).encode())
                 log.info("Care turn published", extra={"turn_id": turn_id})
@@ -863,7 +865,7 @@ async def _care_loop():
             except Exception:
                 log.exception("Care turn failed", extra={"turn_id": turn_id})
             finally:
-                _pending.unregister(turn_id)
+                _pending.remove(turn_id)
 
         except Exception:
             log.exception("Error in care loop")
@@ -974,7 +976,7 @@ async def _work_loop():
                 },
             }
 
-            queue = _pending.register(turn_id)
+            queue = _pending.create(turn_id)
             try:
                 await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
                 log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
@@ -1041,7 +1043,7 @@ async def _work_loop():
                 )
 
             finally:
-                _pending.unregister(turn_id)
+                _pending.remove(turn_id)
 
             # Cooldown between work items
             cooldown = config.get("work_cooldown_minutes", 15) * 60
@@ -1135,7 +1137,7 @@ async def _process_turn(
         "mission_results": None,
     }
 
-    queue = _pending.register(turn_id)
+    queue = _pending.create(turn_id)
     full_response = []
 
     try:
@@ -1183,7 +1185,7 @@ async def _process_turn(
         clean_response = strip_tags(cortex_response)
         config_updates = parse_config_tags(cortex_response)
         if config_updates:
-            await apply_config_updates(_config_kv, config_updates, DEFAULT_CORTEX_CONFIG)
+            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
         asyncio.create_task(_publish_turn_to_stream(turn_id, message, clean_response))
         asyncio.create_task(_feed_memories(message, clean_response))
@@ -1191,7 +1193,7 @@ async def _process_turn(
         return turn_id, clean_response
 
     finally:
-        _pending.unregister(turn_id)
+        _pending.remove(turn_id)
         _active_turns.pop(turn_id, None)
 
 
