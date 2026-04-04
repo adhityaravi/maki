@@ -152,6 +152,10 @@ _cortex_sessions: dict[str, str] = {}  # instance_id -> session_id
 _active_turns: dict[str, float] = {}  # turn_id → start timestamp
 _turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
+_sub_response = None  # NATS subscription: CORTEX_TURN_RESPONSE
+_sub_cortex_health = None  # NATS subscription: CORTEX_HEALTH
+_sub_memory_store = None  # NATS subscription: MEMORY_STORE
+_sub_ears = None  # NATS subscription: EARS_MESSAGE_IN
 
 
 def _init_github_client():
@@ -233,7 +237,9 @@ async def _reject_unverified_issues(issues: list[dict]) -> list[dict]:
 
 async def _response_listener():
     """Listen for cortex responses and push chunks into pending queues."""
-    sub = await _nc.subscribe(CORTEX_TURN_RESPONSE)
+    global _sub_response
+    _sub_response = await _nc.subscribe(CORTEX_TURN_RESPONSE)
+    sub = _sub_response
     log.info("Subscribed", extra={"subject": CORTEX_TURN_RESPONSE})
     async for msg in sub.messages:
         try:
@@ -259,7 +265,9 @@ async def _cortex_heartbeat_watcher():
 
     Tracks sessions per instance_id to support multi-instance cortex.
     """
-    sub = await _nc.subscribe(CORTEX_HEALTH)
+    global _sub_cortex_health
+    _sub_cortex_health = await _nc.subscribe(CORTEX_HEALTH)
+    sub = _sub_cortex_health
     log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
     async for msg in sub.messages:
         try:
@@ -1269,7 +1277,9 @@ async def _memory_store_listener():
     {"content": "...", "user_id": "...", "metadata": {...}}
     Each memory is stored concurrently as a background task.
     """
-    sub = await _nc.subscribe(MEMORY_STORE, queue="maki-stem")
+    global _sub_memory_store
+    _sub_memory_store = await _nc.subscribe(MEMORY_STORE, queue="maki-stem")
+    sub = _sub_memory_store
     log.info("Subscribed", extra={"subject": MEMORY_STORE})
     async for msg in sub.messages:
         try:
@@ -1337,7 +1347,9 @@ async def _handle_discord_message(data: dict):
 
 async def _ears_listener():
     """Listen for incoming Discord messages via NATS and dispatch as tasks."""
-    sub = await _nc.subscribe(EARS_MESSAGE_IN, queue="maki-stem")
+    global _sub_ears
+    _sub_ears = await _nc.subscribe(EARS_MESSAGE_IN, queue="maki-stem")
+    sub = _sub_ears
     log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
     async for msg in sub.messages:
         try:
@@ -1351,6 +1363,24 @@ async def _ears_listener():
 
 @app.get("/health")
 def health():
+    if not _nc or not _nc.is_connected:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "reason": "NATS not connected"})
+
+    dead_subs = []
+    for name, sub in [
+        ("response", _sub_response),
+        ("cortex_health", _sub_cortex_health),
+        ("memory_store", _sub_memory_store),
+        ("ears", _sub_ears),
+    ]:
+        if sub is None or sub.is_closed:
+            dead_subs.append(name)
+    if dead_subs:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "reason": "NATS subscriptions closed", "dead": dead_subs},
+        )
+
     now = time.time()
     for turn_id, started in _active_turns.items():
         if now - started > TURN_TIMEOUT:
