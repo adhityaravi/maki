@@ -167,6 +167,30 @@ def make_code_tools(
         except Exception as e:
             return mcp_result(f"Error searching: {e}")
 
+    async def git_status(args: dict[str, Any]) -> dict[str, Any]:
+        """Show git status."""
+        log.info("Tool: git_status")
+        rc, stdout, stderr = await _run_git(repo_path, "status", "--short")
+        if rc != 0:
+            return mcp_result(f"Error: {stderr}")
+        return mcp_result(stdout if stdout.strip() else "Working tree clean.")
+
+    async def git_diff(args: dict[str, Any]) -> dict[str, Any]:
+        """Show git diff of changes."""
+        path = args.get("path", "")
+        log.info("Tool: git_diff", extra={"path": path})
+        cmd = ["diff"]
+        if path:
+            resolved = _safe_path(repo_path, path)
+            if not resolved:
+                return mcp_result(f"Error: path '{path}' is outside the repository.")
+            cmd.append("--")
+            cmd.append(path)
+        rc, stdout, stderr = await _run_git(repo_path, *cmd)
+        if rc != 0:
+            return mcp_result(f"Error: {stderr}")
+        return mcp_result(stdout if stdout.strip() else "No changes.")
+
     async def git_run(args: dict[str, Any]) -> dict[str, Any]:
         """Run an arbitrary git command."""
         raw_args = args.get("args", "")
@@ -318,7 +342,12 @@ def make_code_edit_tools(
 
             rc, stdout, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main")
             if rc != 0:
-                return mcp_result(f"Pull failed: {stderr}")
+                if "rebase-merge" in stderr or "rebase" in stderr.lower():
+                    log.warning("Stuck rebase detected, aborting and retrying with merge")
+                    await _run_git(repo_path, "rebase", "--abort")
+                    rc, stdout, stderr = await _run_git(repo_path, "pull", "origin", "main")
+                if rc != 0:
+                    return mcp_result(f"Pull failed: {stderr}")
             return mcp_result(stdout if stdout.strip() else "Already up to date.")
         except Exception as e:
             return mcp_result(f"Error: {e}")
