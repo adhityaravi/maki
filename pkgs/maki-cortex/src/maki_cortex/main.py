@@ -342,6 +342,10 @@ def build_system_prompt(turn: dict) -> str:
     if graph:
         parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph))
 
+    session_summary = turn.get("session_summary", "")
+    if session_summary:
+        parts.append("## Session context\n" + session_summary)
+
     conversation = turn.get("conversation", [])
     if conversation:
         conv_lines = []

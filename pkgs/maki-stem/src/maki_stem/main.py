@@ -59,7 +59,7 @@ LOCK_BUCKET = "maki-lock"
 
 STREAM_NAME = "maki-conversation"
 STREAM_MAX_MSGS = int(os.environ.get("STREAM_MAX_MSGS", "200"))
-CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "6"))
+CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "15"))
 MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
 MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
@@ -392,6 +392,28 @@ def _get_recent_conversation() -> list[dict]:
             }
         )
     return conversation
+
+
+def _build_session_summary() -> str:
+    """Build a compact summary of turns that fall outside the recent context window.
+
+    These are turns older than CONTEXT_TURNS that won't appear in _get_recent_conversation().
+    Gives cortex awareness of earlier parts of the same session without bloating the full context.
+    """
+    if len(_conversation_history) <= CONTEXT_TURNS:
+        return ""
+
+    older_turns = _conversation_history[:-CONTEXT_TURNS]
+    if not older_turns:
+        return ""
+
+    lines = [f"Earlier in this session ({len(older_turns)} turns before recent context):"]
+    for turn in older_turns:
+        user_msg = turn.get("user_message", "")[:120].replace("\n", " ").strip()
+        if user_msg:
+            lines.append(f"- {user_msg}")
+
+    return "\n".join(lines)
 
 
 async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
@@ -1119,6 +1141,7 @@ async def _process_turn(
         "turn_id": turn_id,
         "identity": identity,
         "conversation": _get_recent_conversation(),
+        "session_summary": _build_session_summary(),
         "memories": memories,
         "graph_context": graph_context,
         "system_state": turn_system_state,
