@@ -146,6 +146,10 @@ resource "kubernetes_deployment" "immune" {
             name  = "REPO_PATH"
             value = "/repo/maki"
           }
+          env {
+            name  = "SITE_NAME"
+            value = var.site_name
+          }
           readiness_probe {
             http_get {
               path = "/health"

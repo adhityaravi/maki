@@ -29,6 +29,7 @@ from maki_common.subjects import (
     IMMUNE_ACTION,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
+    IMMUNE_HEALTH,
     IMMUNE_STATE_REQUEST,
 )
 
@@ -59,6 +60,8 @@ RECENT_ACTIONS_KEY = "recent_actions"
 RECENT_ACTIONS_MAX = 100
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
+SITE_NAME = os.environ.get("SITE_NAME", "unknown")
+GOSSIP_STALE_THRESHOLD = CHECK_INTERVAL * 3  # 90s — prune peers silent longer than this
 
 DEFAULT_CONFIG = {
     "heartbeat_interval": 1800,
@@ -152,6 +155,24 @@ If you restart or rollback cortex, ALWAYS restart stem too — otherwise stem wi
 waiting for responses from a cortex that forgot about them. Stem's heartbeat watcher should \
 self-heal, but restart it anyway to be safe.
 
+## Hive Awareness
+
+You are not one instance — you are one immune system spanning multiple sites. Each site has its \
+own pods, but you share state via the gossip ring. The "Hive State" section in your metrics shows \
+every site's health.
+
+When a component is down on one site but healthy on others:
+- It's a local problem. Fix it locally. Don't panic.
+- Maki can still think (cortex on other sites), still remember (recall on other sites), still listen.
+- Mention the localized nature in your digest. "cortex down on inu, healthy on sushi/ramen — restarting."
+
+When a component is down everywhere:
+- This is a real emergency. Investigate aggressively. Check if it's the same root cause.
+- Alert immediately.
+
+When a site goes silent (no gossip):
+- The site may be offline or network-partitioned. Note it. Don't assume the worst.
+
 ## Frequency Tuning
 Tighten when unstable, relax when stable:
 - [CONFIG:heartbeat_interval=900] — tighten patrol (default: 1800s)
@@ -193,6 +214,8 @@ _semaphore = asyncio.Semaphore(1)
 # In-memory set of image tags that failed health checks and were rolled back.
 # Cleared on process restart (intentional — restart implies fresh state).
 _failed_image_blacklist: set[str] = set()
+# Hive state — populated by gossip ring, keyed by site name
+_hive_state: dict[str, dict] = {}
 
 
 # --- Infrastructure Lock ---
@@ -507,22 +530,54 @@ async def _check_pod_metrics():
         pass  # metrics API may not be available
 
 
+def _hive_cortex_status() -> tuple[int, int]:
+    """Count how many hive peers have healthy cortex. Returns (total_peers, healthy_peers)."""
+    total = 0
+    healthy = 0
+    for _site, state in _hive_state.items():
+        total += 1
+        cortex_info = state.get("cortex", {})
+        age = cortex_info.get("last_heartbeat_age_s")
+        if age is not None and age < 60:
+            healthy += 1
+    return total, healthy
+
+
+def _component_healthy_in_hive(component: str) -> list[str]:
+    """Return list of hive site names where this component is healthy."""
+    healthy_sites = []
+    for site, state in _hive_state.items():
+        peer_health = state.get("component_health", {})
+        comp_state = peer_health.get(component, {})
+        if comp_state.get("healthy"):
+            healthy_sites.append(site)
+    return healthy_sites
+
+
 def _check_cortex_heartbeat():
-    """Check if cortex heartbeat is recent and include turn state."""
+    """Check if cortex heartbeat is recent and include turn state + hive context."""
     if _last_cortex_heartbeat == 0:
         return
     age = time.time() - _last_cortex_heartbeat
+    hive_total, hive_healthy = _hive_cortex_status()
     details: dict = {
         "last_heartbeat_age_s": round(age, 1),
+        "hive_cortex_total": hive_total,
+        "hive_cortex_healthy": hive_healthy,
     }
     if _cortex_active_turn:
         details["active_turn"] = _cortex_active_turn
         details["turn_mode"] = _cortex_turn_mode
         if _cortex_turn_started:
             details["turn_running_s"] = round(time.time() - _cortex_turn_started, 1)
+
+    local_healthy = age < 60
+    if not local_healthy and hive_healthy > 0:
+        details["hive_note"] = f"cortex healthy on {hive_healthy} other site(s) — local issue only"
+
     _update_health(
         "maki-cortex-heartbeat",
-        age < 60,
+        local_healthy,
         details,
     )
 
@@ -571,6 +626,66 @@ async def _cortex_heartbeat_listener():
             pass
 
 
+# --- Gossip Ring ---
+
+
+async def _gossip_publisher():
+    """Broadcast local state to all immune instances via NATS gossip."""
+    log.info("Gossip publisher started", extra={"site": SITE_NAME, "interval": CHECK_INTERVAL})
+    while True:
+        try:
+            payload = {
+                "site": SITE_NAME,
+                "instance_id": INSTANCE_ID,
+                "timestamp": time.time(),
+                "component_health": {
+                    k: {"healthy": v["healthy"], "consecutive_failures": v["consecutive_failures"]}
+                    for k, v in _component_health.items()
+                },
+                "recent_actions": _recent_actions[-10:],
+                "cortex": {
+                    "last_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
+                    if _last_cortex_heartbeat
+                    else None,
+                    "active_turn": _cortex_active_turn,
+                    "turn_mode": _cortex_turn_mode,
+                },
+                "blacklist": list(_failed_image_blacklist),
+            }
+            await _nc.publish(IMMUNE_HEALTH, json.dumps(payload).encode())
+        except Exception:
+            log.exception("Gossip publish failed")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def _gossip_listener():
+    """Subscribe to gossip from all immune instances, build hive-wide state."""
+    sub = await _nc.subscribe(IMMUNE_HEALTH)  # NOT queue-grouped — all instances receive all
+    log.info("Gossip listener started", extra={"subject": IMMUNE_HEALTH})
+    async for msg in sub.messages:
+        try:
+            payload = json.loads(msg.data.decode())
+            site = payload.get("site", "unknown")
+            if site == SITE_NAME:
+                continue  # skip own messages
+
+            was_new = site not in _hive_state
+            _hive_state[site] = {**payload, "received_at": time.time()}
+
+            if was_new:
+                log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
+
+            # Prune stale peers
+            now = time.time()
+            stale = [s for s, v in _hive_state.items() if now - v["received_at"] > GOSSIP_STALE_THRESHOLD]
+            for s in stale:
+                log.warning("Peer went silent, pruning", extra={"site": s})
+                del _hive_state[s]
+
+        except Exception:
+            log.exception("Gossip listener error")
+
+
 # --- Reflex Engine ---
 
 
@@ -592,6 +707,15 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
     _restart_history[component] = history
 
     if len(history) >= max_restarts:
+        # Check hive — if healthy elsewhere, this is a local problem, don't escalate
+        hive_healthy_elsewhere = _component_healthy_in_hive(component)
+        if hive_healthy_elsewhere:
+            log.warning(
+                "Reflex limit reached but component healthy on other sites — skipping escalation",
+                extra={"component": component, "restarts": len(history), "hive_healthy_sites": hive_healthy_elsewhere},
+            )
+            return
+
         log.warning(
             "Reflex limit reached, escalating to Claude",
             extra={
@@ -700,6 +824,8 @@ async def _state_request_handler(msg):
             "cortex_turn_mode": _cortex_turn_mode,
             "cortex_turn_started": _cortex_turn_started,
             "last_incident_time": _last_incident_time,
+            "site_name": SITE_NAME,
+            "hive_state": _hive_state,
         }
         await msg.respond(json.dumps(state).encode())
         log.info("State request served", extra={"components": len(_component_health)})
@@ -1411,7 +1537,29 @@ def _build_system_state() -> str:
         lines.append(f"- {component}: {status} ({', '.join(parts)})")
 
     if not lines:
-        return "No health data collected yet."
+        lines.append("No health data collected yet.")
+
+    # Append hive state
+    if _hive_state:
+        lines.append(f"\n## Hive State ({len(_hive_state)} peer(s) connected, local site: {SITE_NAME})")
+        for site, state in sorted(_hive_state.items()):
+            peer_health = state.get("component_health", {})
+            total = len(peer_health)
+            healthy = sum(1 for v in peer_health.values() if v.get("healthy"))
+            cortex_info = state.get("cortex", {})
+            cortex_age = cortex_info.get("last_heartbeat_age_s")
+            if cortex_age is not None and cortex_age < 60:
+                turn = cortex_info.get("active_turn")
+                cortex_str = f"cortex active (turn {turn})" if turn else "cortex idle"
+            elif cortex_age is not None:
+                cortex_str = f"cortex DOWN (heartbeat {round(cortex_age)}s ago)"
+            else:
+                cortex_str = "cortex unknown"
+            freshness = round(time.time() - state.get("received_at", 0))
+            lines.append(f"- {site}: {healthy}/{total} healthy, {cortex_str}, last seen {freshness}s ago")
+    else:
+        lines.append(f"\n## Hive State (no peers connected, local site: {SITE_NAME})")
+
     return "\n".join(lines)
 
 
@@ -1586,6 +1734,8 @@ async def main():
     asyncio.create_task(_health_monitor_loop())
     asyncio.create_task(_immune_heartbeat_loop())
     asyncio.create_task(_cortex_heartbeat_listener())
+    asyncio.create_task(_gossip_publisher())
+    asyncio.create_task(_gossip_listener())
 
     server = await tcp_health_server(port=HEALTH_PORT)
     log.info("Health server listening", extra={"port": HEALTH_PORT})

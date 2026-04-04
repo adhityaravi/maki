@@ -26,4 +26,5 @@ inputs = {
   image_registry = local.env.locals.image_registry
   nats_url       = local.env.locals.nats_url
   claude_model   = local.env.locals.claude_model
+  site_name      = local.env.locals.machine
 }

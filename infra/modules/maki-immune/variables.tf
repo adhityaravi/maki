@@ -18,3 +18,8 @@ variable "claude_model" {
   type    = string
   default = "claude-sonnet-4-6"
 }
+
+variable "site_name" {
+  description = "Cluster/site name for hive gossip identification"
+  type        = string
+}
