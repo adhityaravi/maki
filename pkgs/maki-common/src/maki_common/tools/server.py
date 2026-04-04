@@ -8,6 +8,8 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Bump: expose git push as standalone capability (tracked in issue #47)
+
 
 def create_maki_tools(
     nc: Any,
