@@ -155,6 +155,30 @@ class GitHubIssueClient:
             log.exception("Failed to create GitHub issue", extra={"title": title})
             return None
 
+    async def get_issue_comments(self, number: int, per_page: int = 50) -> list[dict[str, Any]]:
+        """Fetch all comments on an issue. Returns list of comment dicts with 'author' and 'body'."""
+        try:
+            resp = await self._client.get(
+                f"{API}/repos/{self._repo_path}/issues/{number}/comments",
+                headers=await self._auth.headers(),
+                params={"per_page": per_page},
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            comments = [
+                {
+                    "author": c.get("user", {}).get("login", "unknown"),
+                    "body": c.get("body", ""),
+                    "created_at": c.get("created_at", ""),
+                }
+                for c in raw
+            ]
+            log.info("GitHub issue comments fetched", extra={"number": number, "count": len(comments)})
+            return comments
+        except Exception:
+            log.exception("Failed to fetch issue comments", extra={"number": number})
+            return []
+
     async def comment_issue(self, number: int, body: str) -> bool:
         """Add a comment to an issue. Returns True on success."""
         try:

@@ -36,6 +36,7 @@ from maki_common.subjects import (
     CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
+    DEPLOY_REQUEST,
     EARS_MESSAGE_IN,
     EARS_MESSAGE_OUT,
     EARS_REMINDER_OUT,
@@ -871,6 +872,38 @@ async def _care_loop():
             log.exception("Error in care loop")
 
 
+async def _request_deploy_after_work(issue_number: int, issue_title: str):
+    """Request a deploy to maki-immune after a successful work session and comment with the result."""
+    deploy_target = "maki-immune"
+    log.info("Requesting deploy after work", extra={"service": deploy_target, "issue": issue_number})
+    try:
+        reply = await _nc.request(
+            DEPLOY_REQUEST,
+            json.dumps({"service": deploy_target, "image_tag": "latest"}).encode(),
+            timeout=30.0,
+        )
+        result = json.loads(reply.data.decode())
+        status = result.get("status", "unknown")
+        message = result.get("message", "")
+        log.info("Deploy requested", extra={"service": deploy_target, "status": status})
+
+        deploy_comment = (
+            f"🚀 **Deploy requested** → `{deploy_target}`\n\n"
+            f"Status: `{status}`"
+            + (f"\n{message}" if message else "")
+            + f"\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+    except Exception:
+        log.exception("Failed to request deploy after work", extra={"issue": issue_number})
+        deploy_comment = (
+            f"⚠️ **Deploy request failed** for `{deploy_target}` — will need manual trigger.\n\n"
+            f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+    if _github:
+        await _github.comment_issue(issue_number, deploy_comment)
+
+
 async def _work_loop():
     """Night work loop — execute queued todos while the user sleeps."""
     global _work_items_tonight, _work_items_tonight_date
@@ -959,6 +992,9 @@ async def _work_loop():
 
             memories, graph_context = await _search_memories(f"{issue_title} {issue_body[:200]}")
 
+            # Fetch issue comments so cortex has full history before starting (#39)
+            issue_comments = await _github.get_issue_comments(issue_number)
+
             turn_id = f"work-{uuid.uuid4().hex[:8]}"
             work_payload = {
                 "turn_id": turn_id,
@@ -973,6 +1009,7 @@ async def _work_loop():
                     "issue_title": issue_title,
                     "issue_description": issue_body,
                     "issue_priority": issue_priority,
+                    "issue_comments": issue_comments,
                 },
             }
 
@@ -1008,6 +1045,9 @@ async def _work_loop():
                     f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
                 )
                 asyncio.create_task(_github.close_issue(issue_number, comment=close_comment))
+
+                # Request deploy to maki-immune after successful work (#40)
+                asyncio.create_task(_request_deploy_after_work(issue_number, issue_title))
 
             except TimeoutError:
                 log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
