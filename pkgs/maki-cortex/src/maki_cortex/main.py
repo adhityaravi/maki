@@ -509,13 +509,10 @@ async def main():
     elif github_private_key:
         import subprocess
 
-        from maki_common.tools.local_code import get_github_token
+        from maki_common.tools.github import GitHubAuth
 
-        token = await get_github_token(
-            app_id=GITHUB_APP_ID,
-            private_key=github_private_key,
-            installation_id=GITHUB_INSTALLATION_ID,
-        )
+        _auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
+        token = await _auth.get_token()
         repo_url = f"https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
         log.info("Cloning repo", extra={"path": REPO_PATH})
         os.makedirs(os.path.dirname(REPO_PATH), exist_ok=True)
