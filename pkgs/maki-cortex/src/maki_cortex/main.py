@@ -197,64 +197,20 @@ Priority: {issue_priority}
 - One task at a time. Focus."""
 
 
-TOOLS_PROMPT = """## Available Tools
+TOOLS_PROMPT = """## Tools
+Memory: search_memories, get_all_memories, add_memory, get_system_health, check_component, \
+get_config, update_config
+Code: search_code (use FIRST — scopes: symbol/callers/callees/references/definition/file/path), \
+read_file, write_file, list_directory, search_text, rebuild_code_graph
+Git: git_status, git_diff, quality_check (run before commit), git_commit_and_push, git_pull, \
+get_workflow_status, get_workflow_logs, trigger_docker_build (emergency only)
+Deploy: request_deploy, get_deploy_status
+Issues: create_issue, list_issues, get_issue, close_issue, comment_issue
 
-You have MCP tools to investigate and interact with your own systems:
+Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
+→ git_commit_and_push → request_deploy
 
-### Memory & State
-- **search_memories** / **get_all_memories** — search or read memories
-- **add_memory** (content) — store something into long-term memory
-- **get_system_health** — get detailed health from your immune system
-- **check_component** — check a specific component's health endpoint
-- **get_config** / **update_config** — read or change your configuration
-
-### Code Navigation (Local)
-- **search_code** (query, scope, kind, file) — search the code structure graph (tree-sitter AST). \
-Use this FIRST to find symbols, callers, callees, references. Much more efficient than reading \
-entire files. Scopes: symbol, callers, callees, references, definition, file, path.
-- **read_file** (path) — read a file from the local repo clone (relative path)
-- **write_file** (path, content) — write a file to the local repo clone
-- **list_directory** (path) — list directory contents
-- **search_text** (query, path) — grep-style text search in the repo
-- **rebuild_code_graph** (languages) — rebuild the AST graph after making changes
-
-### Git & CI/CD
-- **git_status** — show current git status
-- **git_diff** (path) — show unstaged changes
-- **quality_check** (path) — run ruff lint + format checks. **Always run before git_commit_and_push.**
-- **git_commit_and_push** (message, files) — stage, commit, and push to GitHub
-- **git_pull** — pull latest from origin/main
-- **trigger_docker_build** (services) — emergency only: trigger Docker builds (CI does this on push)
-- **get_workflow_status** (workflow) — check CI/CD workflow status
-- **get_workflow_logs** (run_id) — get logs from a workflow run
-
-### Deployment
-- **request_deploy** (service, image_tag) — request deployment of a service (immune handles K8s)
-- **get_deploy_status** (service) — check current deployment status
-
-### GitHub Issues
-- **create_issue** (title, body, labels) — create a new GitHub issue
-- **list_issues** (state, labels) — list issues, optionally filtered by state/labels
-- **get_issue** (issue_number) — get details of a specific issue
-- **close_issue** (issue_number, comment) — close an issue with a summary comment
-- **comment_issue** (issue_number, body) — add a comment to an issue
-
-## Self-Evolution Workflow
-1. **search_code** to find what you want to change (efficient, ~260 tokens per search)
-2. **read_file** to see the full context of what you want to modify
-3. **write_file** to make your changes
-4. **rebuild_code_graph** to update your understanding
-5. **quality_check** to verify lint + formatting pass
-6. **git_commit_and_push** to push changes to GitHub (CI builds Docker images automatically)
-7. **request_deploy** to deploy (immune monitors and auto-rollbacks if unhealthy)
-
-## Learning
-When you learn something useful — about Adi's preferences, projects, workflows, or about \
-your own system — use **add_memory** to remember it. Your memories persist across conversations \
-and feed into your knowledge graph. Don't wait to be told to remember things.
-
-Use search_code first to understand code structure before reading files. \
-Don't read entire files unnecessarily — targeted searches save context."""
+Use add_memory for anything worth remembering. Use search_code before reading files."""
 
 
 def build_system_prompt(turn: dict) -> str:
@@ -333,16 +289,22 @@ def build_system_prompt(turn: dict) -> str:
             )
         )
 
-    # System state — available in all turns for self-awareness
-    system_state = turn.get("system_state") or (turn.get("idle_context", {}).get("system_state"))
-    if system_state and turn.get("mode") != "idle_reflection":
-        state_lines = []
-        for name, info in system_state.items():
-            if isinstance(info, dict):
-                details = ", ".join(f"{k}={v}" for k, v in info.items())
-                state_lines.append(f"- {name}: {details}")
-        if state_lines:
-            parts.append("## Your system state\n" + "\n".join(state_lines))
+    # System state — full detail or one-line summary depending on what stem sent
+    if turn.get("mode") != "idle_reflection":
+        system_state = turn.get("system_state")
+        system_state_summary = turn.get("system_state_summary")
+        if system_state and isinstance(system_state, dict):
+            # Full state provided — health-focused query
+            state_lines = []
+            for name, info in system_state.items():
+                if isinstance(info, dict):
+                    details = ", ".join(f"{k}={v}" for k, v in info.items())
+                    state_lines.append(f"- {name}: {details}")
+            if state_lines:
+                parts.append("## Your system state\n" + "\n".join(state_lines))
+        elif system_state_summary:
+            # Summary only — normal query
+            parts.append(f"## System: {system_state_summary}")
 
     memories = turn.get("memories", [])
     if memories:

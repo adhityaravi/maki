@@ -59,7 +59,9 @@ LOCK_BUCKET = "maki-lock"
 
 STREAM_NAME = "maki-conversation"
 STREAM_MAX_MSGS = int(os.environ.get("STREAM_MAX_MSGS", "200"))
-CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "20"))
+CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "6"))
+MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
+MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
 
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
@@ -377,24 +379,31 @@ def _get_recent_conversation() -> list[dict]:
 
 
 async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
-    """Query maki-recall for relevant memories and graph context."""
+    """Query maki-recall for relevant memories and graph context.
+
+    Fetches up to MEMORY_MAX_COUNT memories with score >= MEMORY_MIN_RELEVANCE.
+    """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 f"{RECALL_URL}/search",
-                json={"query": query, "user_id": MEMORY_USER_ID},
+                json={"query": query, "user_id": MEMORY_USER_ID, "limit": MEMORY_MAX_COUNT * 2},
             )
             resp.raise_for_status()
             data = resp.json()
 
         memories = []
         for result in data.get("results", []):
-            memories.append(
-                {
-                    "text": result.get("memory", ""),
-                    "relevance": result.get("score", 0),
-                }
-            )
+            score = result.get("score", 0)
+            if score >= MEMORY_MIN_RELEVANCE:
+                memories.append(
+                    {
+                        "text": result.get("memory", ""),
+                        "relevance": round(score, 2),
+                    }
+                )
+        # Cap at max count (already sorted by score descending from recall)
+        memories = memories[:MEMORY_MAX_COUNT]
 
         graph_context = []
         for rel in data.get("relations", []):
@@ -403,7 +412,10 @@ async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
             target = rel.get("target", "?")
             graph_context.append(f"{source} --{relationship}--> {target}")
 
-        log.info("Memory search complete", extra={"memories": len(memories), "relations": len(graph_context)})
+        log.info(
+            "Memory search complete",
+            extra={"memories": len(memories), "relations": len(graph_context)},
+        )
         return memories, graph_context
 
     except Exception:
@@ -476,6 +488,57 @@ def _format_system_state(system_state: dict) -> str:
             details = ", ".join(f"{k}={v}" for k, v in info.items())
             parts.append(f"{name}: {details}")
     return "; ".join(parts) if parts else "no data"
+
+
+def _summarize_system_state(system_state: dict) -> str:
+    """Return a one-line system health summary for non-health-focused turns."""
+    problems = []
+    for name, info in system_state.items():
+        if not isinstance(info, dict):
+            continue
+        # Flag unhealthy or restarting components
+        healthy = info.get("healthy", True)
+        restarts = info.get("restart_count", 0) or info.get("restarts", 0)
+        if not healthy:
+            problems.append(f"{name}: unhealthy")
+        elif restarts and int(restarts) > 3:
+            problems.append(f"{name}: {restarts} restarts")
+    if problems:
+        return "issues: " + ", ".join(problems)
+    return "all healthy"
+
+
+_HEALTH_KEYWORDS = frozenset(
+    [
+        "health",
+        "status",
+        "system",
+        "component",
+        "running",
+        "restart",
+        "down",
+        "broken",
+        "error",
+        "crash",
+        "fail",
+        "deploy",
+        "pod",
+        "service",
+        "immune",
+        "stem",
+        "cortex",
+        "recall",
+        "synapse",
+        "nerve",
+        "embed",
+    ]
+)
+
+
+def _is_health_query(message: str) -> bool:
+    """Return True if the message is asking about system health/status."""
+    lower = message.lower()
+    return any(kw in lower for kw in _HEALTH_KEYWORDS)
 
 
 def _in_quiet_hours(config: dict) -> bool:
@@ -1022,13 +1085,22 @@ async def _process_turn(
     memories, graph_context = await _search_memories(message)
     system_state = await _gather_system_state()
 
+    # Include full system state only for health-related queries; otherwise send a summary
+    if _is_health_query(message):
+        turn_system_state = system_state
+        turn_system_state_summary = None
+    else:
+        turn_system_state = None
+        turn_system_state_summary = _summarize_system_state(system_state)
+
     turn_payload = {
         "turn_id": turn_id,
         "identity": identity,
         "conversation": _get_recent_conversation(),
         "memories": memories,
         "graph_context": graph_context,
-        "system_state": system_state,
+        "system_state": turn_system_state,
+        "system_state_summary": turn_system_state_summary,
         "prompt": message,
         "mission_results": None,
     }
