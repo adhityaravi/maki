@@ -374,11 +374,20 @@ def make_code_edit_tools(
                 remote_url = f"https://x-access-token:{token}@github.com/{repo_owner}/{repo_name}.git"
                 await _run_git(repo_path, "remote", "set-url", "origin", remote_url)
 
+            # Clear stuck rebase state before pulling — rebase --abort silently
+            # fails in some states, so nuke the directory directly.
+            import shutil
+
+            for rebase_dir in ("rebase-merge", "rebase-apply"):
+                p = Path(repo_path) / ".git" / rebase_dir
+                if p.is_dir():
+                    shutil.rmtree(p)
+                    log.warning("Cleared stuck rebase dir", extra={"path": str(p)})
+
             rc, stdout, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main")
             if rc != 0:
-                if "rebase-merge" in stderr or "rebase" in stderr.lower():
-                    log.warning("Stuck rebase detected, aborting and retrying with merge")
-                    await _run_git(repo_path, "rebase", "--abort")
+                if "rebase" in stderr.lower():
+                    log.warning("Rebase failed, retrying with merge")
                     rc, stdout, stderr = await _run_git(repo_path, "pull", "origin", "main")
                 if rc != 0:
                     return mcp_result(f"Pull failed: {stderr}")
