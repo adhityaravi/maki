@@ -190,12 +190,13 @@ def create_cortex_tools(
         from maki_common.tools.codegraph_tools import make_codegraph_tools
         from maki_common.tools.local_code import make_code_edit_tools, make_code_tools
 
-        async def _on_commit_success(sha: str, message: str) -> None:
+        async def _on_commit_success(sha: str, message: str, repo: str) -> None:
             """Publish an episodic memory to NATS after every successful push."""
-            content = f"committed and pushed {sha}: {message}"
+            repo_label = repo or repo_name or "unknown"
+            content = f"committed and pushed {sha} to {repo_label}: {message}"
             payload = {"content": content, "source": "cortex", "user_id": "adi"}
             await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
-            log.info("Commit memory published", extra={"sha": sha})
+            log.info("Commit memory published", extra={"sha": sha, "repo": repo_label})
 
         all_tools.extend(make_code_tools(repo_path))
         all_tools.extend(
