@@ -25,6 +25,11 @@ def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
         if not service:
             return mcp_result("Error: service name is required.")
 
+        # Self-deploys (cortex/stem) kill the pod that issued the request,
+        # so the NATS request/reply connection dies before immune can respond.
+        # Fire-and-forget for these — immune publishes results to #maki-vitals.
+        self_deploy = any(s in service for s in ("cortex", "stem"))
+
         try:
             payload = json.dumps(
                 {
@@ -33,6 +38,15 @@ def make_deploy_tools(nc: Any) -> list[tuple[str, str, dict[str, type], Any]]:
                     "requested_at": time.time(),
                 }
             ).encode()
+
+            if self_deploy:
+                await nc.publish(DEPLOY_REQUEST, payload)
+                return mcp_result(
+                    f"Self-deploy of {service} requested (fire-and-forget). "
+                    "This pod will restart during rollout. "
+                    "Result will appear in #maki-vitals."
+                )
+
             resp = await nc.request(DEPLOY_REQUEST, payload, timeout=120.0)
             return mcp_result(resp.data.decode())
         except Exception as e:
