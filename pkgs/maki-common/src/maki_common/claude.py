@@ -165,7 +165,8 @@ async def stream_claude(
 
     async def _stream() -> AsyncIterator[str]:
         t0 = time.monotonic()
-        log.info("Streaming Claude", extra={"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode})
+        extra = {"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode}
+        log.info("Streaming Claude", extra=extra)
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
