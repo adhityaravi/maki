@@ -93,6 +93,10 @@ REPO_NAME = os.environ.get("REPO_NAME", "maki")
 # Labels that the autonomous work loop must never pick up
 WORK_SKIP_LABELS = {"draft", "human"}
 
+# GitHub logins allowed to create issues the work loop will execute
+# Anyone not in this set gets their issue commented on and closed immediately
+ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself", "renovate[bot]", "dependabot[bot]"})
+
 DEFAULT_CORTEX_CONFIG = {
     "idle_interval": 7200,
     "care_interval": 1800,
@@ -192,6 +196,36 @@ def _issue_has_skip_label(issue: dict) -> bool:
         if name.lower() in WORK_SKIP_LABELS:
             return True
     return False
+
+
+async def _reject_unverified_issues(issues: list[dict]) -> list[dict]:
+    """Comment on and close issues from unverified authors, return only verified ones.
+
+    This is a hard security boundary — the work loop must never execute
+    instructions from arbitrary GitHub users on a public repo.
+    """
+    verified = []
+    for issue in issues:
+        author = (issue.get("user") or {}).get("login", "").lower()
+        if author in ALLOWED_ISSUE_AUTHORS:
+            verified.append(issue)
+        else:
+            number = issue.get("number")
+            log.warning(
+                "Issue from unverified author — closing",
+                extra={"issue": number, "author": author},
+            )
+            if _github and number:
+                try:
+                    await _github.comment_issue(
+                        number,
+                        "Closing: this issue was opened by an unverified account. "
+                        "Only trusted contributors may submit issues for autonomous execution.",
+                    )
+                    await _github.close_issue(number)
+                except Exception:
+                    log.exception("Failed to close unverified issue", extra={"issue": number})
+    return verified
 
 
 async def _response_listener():
@@ -926,6 +960,12 @@ async def _work_loop():
             issues = [i for i in issues if not _issue_has_skip_label(i)]
             if not issues:
                 log.info("All open issues are draft or human-gated — skipping work cycle")
+                continue
+
+            # Reject and close issues from unverified authors (public repo attack surface)
+            issues = await _reject_unverified_issues(issues)
+            if not issues:
+                log.info("All open issues are from unverified authors — skipping work cycle")
                 continue
 
             issue = issues[0]  # Highest priority (list_issues sorts by P-label)
