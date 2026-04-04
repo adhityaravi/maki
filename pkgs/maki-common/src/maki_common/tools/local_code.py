@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +222,7 @@ def make_code_edit_tools(
     github_auth: Any | None = None,
     repo_owner: str = "",
     repo_name: str = "",
+    on_commit_success: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> list[tuple[str, str, dict[str, type], Any]]:
     """Write/commit/push tools — work on any git repo.
 
@@ -231,6 +233,8 @@ def make_code_edit_tools(
         github_auth: GitHubAuth instance for push authentication (optional).
         repo_owner: Repo owner (for remote URL on push).
         repo_name: Repo name (for remote URL on push).
+        on_commit_success: Optional async callback(sha, message) fired after a
+            successful push. Use this to persist episodic memory of what changed.
     """
 
     async def write_file(args: dict[str, Any]) -> dict[str, Any]:
@@ -287,7 +291,16 @@ def make_code_edit_tools(
 
             # Get commit SHA
             _, sha, _ = await _run_git(repo_path, "rev-parse", "--short", "HEAD")
-            return mcp_result(f"Committed and pushed ({sha.strip()}): {message}")
+            sha = sha.strip()
+
+            # Fire episodic memory callback — non-blocking, never fail the commit
+            if on_commit_success is not None:
+                try:
+                    await on_commit_success(sha, message)
+                except Exception:
+                    log.warning("on_commit_success callback failed", exc_info=True)
+
+            return mcp_result(f"Committed and pushed ({sha}): {message}")
         except Exception as e:
             return mcp_result(f"Error: {e}")
 

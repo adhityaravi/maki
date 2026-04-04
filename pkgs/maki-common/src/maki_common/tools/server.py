@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -185,6 +186,14 @@ def create_cortex_tools(
     if repo_path:
         from maki_common.tools.codegraph_tools import make_codegraph_tools
         from maki_common.tools.local_code import make_code_edit_tools, make_code_tools
+        from maki_common.subjects import MEMORY_STORE
+
+        async def _on_commit_success(sha: str, message: str) -> None:
+            """Publish an episodic memory to NATS after every successful push."""
+            content = f"committed and pushed {sha}: {message}"
+            payload = {"content": content, "source": "cortex", "user_id": "adi"}
+            await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
+            log.info("Commit memory published", extra={"sha": sha})
 
         all_tools.extend(make_code_tools(repo_path))
         all_tools.extend(
@@ -193,6 +202,7 @@ def create_cortex_tools(
                 github_auth=github_auth,
                 repo_owner=repo_owner or "",
                 repo_name=repo_name or "",
+                on_commit_success=_on_commit_success,
             )
         )
         all_tools.extend(make_codegraph_tools(repo_path))
