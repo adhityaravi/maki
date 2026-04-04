@@ -194,7 +194,7 @@ def make_code_tools(
     async def git_run(args: dict[str, Any]) -> dict[str, Any]:
         """Run an arbitrary git command."""
         raw_args = args.get("args", "")
-        log.info("Tool: git_run", extra={"args": raw_args})
+        log.info("Tool: git_run", extra={"git_args": raw_args})
         if not raw_args.strip():
             return mcp_result("Error: args is required (e.g. 'status', 'log --oneline -10').")
         try:
