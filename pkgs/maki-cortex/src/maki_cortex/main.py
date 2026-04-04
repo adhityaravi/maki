@@ -466,6 +466,7 @@ async def heartbeat_loop(nc):
                     "timestamp": time.time(),
                     "model": MODEL,
                     "session_id": SESSION_ID,
+                    "instance_id": os.environ.get("HOSTNAME", "unknown"),
                     "active_turn": _active_turn,
                     "turn_mode": _active_turn_mode,
                     "turn_started": _active_turn_started,

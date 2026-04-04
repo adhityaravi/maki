@@ -18,6 +18,16 @@ from pydantic import BaseModel, Field
 configure_logging()
 log = logging.getLogger(__name__)
 
+
+def _build_pg_uri() -> str:
+    user = quote_plus(os.environ.get("POSTGRES_USER", "maki"))
+    password = quote_plus(os.environ["POSTGRES_PASSWORD"])
+    hosts = os.environ.get("POSTGRES_HOST", "maki-vault")
+    port = os.environ.get("POSTGRES_PORT", "5432")
+    db = os.environ.get("POSTGRES_DB", "maki")
+    host_port = ",".join(f"{h}:{port}" for h in hosts.split(","))
+    return f"postgresql://{user}:{password}@{host_port}/{db}?target_session_attrs=read-write"
+
 config: dict[str, Any] = {
     "version": "v1.1",
     "vector_store": {
@@ -25,13 +35,7 @@ config: dict[str, Any] = {
         "config": {
             "collection_name": os.environ.get("POSTGRES_COLLECTION_NAME", "memories"),
             "embedding_model_dims": int(os.environ.get("EMBEDDING_DIMS", "768")),
-            "connection_string": "postgresql://{}:{}@{}:{}/{}".format(
-                quote_plus(os.environ.get("POSTGRES_USER", "maki")),
-                quote_plus(os.environ["POSTGRES_PASSWORD"]),
-                os.environ.get("POSTGRES_HOST", "maki-vault"),
-                os.environ.get("POSTGRES_PORT", "5432"),
-                os.environ.get("POSTGRES_DB", "maki"),
-            ),
+            "connection_string": _build_pg_uri(),
         },
     },
     "llm": {

@@ -141,7 +141,7 @@ _reminders_today: int = 0
 _reminders_today_date: str = ""
 _work_items_tonight: int = 0
 _work_items_tonight_date: str = ""
-_cortex_session_id: str | None = None
+_cortex_sessions: dict[str, str] = {}  # instance_id -> session_id
 _active_turns: dict[str, float] = {}  # turn_id → start timestamp
 _turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
@@ -207,8 +207,9 @@ async def _cortex_heartbeat_watcher():
     When cortex restarts mid-turn, its session_id changes. We detect this
     and cancel all pending turns immediately instead of waiting 30 minutes
     for the timeout.
+
+    Tracks sessions per instance_id to support multi-instance cortex.
     """
-    global _cortex_session_id
     sub = await _nc.subscribe(CORTEX_HEALTH)
     log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
     async for msg in sub.messages:
@@ -218,20 +219,23 @@ async def _cortex_heartbeat_watcher():
             if not session_id:
                 continue
 
-            if _cortex_session_id is None:
-                _cortex_session_id = session_id
-                log.info("Cortex session tracked", extra={"session_id": session_id})
+            instance_id = payload.get("instance_id", session_id)
+
+            if instance_id not in _cortex_sessions:
+                _cortex_sessions[instance_id] = session_id
+                log.info("Cortex session tracked", extra={"instance_id": instance_id, "session_id": session_id})
                 continue
 
-            if session_id != _cortex_session_id:
-                old_session = _cortex_session_id
-                _cortex_session_id = session_id
+            old_session = _cortex_sessions[instance_id]
+            if session_id != old_session:
+                _cortex_sessions[instance_id] = session_id
                 pending_keys = _pending.pending_keys()
                 if pending_keys:
                     cancelled = _pending.cancel_all()
                     log.warning(
                         "Cortex restarted — cancelled stale turns",
                         extra={
+                            "instance_id": instance_id,
                             "old_session": old_session,
                             "new_session": session_id,
                             "cancelled_turns": cancelled,
@@ -240,8 +244,8 @@ async def _cortex_heartbeat_watcher():
                     )
                 else:
                     log.info(
-                        "Cortex session changed (no pending turns)",
-                        extra={"old_session": old_session, "new_session": session_id},
+                        "Cortex instance restarted (no pending turns)",
+                        extra={"instance_id": instance_id, "old_session": old_session, "new_session": session_id},
                     )
         except Exception:
             log.exception("Error in cortex heartbeat watcher")

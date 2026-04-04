@@ -12,8 +12,8 @@ locals {
     "nats-route://maki-nerve-inu.xantu-city.ts.net:6222",
   ]
 
-  # Local PostgreSQL
-  postgres_host = "maki-vault"
+  # PostgreSQL — local first, then peers for leader failover
+  postgres_host = "maki-vault,maki-vault-sushi.xantu-city.ts.net,maki-vault-inu.xantu-city.ts.net"
 
   # Neo4j over tailnet (lives on sushitrash, accessed remotely)
   neo4j_uri    = "bolt://maki-graph-sushi.xantu-city.ts.net:7687"
