@@ -296,11 +296,7 @@ def make_code_edit_tools(
             # Fire episodic memory callback — non-blocking, never fail the commit
             if on_commit_success is not None:
                 try:
-                    repo_url = (
-                        f"https://github.com/{repo_owner}/{repo_name}"
-                        if repo_owner and repo_name
-                        else repo_name
-                    )
+                    repo_url = f"https://github.com/{repo_owner}/{repo_name}" if repo_owner and repo_name else repo_name
                     await on_commit_success(sha, message, repo_url)
                 except Exception:
                     log.warning("on_commit_success callback failed", exc_info=True)
@@ -340,7 +336,7 @@ def make_code_edit_tools(
 
         # Run ruff lint check
         try:
-            rc, stdout, stderr = await _run_cmd(repo_path, "ruff", "check", path_filter)
+            rc, stdout, stderr = await _run_cmd(repo_path, "uvx", "ruff", "check", path_filter)
             if rc == 0:
                 results.append("✅ ruff check (lint): passed")
             else:
@@ -348,12 +344,12 @@ def make_code_edit_tools(
                 output = stdout or stderr
                 results.append(f"❌ ruff check (lint): FAILED\n{output}")
         except FileNotFoundError:
-            results.append("⚠️ ruff not found — install with: pip install ruff")
+            results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
 
         # Run ruff format check
         try:
-            rc, stdout, stderr = await _run_cmd(repo_path, "ruff", "format", "--check", path_filter)
+            rc, stdout, stderr = await _run_cmd(repo_path, "uvx", "ruff", "format", "--check", path_filter)
             if rc == 0:
                 results.append("✅ ruff format: passed")
             else:
@@ -361,7 +357,7 @@ def make_code_edit_tools(
                 output = stdout or stderr
                 results.append(f"❌ ruff format: FAILED\n{output}")
         except FileNotFoundError:
-            results.append("⚠️ ruff not found — install with: pip install ruff")
+            results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
 
         summary = "ALL CHECKS PASSED ✅" if all_passed else "CHECKS FAILED ❌ — fix issues before pushing"
