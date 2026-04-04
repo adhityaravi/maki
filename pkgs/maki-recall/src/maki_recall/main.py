@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 configure_logging()
 log = logging.getLogger(__name__)
 
-config = {
+config: dict[str, Any] = {
     "version": "v1.1",
     "vector_store": {
         "provider": "pgvector",
@@ -32,14 +32,6 @@ config = {
                 os.environ.get("POSTGRES_PORT", "5432"),
                 os.environ.get("POSTGRES_DB", "maki"),
             ),
-        },
-    },
-    "graph_store": {
-        "provider": "neo4j",
-        "config": {
-            "url": os.environ.get("NEO4J_URI", "bolt://maki-graph:7687"),
-            "username": os.environ.get("NEO4J_USERNAME", "neo4j"),
-            "password": os.environ["NEO4J_PASSWORD"],
         },
     },
     "llm": {
@@ -62,18 +54,40 @@ config = {
     "history_db_path": os.environ.get("HISTORY_DB_PATH", "/data/history.db"),
 }
 
+neo4j_uri = os.environ.get("NEO4J_URI", "")
+graph_enabled = False
+
+if neo4j_uri:
+    config["graph_store"] = {
+        "provider": "neo4j",
+        "config": {
+            "url": neo4j_uri,
+            "username": os.environ.get("NEO4J_USERNAME", "neo4j"),
+            "password": os.environ.get("NEO4J_PASSWORD", ""),
+        },
+    }
+
 log.info(
     "Initializing Mem0",
     extra={
         "vector_store": "pgvector",
-        "graph_store": "neo4j",
+        "graph_store": "neo4j" if neo4j_uri else "disabled",
         "llm_provider": config["llm"]["provider"],
         "llm_model": config["llm"]["config"]["model"],
         "embedder_model": config["embedder"]["config"]["model"],
     },
 )
 
-memory = Memory.from_config(config)
+try:
+    memory = Memory.from_config(config)
+    graph_enabled = "graph_store" in config
+except Exception:
+    if "graph_store" in config:
+        log.warning("Graph store unreachable, falling back to vector-only")
+        del config["graph_store"]
+        memory = Memory.from_config(config)
+    else:
+        raise
 
 app = FastAPI(title="maki-recall", version="0.0.1")
 
@@ -96,7 +110,7 @@ class SearchRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "graph": graph_enabled}
 
 
 @app.post("/memories")

@@ -10,31 +10,28 @@ resource "kubernetes_config_map" "patroni" {
       scope = var.patroni_scope
       name  = var.patroni_name
 
-      raft = merge(
-        {
-          data_dir = "/var/lib/raft"
-        },
-        var.raft_self_addr != "" ? {
-          self_addr    = var.raft_self_addr
-          partner_addrs = var.raft_partner_addrs
-        } : {}
-      )
+      raft = {
+        data_dir      = "/var/lib/raft"
+        self_addr     = var.raft_self_addr != "" ? var.raft_self_addr : "127.0.0.1:2222"
+        partner_addrs = var.raft_partner_addrs
+      }
 
       restapi = {
-        listen         = "0.0.0.0:8008"
+        listen          = "0.0.0.0:8008"
         connect_address = "${var.patroni_name}:8008"
       }
 
       bootstrap = {
         dcs = {
-          ttl                   = 30
-          loop_wait             = 10
-          retry_timeout         = 10
+          ttl                     = 30
+          loop_wait               = 10
+          retry_timeout           = 10
           maximum_lag_on_failover = 1048576
         }
         initdb = [
           { encoding = "UTF8" },
-          "data-checksums"
+          "data-checksums",
+          { "username" = "maki" }
         ]
         pg_hba = [
           "local all all trust",
@@ -45,25 +42,23 @@ resource "kubernetes_config_map" "patroni" {
       }
 
       postgresql = {
-        listen         = "0.0.0.0:5432"
+        listen          = "0.0.0.0:5432"
         connect_address = "${var.patroni_name}:5432"
-        data_dir       = "/var/lib/postgresql/data/pgdata"
-        pgpass         = "/tmp/pgpass"
+        data_dir        = "/var/lib/postgresql/data/pgdata"
+        pgpass          = "/tmp/pgpass"
         authentication = {
           superuser = {
-            username = "postgres"
-            password = "__POSTGRES_PASSWORD__"
+            username = "maki"
           }
           replication = {
             username = "replicator"
-            password = "__REPLICATION_PASSWORD__"
           }
         }
         parameters = {
-          max_connections    = 100
-          shared_buffers     = "128MB"
-          wal_level          = "replica"
-          max_wal_senders    = 5
+          max_connections       = 100
+          shared_buffers        = "128MB"
+          wal_level             = "replica"
+          max_wal_senders       = 5
           max_replication_slots = 5
         }
       }
@@ -72,9 +67,9 @@ resource "kubernetes_config_map" "patroni" {
     "post-bootstrap.sh" = <<-EOT
       #!/bin/bash
       set -e
-      psql -U postgres -d postgres -c "CREATE USER maki WITH PASSWORD '$POSTGRES_PASSWORD';" || true
-      psql -U postgres -d postgres -c "CREATE DATABASE maki OWNER maki;" || true
-      psql -U postgres -d maki -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
+      psql -U maki -d postgres -c "CREATE DATABASE maki OWNER maki;"
+      psql -U maki -d maki -c "CREATE EXTENSION IF NOT EXISTS vector;"
+      psql -U maki -d maki -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '$PATRONI_REPLICATION_PASSWORD';"
     EOT
   }
 }
@@ -137,20 +132,27 @@ resource "kubernetes_stateful_set" "vault" {
         }
       }
       spec {
+        init_container {
+          name    = "fix-permissions"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "chown -R 999:999 /var/lib/postgresql/data /var/lib/raft && chmod -R 0700 /var/lib/postgresql/data"]
+          volume_mount {
+            name       = "data"
+            mount_path = "/var/lib/postgresql/data"
+          }
+          volume_mount {
+            name       = "raft-data"
+            mount_path = "/var/lib/raft"
+          }
+        }
         container {
-          name  = "patroni"
-          image = "${var.image_registry}/maki-vault:latest"
+          name              = "patroni"
+          image             = "${var.image_registry}/maki-vault:latest"
           image_pull_policy = "Always"
-
-          command = ["/bin/bash", "-c"]
-          args = [
-            <<-EOT
-            # Inject secrets into patroni config
-            sed "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g; s/__REPLICATION_PASSWORD__/$REPLICATION_PASSWORD/g" \
-              /etc/patroni/patroni.yml > /tmp/patroni.yml
-            exec patroni /tmp/patroni.yml
-            EOT
-          ]
+          command           = ["patroni", "/etc/patroni/patroni.yml"]
+          security_context {
+            run_as_user = 999
+          }
 
           port {
             name           = "postgres"
@@ -166,7 +168,7 @@ resource "kubernetes_stateful_set" "vault" {
           }
 
           env {
-            name = "POSTGRES_PASSWORD"
+            name = "PATRONI_SUPERUSER_PASSWORD"
             value_from {
               secret_key_ref {
                 name = "maki-vault-secret"
@@ -175,7 +177,7 @@ resource "kubernetes_stateful_set" "vault" {
             }
           }
           env {
-            name = "REPLICATION_PASSWORD"
+            name = "PATRONI_REPLICATION_PASSWORD"
             value_from {
               secret_key_ref {
                 name = "maki-vault-secret"

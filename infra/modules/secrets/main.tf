@@ -45,8 +45,6 @@ resource "kubernetes_secret" "vault_secret" {
 }
 
 resource "kubernetes_secret" "graph_auth" {
-  count = var.enable_graph ? 1 : 0
-
   metadata {
     name      = "maki-graph-auth"
     namespace = var.namespace
