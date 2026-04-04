@@ -48,6 +48,9 @@ SESSION_ID = uuid.uuid4().hex[:12]
 
 _semaphore = asyncio.Semaphore(1)
 
+# Hoisted from main() so handle_turn_request can use it for auto-pull
+_github_private_key: str | None = None
+
 # Active turn tracking — exposed via heartbeat for immune awareness
 _active_turn: str | None = None
 _active_turn_mode: str | None = None
@@ -399,6 +402,43 @@ async def handle_turn_request(msg, nc, mcp_server):
         _active_turn_mode = mode
         _active_turn_started = time.time()
 
+        # Auto-pull latest code before work turns
+        if is_work and os.path.exists(REPO_PATH):
+            try:
+                if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
+                    from maki_common.tools.github import GitHubAuth
+
+                    _auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
+                    _token = await _auth.get_token()
+                    _url = f"https://x-access-token:{_token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
+                    proc = await asyncio.create_subprocess_exec(
+                        "git",
+                        "-C",
+                        REPO_PATH,
+                        "remote",
+                        "set-url",
+                        "origin",
+                        _url,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                proc = await asyncio.create_subprocess_exec(
+                    "git",
+                    "-C",
+                    REPO_PATH,
+                    "pull",
+                    "--rebase",
+                    "origin",
+                    "main",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, stderr_bytes = await proc.communicate()
+                log.info("Auto-pull before work", extra={"rc": proc.returncode, "turn_id": turn_id})
+            except Exception:
+                log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
+
         system_prompt = build_system_prompt(turn)
         full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
 
@@ -504,10 +544,12 @@ async def main():
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
 
     # Load GitHub App private key if configured
+    global _github_private_key
     github_private_key = None
     if GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
         with open(GITHUB_PRIVATE_KEY_PATH) as f:
             github_private_key = f.read()
+        _github_private_key = github_private_key
         log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
     # Clone or pull the repo for self-evolution tools

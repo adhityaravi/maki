@@ -80,6 +80,8 @@ jobs:
         run: uvx ruff check pkgs/
       - name: Format check
         run: uvx ruff format --check pkgs/
+      - name: Type check
+        run: uvx ty check pkgs/
 
   status:
     runs-on: ubuntu-latest

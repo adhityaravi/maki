@@ -229,16 +229,12 @@ def make_code_tools(
             search_text,
         ),
         (
-            "git_status",
-            "Show git status (short format).",
-            {},
-            git_status,
-        ),
-        (
-            "git_diff",
-            "Show git diff of unstaged changes. Optionally filter by file path.",
-            {"path": str},
-            git_diff,
+            "git_run",
+            "Run any git command. Pass the arguments as a string (everything after 'git'). "
+            "Examples: 'status', 'log --oneline -10', 'diff HEAD~1', 'show HEAD:path/to/file', "
+            "'blame path/to/file', 'branch -a'.",
+            {"args": str},
+            git_run,
         ),
     ]
 
@@ -277,6 +273,37 @@ def make_code_edit_tools(
             return mcp_result(f"Written {len(content)} bytes to {path}")
         except Exception as e:
             return mcp_result(f"Error writing file: {e}")
+
+    async def edit_file(args: dict[str, Any]) -> dict[str, Any]:
+        """Edit a file using search-and-replace."""
+        path = args.get("path", "")
+        old_text = args.get("old_text", "")
+        new_text = args.get("new_text", "")
+        log.info("Tool: edit_file", extra={"path": path, "old_len": len(old_text), "new_len": len(new_text)})
+        if not old_text:
+            return mcp_result("Error: old_text is required.")
+        resolved = _safe_path(repo_path, path)
+        if not resolved:
+            return mcp_result(f"Error: path '{path}' is outside the repository.")
+        if not resolved.is_file():
+            return mcp_result(f"Error: '{path}' does not exist or is not a file.")
+        try:
+            content = resolved.read_text(encoding="utf-8")
+            count = content.count(old_text)
+            if count == 0:
+                return mcp_result("Error: old_text not found in file. Provide exact text including whitespace.")
+            if count > 1:
+                return mcp_result(
+                    f"Error: old_text found {count} times — ambiguous. Include more context to make it unique."
+                )
+            # Find line number of the match
+            before = content[: content.index(old_text)]
+            line_num = before.count("\n") + 1
+            new_content = content.replace(old_text, new_text, 1)
+            resolved.write_text(new_content, encoding="utf-8")
+            return mcp_result(f"Edited {path} at line {line_num} ({len(old_text)} chars -> {len(new_text)} chars)")
+        except Exception as e:
+            return mcp_result(f"Error editing file: {e}")
 
     async def git_commit_and_push(args: dict[str, Any]) -> dict[str, Any]:
         """Stage files, commit, and push to remote."""
@@ -391,6 +418,19 @@ def make_code_edit_tools(
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
 
+        # Run ty type check
+        try:
+            rc, stdout, stderr = await _run_cmd(repo_path, "uvx", "ty", "check", path_filter)
+            if rc == 0:
+                results.append("✅ ty check (types): passed")
+            else:
+                all_passed = False
+                output = stdout or stderr
+                results.append(f"❌ ty check (types): FAILED\n{output}")
+        except FileNotFoundError:
+            results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
+            all_passed = False
+
         summary = "ALL CHECKS PASSED ✅" if all_passed else "CHECKS FAILED ❌ — fix issues before pushing"
         return mcp_result(f"{summary}\n\n" + "\n\n".join(results))
 
@@ -401,6 +441,14 @@ def make_code_edit_tools(
             "Creates parent directories if needed. Provide the full file content.",
             {"path": str, "content": str},
             write_file,
+        ),
+        (
+            "edit_file",
+            "Edit a file using search-and-replace. Provide the exact old_text to find and new_text to replace it with. "
+            "old_text must match exactly (including whitespace/indentation) and appear exactly once. "
+            "Much more efficient than read_file + write_file for small changes.",
+            {"path": str, "old_text": str, "new_text": str},
+            edit_file,
         ),
         (
             "git_commit_and_push",
@@ -417,7 +465,7 @@ def make_code_edit_tools(
         ),
         (
             "quality_check",
-            "Run ruff lint and format checks on the codebase. "
+            "Run ruff lint, ruff format, and ty type checks on the codebase. "
             "Call this BEFORE git_commit_and_push to catch CI failures early. "
             "Optionally pass a path to check (default: pkgs/).",
             {"path": str},

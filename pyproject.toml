@@ -13,5 +13,60 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
+[tool.ty]
+
+[tool.ty.environment]
+# Workspace package source roots — lets ty resolve cross-package imports
+root = [
+    "pkgs/maki-common/src",
+    "pkgs/maki-cortex/src",
+    "pkgs/maki-stem/src",
+    "pkgs/maki-immune/src",
+    "pkgs/maki-ears/src",
+    "pkgs/maki-recall/src",
+    "pkgs/maki-synapse/src",
+]
+python-version = "3.12"
+
+[tool.ty.rules]
+# Module-level globals (e.g. _nc = None) passed to functions / accessed
+unresolved-attribute = "warn"
+invalid-argument-type = "warn"
+# proc.returncode is int|None but always set after communicate()
+invalid-return-type = "warn"
+
+[tool.ty.analysis]
+# Bundled ELF binary + third-party deps without stubs
+allowed-unresolved-imports = [
+    "claude_agent_sdk",
+    "claude_agent_sdk.**",
+    "nats",
+    "nats.**",
+    "structlog",
+    "structlog.**",
+    "httpx",
+    "httpx.**",
+    "jwt",
+    "jwt.**",
+    "fastapi",
+    "fastapi.**",
+    "pydantic",
+    "pydantic.**",
+    "uvicorn",
+    "uvicorn.**",
+    "tree_sitter",
+    "tree_sitter.**",
+    "tree_sitter_python",
+    "tree_sitter_python.**",
+    "tree_sitter_go",
+    "tree_sitter_go.**",
+    "kubernetes",
+    "kubernetes.**",
+    "mem0",
+    "mem0.**",
+    "discord",
+    "discord.**",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["pkgs"]
