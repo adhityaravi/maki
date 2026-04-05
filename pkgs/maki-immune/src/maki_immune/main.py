@@ -1358,6 +1358,18 @@ async def _deploy_propagate_handler(msg):
             return
 
         if not await _acquire_lock("immune-deploy", ttl=180):
+            # Check if we're already on the target image (e.g. canary receiving
+            # its own propagation, or manual update already applied).
+            # No alert needed — just skip.
+            try:
+                dep = await asyncio.to_thread(
+                    _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
+                )
+                if dep.spec.template.spec.containers[0].image == image:
+                    log.info("Lock held but already on target image, skipping", extra={"deployment": deployment_name})
+                    return
+            except Exception:
+                pass
             await _publish_alert(f"Cannot propagate deploy of {deployment_name} — lock held")
             return
 
