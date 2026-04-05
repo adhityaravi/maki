@@ -236,7 +236,7 @@ def create_cortex_tools(
         )
         all_tools.extend(make_codegraph_tools(repo_path))
 
-    # GitHub CI tools (trigger builds, check status) — still needs API
+    # GitHub CI tools (check workflow status, logs) — needs API
     if github_app_id and github_private_key and github_installation_id and repo_owner and repo_name:
         from maki_common.tools.github import make_github_ci_tools, make_github_issues_tools
 

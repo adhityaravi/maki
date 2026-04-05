@@ -1,4 +1,4 @@
-"""GitHub API tools — CI/CD operations (builds, workflow status, logs)."""
+"""GitHub API tools — CI/CD operations (workflow status, logs)."""
 
 from __future__ import annotations
 
@@ -69,30 +69,13 @@ def make_github_ci_tools(
 ) -> list[tuple[str, str, dict[str, type], Any]]:
     """Return (name, description, params, handler) tuples for GitHub CI tools.
 
-    These tools handle CI/CD operations only (triggering builds, checking
-    workflow status, reading logs). File read/write is handled by local_code tools.
+    These tools handle CI/CD operations only (checking workflow status,
+    reading logs). Docker builds happen automatically via CI on push.
     """
 
     auth = GitHubAuth(app_id, private_key, installation_id)
     repo = f"{repo_owner}/{repo_name}"
     client = httpx.AsyncClient(timeout=30.0)
-
-    async def trigger_docker_build(args: dict[str, Any]) -> dict[str, Any]:
-        """Trigger the Docker build workflow for specified services."""
-        services = args.get("services", "")
-        log.info("Tool: trigger_docker_build", extra={"services": services})
-        try:
-            resp = await client.post(
-                f"{API}/repos/{repo}/actions/workflows/docker.yml/dispatches",
-                headers=await auth.headers(),
-                json={"ref": "main", "inputs": {"services": services}},
-            )
-            resp.raise_for_status()
-            return mcp_result(f"Docker build triggered for: {services or 'all services'}")
-        except httpx.HTTPStatusError as e:
-            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
-        except Exception as e:
-            return mcp_result(f"Error: {e}")
 
     async def get_workflow_status(args: dict[str, Any]) -> dict[str, Any]:
         """Get the status of recent workflow runs."""
@@ -183,16 +166,9 @@ def make_github_ci_tools(
 
     return [
         (
-            "trigger_docker_build",
-            "Trigger a Docker image build for specified services (comma-separated, e.g. 'cortex,ears'). "
-            "Leave empty to build all changed services.",
-            {"services": str},
-            trigger_docker_build,
-        ),
-        (
             "get_workflow_status",
-            "Get the status of recent GitHub Actions workflow runs. "
-            "Optionally filter by workflow filename (e.g. 'docker.yml', 'ci.yml').",
+            "Get the status of recent GitHub Actions CI workflow runs. "
+            "Optionally filter by workflow filename (e.g. 'ci.yml').",
             {"workflow": str},
             get_workflow_status,
         ),
