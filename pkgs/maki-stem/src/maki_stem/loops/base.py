@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from croniter import croniter
-
 from maki_common import load_kv_config, try_claim_loop
 
 log = logging.getLogger(__name__)
