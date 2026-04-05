@@ -658,8 +658,8 @@ async def _refresh_running_images():
     global _running_images
     if not _k8s_apps_v1:
         return
+    images: dict[str, str] = {}
     try:
-        images: dict[str, str] = {}
         deps = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_deployment, namespace=NAMESPACE)
         for dep in deps.items:
             name = dep.metadata.name
@@ -668,7 +668,10 @@ async def _refresh_running_images():
             img = dep.spec.template.spec.containers[0].image
             # Extract tag from full image URL
             images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
+    except Exception:
+        log.exception("Failed to refresh deployment images")
 
+    try:
         sts_list = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_stateful_set, namespace=NAMESPACE)
         for sts in sts_list.items:
             name = sts.metadata.name
@@ -679,10 +682,11 @@ async def _refresh_running_images():
             if "ghcr.io" not in img:
                 continue
             images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
-
-        _running_images = images
     except Exception:
-        log.exception("Failed to refresh running images")
+        log.exception("Failed to refresh statefulset images")
+
+    if images:
+        _running_images = images
 
 
 async def _gossip_publisher():

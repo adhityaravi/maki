@@ -26,6 +26,9 @@ rules:
     resources: ["deployments/scale"]
     verbs: ["get", "patch"]
   - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["get", "list"]
 ---
