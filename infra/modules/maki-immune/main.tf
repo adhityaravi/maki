@@ -37,6 +37,11 @@ resource "kubernetes_role" "immune" {
   }
   rule {
     api_groups = ["apps"]
+    resources  = ["statefulsets"]
+    verbs      = ["get", "list"]
+  }
+  rule {
+    api_groups = ["apps"]
     resources  = ["replicasets"]
     verbs      = ["get", "list"]
   }
