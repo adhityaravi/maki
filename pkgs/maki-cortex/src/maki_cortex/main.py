@@ -353,21 +353,30 @@ def build_system_prompt(turn: dict) -> str:
     if session_summary:
         parts.append("## Session context\n" + session_summary)
 
-    conversation = turn.get("conversation", [])
-    if conversation:
-        conv_lines = []
-        for msg in conversation:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            conv_lines.append(f"{role}: {content}")
-        parts.append("## Recent conversation\n" + "\n".join(conv_lines))
-
     # Only include the tools listing for modes that use MCP tools directly —
     # normal turns use the Claude API with MCP tools and don't need the text listing
     if turn.get("mode") in ("idle_reflection", "care", "work"):
         parts.append(TOOLS_PROMPT)
 
     return "\n\n".join(parts)
+
+
+def build_conversation_prompt(turn: dict) -> str:
+    """Return conversation history wrapped in XML tags.
+
+    Kept separate from the system prompt so that injected or replayed
+    ``user:``/``assistant:`` lines in context cannot be mistaken for live
+    turns by the model.
+    """
+    conversation = turn.get("conversation", [])
+    if not conversation:
+        return ""
+    conv_lines = []
+    for msg in conversation:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        conv_lines.append(f'<turn role="{role}">{content}</turn>')
+    return "<conversation_history>\n" + "\n".join(conv_lines) + "\n</conversation_history>"
 
 
 async def handle_turn_request(msg, nc, mcp_server):
@@ -439,8 +448,18 @@ async def handle_turn_request(msg, nc, mcp_server):
             except Exception:
                 log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
 
-        system_prompt = build_system_prompt(turn)
-        full_prompt = f"{system_prompt}\n\n---\n\n{prompt}" if system_prompt else prompt
+        static_context = build_system_prompt(turn)
+        conv_context = build_conversation_prompt(turn)
+
+        # Conversation history is XML-tagged and prepended to the human prompt —
+        # never mixed into the system prompt — so injected role: lines cannot
+        # be confused with live turns.
+        human_parts = []
+        if conv_context:
+            human_parts.append(conv_context)
+        if prompt:
+            human_parts.append(prompt)
+        full_prompt = "\n\n".join(human_parts) if human_parts else ""
 
         if is_idle or is_care or is_work:
             # Single-shot with tools — idle/care/work modes
@@ -452,6 +471,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                 max_turns=effective_max_turns,
                 mcp_servers={"maki": mcp_server},
                 mode=mode,
+                system_prompt=static_context or None,
             )
             response = {"turn_id": turn_id, "response": response_text, "done": True}
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
@@ -468,6 +488,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                     mcp_servers={"maki": mcp_server},
                     mode=mode,
                     usage_out=usage_out,
+                    system_prompt=static_context or None,
                 ):
                     response = {"turn_id": turn_id, "response": chunk, "done": False}
                     await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())

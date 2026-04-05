@@ -79,28 +79,35 @@ async def invoke_claude(
     max_turns: int = 1,
     mcp_servers: dict[str, Any] | None = None,
     mode: str = "",
+    system_prompt: str | None = None,
 ) -> tuple[str, TokenUsage]:
     """Claude invocation via Agent SDK.
 
     Args:
-        prompt: The full prompt to send.
+        prompt: The human turn prompt (current message + XML-tagged conversation history).
         model: Claude model ID.
         semaphore: Optional concurrency limiter.
         max_turns: Max agentic turns (default 1 for single-shot).
         mcp_servers: Optional MCP servers for tool use.
         mode: Turn mode label for usage tracking (e.g. "idle_reflection", "work").
+        system_prompt: Static system context (identity, memories, graph). Kept
+            separate from the human prompt so conversation history cannot bleed
+            into the system context and vice versa.
 
     Returns:
         Tuple of (response_text, token_usage).
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
 
-    options = ClaudeAgentOptions(
+    options_kwargs: dict[str, Any] = dict(
         model=model,
         permission_mode="bypassPermissions",
         max_turns=max_turns,
         mcp_servers=mcp_servers or {},
     )
+    if system_prompt:
+        options_kwargs["system_prompt"] = system_prompt
+    options = ClaudeAgentOptions(**options_kwargs)
 
     async def _invoke() -> tuple[str, TokenUsage]:
         text_parts: list[str] = []
@@ -144,6 +151,7 @@ async def stream_claude(
     mcp_servers: dict[str, Any] | None = None,
     mode: str = "",
     usage_out: list[TokenUsage] | None = None,
+    system_prompt: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream Claude responses, yielding each assistant text block as it arrives.
 
@@ -153,15 +161,21 @@ async def stream_claude(
     Args:
         usage_out: If provided, a TokenUsage object is appended to this list
                    when the stream completes (from ResultMessage).
+        system_prompt: Static system context (identity, memories, graph). Kept
+            separate from the human prompt so conversation history cannot bleed
+            into the system context and vice versa.
     """
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
 
-    options = ClaudeAgentOptions(
+    options_kwargs: dict[str, Any] = dict(
         model=model,
         permission_mode="bypassPermissions",
         max_turns=max_turns,
         mcp_servers=mcp_servers or {},
     )
+    if system_prompt:
+        options_kwargs["system_prompt"] = system_prompt
+    options = ClaudeAgentOptions(**options_kwargs)
 
     async def _stream() -> AsyncIterator[str]:
         t0 = time.monotonic()
