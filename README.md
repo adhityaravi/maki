@@ -16,7 +16,7 @@
 
 A persistent, self-evolving AI companion running across three geographically separated sites. Not a chatbot. Not a wrapper around an API. Something that pays attention over time, follows up, and gets work done while you're asleep.
 
-Built on the Claude Agent SDK. Backed by PostgreSQL vector memory and a Neo4j knowledge graph. Wired together with NATS JetStream. Hard to kill by design.
+Built on Claude Code. Backed by PostgreSQL vector memory and a Neo4j knowledge graph. Wired together with NATS JetStream. Hard to kill by design.
 
 ---
 
@@ -139,11 +139,11 @@ graph LR
 
 **stem** — The coordinator. Assembles context for each turn: retrieves relevant memories, gathers system state, builds conversation history, publishes the full package to cortex. Runs the idle/care/work loops. Relays Discord messages. Feeds completed turns back into memory.
 
-**cortex** — The thinker. Claude Agent SDK backed reasoning engine. Subscribes to turn requests on NATS, invokes Claude with the full assembled context (identity + memories + graph relationships + conversation history + system state), streams responses back chunk by chunk. Processes one turn at a time. Has a heartbeat so stem can detect restarts mid-turn and cancel pending work immediately instead of timing out.
+**cortex** — The thinker. Claude Code backed reasoning engine. Subscribes to turn requests on NATS, invokes Claude with the full assembled context (identity + memories + graph relationships + conversation history + system state), streams responses back chunk by chunk. Processes one turn at a time. Has a heartbeat so stem can detect restarts mid-turn and cancel pending work immediately instead of timing out.
 
 **recall** — Memory. REST API backed by [Mem0](https://github.com/mem0ai/mem0), using pgvector for semantic search and Neo4j for relationship graph. After every turn, stem feeds the interaction here — Mem0 extracts what matters. Relevant memories surface automatically on future turns, scored by relevance, deduplicated.
 
-**synapse** — OpenAI-compatible proxy. Translates standard `POST /v1/chat/completions` requests into Claude SDK calls using the host's Claude OAuth subscription. Recall uses it internally so Mem0's LLM-based memory extraction runs on Claude without needing a separate API key.
+**synapse** — OpenAI-compatible proxy. Translates standard `POST /v1/chat/completions` requests into Claude Code calls. Recall uses it internally so Mem0's LLM-based memory extraction runs on Claude without needing a separate API key.
 
 **ears** — Discord interface. Listens in `#maki-general` and DMs, bridges messages in and responses out via NATS pub/sub. Also routes idle thoughts, care reminders, immune vitals, and alerts to their respective channels.
 
@@ -250,7 +250,7 @@ Most of the code in this codebase was ideated and written this way.
 
 | Layer | Tech |
 |-------|------|
-| Reasoning | Claude Agent SDK · claude-sonnet |
+| Reasoning | Claude Code · claude-sonnet |
 | Messaging | NATS JetStream · 3-node geo-distributed quorum |
 | Memory | Mem0 · pgvector |
 | Graph | Neo4j |
