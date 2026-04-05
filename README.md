@@ -195,8 +195,8 @@ Three background loops run on cron schedule. They use the same cortex pipeline a
 | Loop | Schedule | What it does |
 |------|----------|-------------|
 | **care** | daily 08:00 | Checks in. Surfaces things said and not followed up on. Patterns worth noting. Deadlines. If there's genuinely nothing worth saying → silent. |
-| **idle** | weekdays 21:00 | Reads its own source code. Files issues. Cleans up stale ones. Stores learnings. Improves its own prompts and identity. Observe-only — no writes, no deploys. |
-| **work** | weeknights 01:00–05:00 | Picks up GitHub issues, implements them, runs quality checks, commits, pushes, deploys. Closes the issue when done. Adds `human` label and stops if something needs a judgment call it can't make. |
+| **idle** | Sun/Mon/Wed/Fri 21:00 | Reads its own source code. Files issues. Cleans up stale ones. Stores learnings. Improves its own prompts and identity. Observe-only — no writes, no deploys. |
+| **work** | Tue/Thu/Sat 21:00 | Picks up GitHub issues, implements them, runs quality checks, commits, pushes, deploys. Closes the issue when done. Adds `human` label and stops if something needs a judgment call it can't make. |
 
 </div>
 
@@ -209,11 +209,11 @@ gantt
     section care
     check-in :crit, 08:00, 30m
 
-    section idle (weekdays)
+    section idle (Sun/Mon/Wed/Fri)
     reflection + filing :21:00, 1h
 
-    section work (weeknights)
-    issue execution :01:00, 4h
+    section work (Tue/Thu/Sat)
+    issue execution :21:00, 1h
 ```
 
 ---
