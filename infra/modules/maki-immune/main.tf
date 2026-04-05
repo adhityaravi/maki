@@ -86,6 +86,11 @@ resource "kubernetes_deployment" "immune" {
       app = "maki-immune"
     }
   }
+  lifecycle {
+    ignore_changes = [
+      spec[0].template[0].spec[0].container[0].image,
+    ]
+  }
   spec {
     replicas = 1
     selector {

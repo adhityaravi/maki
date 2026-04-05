@@ -131,6 +131,10 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         if config_updates:
             await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
 
+        # [SILENT] means cortex had nothing to say — don't publish
+        if "[SILENT]" in (thought or ""):
+            clean_thought = ""
+
         if clean_thought:
             thought_payload = {"thought": clean_thought, "turn_id": turn_id}
             await ctx.nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())

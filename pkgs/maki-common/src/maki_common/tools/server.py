@@ -125,6 +125,32 @@ def create_immune_tools(
         all_tools.extend(make_code_tools(repo_path))
         all_tools.extend(make_codegraph_tools(repo_path))
 
+    # Cross-site query tool — ask a specific site's immune for rich state
+    from maki_common.subjects import IMMUNE_SITE_QUERY
+
+    async def _query_site(site_name: str) -> str:
+        """Query a remote site's immune for detailed state."""
+        subject = f"{IMMUNE_SITE_QUERY}.{site_name}"
+        try:
+            resp = await nc.request(subject, b"{}", timeout=10.0)
+            data = json.loads(resp.data.decode())
+            if not data:
+                return f"Site '{site_name}' returned empty response — may be unreachable."
+            return json.dumps(data, indent=2, default=str)
+        except Exception as e:
+            return f"Failed to query site '{site_name}': {e}"
+
+    all_tools.append(
+        (
+            "query_site",
+            "Query a remote site's immune for detailed state: component health with latency/restarts/metrics, "
+            "running image tags, deploy history, recent actions, lock status, cortex state, and blacklist. "
+            "Use this when gossip shows a problem on another site and you need to investigate deeper.",
+            {"site_name": {"type": "string", "description": "The site name to query (e.g. 'sushi', 'ramen', 'inu')"}},
+            _query_site,
+        )
+    )
+
     sdk_tools = []
     for name, description, params, handler in all_tools:
         decorated = tool(name, description, params)(handler)

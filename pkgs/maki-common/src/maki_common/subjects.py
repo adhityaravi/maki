@@ -20,6 +20,7 @@ IMMUNE_ACTION = "maki.immune.action"
 IMMUNE_ALERT = "maki.immune.alert"
 IMMUNE_STATE_REQUEST = "maki.immune.state"
 IMMUNE_COMMAND = "maki.immune.command"
+IMMUNE_SITE_QUERY = "maki.immune.site"  # append .{site_name} at runtime
 
 # Deploy coordination
 DEPLOY_REQUEST = "maki.deploy.request"

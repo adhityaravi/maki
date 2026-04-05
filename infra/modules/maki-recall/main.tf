@@ -25,6 +25,11 @@ resource "kubernetes_deployment" "recall" {
       app = "maki-recall"
     }
   }
+  lifecycle {
+    ignore_changes = [
+      spec[0].template[0].spec[0].container[0].image,
+    ]
+  }
   spec {
     replicas = 1
     selector {

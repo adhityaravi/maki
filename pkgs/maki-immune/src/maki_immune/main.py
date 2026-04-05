@@ -30,6 +30,7 @@ from maki_common.subjects import (
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
     IMMUNE_HEALTH,
+    IMMUNE_SITE_QUERY,
     IMMUNE_STATE_REQUEST,
 )
 
@@ -53,6 +54,7 @@ HEALTH_ENDPOINTS = {
 }
 
 VITALS_STREAM = "maki-vitals"
+DEPLOY_STREAM = "maki-deploy"
 CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
@@ -125,6 +127,8 @@ catch them, remember them, never repeat them. You are the last line. Nothing get
 - **get_pod_logs** (pod_name, tail_lines) — recent logs (default 100)
 - **get_k8s_events** (involved_object) — K8s events, filtered by object
 - **get_deployment_status** (deployment_name) — replicas, conditions, images
+- **query_site** (site_name) — query a remote site's immune for rich state (health, metrics, images, \
+deploys, actions). Use when gossip shows a problem on another site and you need details.
 
 ### Remediation (requires lock)
 - **restart_pod** (pod_name, reason) — delete pod for recreation
@@ -223,11 +227,17 @@ _hive_state: dict[str, dict] = {}
 
 
 async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
-    """Acquire infrastructure lock. Returns True if acquired."""
+    """Acquire infrastructure lock with server-side TTL.
+
+    Uses NATS KV msg_ttl so the lock auto-expires even if the pod crashes
+    mid-deploy (fixes orphaned lock problem — issue #56).
+    """
     try:
         try:
             entry = await _lock_kv.get("infrastructure")
             lock_data = json.loads(entry.value.decode())
+            # Still check software TTL for backwards compat with entries
+            # written before server-side TTL was added
             if time.time() - lock_data["acquired_at"] < lock_data["ttl"]:
                 log.info("Lock held, cannot acquire", extra={"holder": lock_data["holder"]})
                 return False
@@ -236,8 +246,15 @@ async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
             pass
 
         lock_data = {"holder": holder, "acquired_at": time.time(), "ttl": ttl}
-        await _lock_kv.put("infrastructure", json.dumps(lock_data).encode())
-        log.info("Lock acquired", extra={"holder": holder, "ttl": ttl})
+        payload = json.dumps(lock_data).encode()
+        # Delete then create with server-side TTL — if pod crashes, NATS
+        # auto-purges the entry after ttl+60s (grace period for clock skew)
+        try:
+            await _lock_kv.delete("infrastructure")
+        except Exception:
+            pass
+        await _lock_kv.create("infrastructure", payload, msg_ttl=ttl + 60)
+        log.info("Lock acquired", extra={"holder": holder, "ttl": ttl, "server_ttl": ttl + 60})
         return True
     except Exception:
         log.exception("Failed to acquire lock")
@@ -629,12 +646,47 @@ async def _cortex_heartbeat_listener():
 
 # --- Gossip Ring ---
 
+_running_images: dict[str, str] = {}  # deployment_name -> image tag (e.g. "sha-7793b98")
+
+
+async def _refresh_running_images():
+    """Query K8s for current image tags on all maki deployments/statefulsets."""
+    global _running_images
+    if not _k8s_apps_v1:
+        return
+    try:
+        images: dict[str, str] = {}
+        deps = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_deployment, namespace=NAMESPACE)
+        for dep in deps.items:
+            name = dep.metadata.name
+            if not name.startswith("maki-") or name == "maki-nerve-nats-box":
+                continue
+            img = dep.spec.template.spec.containers[0].image
+            # Extract tag from full image URL
+            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
+
+        sts_list = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_stateful_set, namespace=NAMESPACE)
+        for sts in sts_list.items:
+            name = sts.metadata.name
+            if not name.startswith("maki-"):
+                continue
+            # Skip third-party statefulsets (embed=ollama, graph=neo4j, nerve=nats)
+            img = sts.spec.template.spec.containers[0].image
+            if "ghcr.io" not in img:
+                continue
+            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
+
+        _running_images = images
+    except Exception:
+        log.exception("Failed to refresh running images")
+
 
 async def _gossip_publisher():
     """Broadcast local state to all immune instances via NATS gossip."""
     log.info("Gossip publisher started", extra={"site": SITE_NAME, "interval": CHECK_INTERVAL})
     while True:
         try:
+            await _refresh_running_images()
             payload = {
                 "site": SITE_NAME,
                 "instance_id": INSTANCE_ID,
@@ -652,6 +704,7 @@ async def _gossip_publisher():
                     "turn_mode": _cortex_turn_mode,
                 },
                 "blacklist": list(_failed_image_blacklist),
+                "images": dict(_running_images),
             }
             await _nc.publish(IMMUNE_HEALTH, json.dumps(payload).encode())
         except Exception:
@@ -827,11 +880,54 @@ async def _state_request_handler(msg):
             "last_incident_time": _last_incident_time,
             "site_name": SITE_NAME,
             "hive_state": _hive_state,
+            "images": dict(_running_images),
         }
         await msg.respond(json.dumps(state).encode())
         log.info("State request served", extra={"components": len(_component_health)})
     except Exception:
         log.exception("Failed to serve state request")
+        await msg.respond(b"{}")
+
+
+async def _site_query_handler(msg):
+    """Handle rich site query from a remote immune's Claude.
+
+    Returns comprehensive local state — component health with full details,
+    pod metrics, images, deploy history, blacklist, recent actions.
+    Used by immune's query_site tool for cross-site investigation.
+    """
+    try:
+        lock_info = None
+        try:
+            entry = await _lock_kv.get("infrastructure")
+            lock_info = json.loads(entry.value.decode())
+        except Exception:
+            pass
+
+        state = {
+            "site_name": SITE_NAME,
+            "instance_id": INSTANCE_ID,
+            "timestamp": time.time(),
+            "component_health": _component_health,
+            "pod_metrics": _pod_metrics,
+            "images": dict(_running_images),
+            "recent_actions": _recent_actions[-20:],
+            "deploy_history": _deploy_history,
+            "lock": lock_info,
+            "blacklist": list(_failed_image_blacklist),
+            "cortex": {
+                "last_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
+                if _last_cortex_heartbeat
+                else None,
+                "active_turn": _cortex_active_turn,
+                "turn_mode": _cortex_turn_mode,
+                "turn_started": _cortex_turn_started,
+            },
+        }
+        await msg.respond(json.dumps(state, default=str).encode())
+        log.info("Site query served", extra={"components": len(_component_health)})
+    except Exception:
+        log.exception("Failed to serve site query")
         await msg.respond(b"{}")
 
 
@@ -946,6 +1042,16 @@ async def _deploy_request_handler(msg):
             previous_image = dep.spec.template.spec.containers[0].image
             log.info("Current image recorded for rollback", extra={"previous": previous_image})
 
+            # Skip if already on this exact image — avoids no-op deploys,
+            # 60s monitoring wait, and unnecessary propagation
+            if previous_image == image:
+                log.info(
+                    "Already on target image, skipping deploy", extra={"deployment": deployment_name, "image": image}
+                )
+                result = {"status": "skipped", "message": f"Already running {image}"}
+                await msg.respond(json.dumps(result).encode())
+                return
+
             # Persist previous image for rollback (survives restarts)
             await _save_deploy_history(deployment_name, previous_image)
 
@@ -970,8 +1076,9 @@ async def _deploy_request_handler(msg):
                 log.info("Deploy succeeded", extra={"deployment": deployment_name})
                 await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy on {INSTANCE_ID}")
 
-                # Propagate to other clusters — they'll deploy independently
-                await _nc.publish(
+                # Propagate to other clusters via JetStream — survives brief
+                # immune restarts and NATS routing gaps (fixes #52)
+                await _js.publish(
                     DEPLOY_PROPAGATE,
                     json.dumps(
                         {
@@ -1163,6 +1270,30 @@ async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
 
     log.warning("Rollout timed out", extra={"deployment": deployment_name, "timeout": timeout})
     return False
+
+
+async def _deploy_propagate_listener():
+    """JetStream durable consumer for deploy propagation.
+
+    Each immune instance gets its own durable consumer keyed by INSTANCE_ID,
+    ensuring messages persist until consumed even if the pod restarts briefly.
+    Uses deliver_policy=new so only future propagations are consumed.
+    """
+    from nats.js.api import DeliverPolicy
+
+    sub = await _js.subscribe(
+        DEPLOY_PROPAGATE,
+        durable=f"immune-propagate-{INSTANCE_ID}",
+        deliver_policy=DeliverPolicy.NEW,
+    )
+    log.info("JetStream propagation consumer started", extra={"durable": f"immune-propagate-{INSTANCE_ID}"})
+    async for msg in sub.messages:
+        try:
+            await _deploy_propagate_handler(msg)
+        except Exception:
+            log.exception("Deploy propagation listener error")
+        finally:
+            await msg.ack()
 
 
 async def _deploy_propagate_handler(msg):
@@ -1540,7 +1671,13 @@ def _build_system_state() -> str:
     if not lines:
         lines.append("No health data collected yet.")
 
-    # Append hive state
+    # Append local images
+    if _running_images:
+        lines.append(f"\n## Local Images ({SITE_NAME})")
+        for dep, tag in sorted(_running_images.items()):
+            lines.append(f"- {dep}: {tag}")
+
+    # Append hive state with images and drift detection
     if _hive_state:
         lines.append(f"\n## Hive State ({len(_hive_state)} peer(s) connected, local site: {SITE_NAME})")
         for site, state in sorted(_hive_state.items()):
@@ -1558,6 +1695,14 @@ def _build_system_state() -> str:
                 cortex_str = "cortex unknown"
             freshness = round(time.time() - state.get("received_at", 0))
             lines.append(f"- {site}: {healthy}/{total} healthy, {cortex_str}, last seen {freshness}s ago")
+
+            # Show peer images and flag drift vs local
+            peer_images = state.get("images", {})
+            if peer_images:
+                for dep, tag in sorted(peer_images.items()):
+                    local_tag = _running_images.get(dep)
+                    drift = f" ⚠ DRIFT (local={local_tag})" if local_tag and local_tag != tag else ""
+                    lines.append(f"  - {dep}: {tag}{drift}")
     else:
         lines.append(f"\n## Hive State (no peers connected, local site: {SITE_NAME})")
 
@@ -1684,6 +1829,20 @@ async def main():
         )
         log.info("Created vitals stream", extra={"stream": VITALS_STREAM})
 
+    # Deploy propagation stream — ensures propagation reaches all sites even
+    # during brief immune restarts or NATS routing gaps (fixes #52)
+    try:
+        await _js.find_stream_name_by_subject(DEPLOY_PROPAGATE)
+    except Exception:
+        await _js.add_stream(
+            name=DEPLOY_STREAM,
+            subjects=[DEPLOY_PROPAGATE],
+            retention=RetentionPolicy.LIMITS,
+            max_age=3600,  # 1 hour retention
+            storage=StorageType.FILE,
+        )
+        log.info("Created deploy stream", extra={"stream": DEPLOY_STREAM})
+
     # Load previous deploy history for rollback support
     await _load_deploy_history()
 
@@ -1732,11 +1891,18 @@ async def main():
     await _nc.subscribe(IMMUNE_STATE_REQUEST, queue="maki-immune", cb=_state_request_handler)
     log.info("Subscribed", extra={"subject": IMMUNE_STATE_REQUEST})
 
+    # Site-specific query — no queue group, targets this site only
+    site_query_subject = f"{IMMUNE_SITE_QUERY}.{SITE_NAME}"
+    await _nc.subscribe(site_query_subject, cb=_site_query_handler)
+    log.info("Subscribed", extra={"subject": site_query_subject})
+
     await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=_deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
 
-    await _nc.subscribe(DEPLOY_PROPAGATE, cb=_deploy_propagate_handler)
-    log.info("Subscribed", extra={"subject": DEPLOY_PROPAGATE})
+    # DEPLOY_PROPAGATE via JetStream durable consumer — each immune instance
+    # gets its own durable so messages persist until consumed (fixes #52)
+    asyncio.create_task(_deploy_propagate_listener())
+    log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
 
     await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=_deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})

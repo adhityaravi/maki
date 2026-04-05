@@ -273,6 +273,7 @@ resource "kubernetes_stateful_set" "vault" {
 
   lifecycle {
     ignore_changes = [
+      spec[0].template[0].spec[0].container[0].image,
       spec[0].volume_claim_template,
     ]
   }
