@@ -23,8 +23,8 @@ WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minut
 WORK_SKIP_LABELS = {"draft", "human"}
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
-# Work fires at 21:00 on Tue/Thu/Sat (cron: 2=Tue, 4=Thu, 6=Sat)
-WORK_CRON = "0 21 * * 2,4,6"
+# Work fires at 03:00 on Tue/Thu/Sat (cron: 2=Tue, 4=Thu, 6=Sat)
+WORK_CRON = "0 3 * * 2,4,6"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."

@@ -19,14 +19,14 @@ RECENTLY_ACTIVE_THRESHOLD = 600  # 10 minutes
 USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
-CRON_WINDOW_SECONDS = 300  # 5 minutes
+CRON_WINDOW_SECONDS = 1800  # 30 minutes
 
 
 def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
     """Return True if the cron expression was due within the last *window_seconds*.
 
     Replaces hand-rolled weekday/hour checks with a single declarative expression.
-    Example: cron_window("0 21 * * 1,3,5") fires between 21:00 and 21:05 on Tue/Thu/Sat.
+    Example: cron_window("0 3 * * 1,3,5") fires between 03:00 and 03:30 on Mon/Wed/Fri.
     """
     now = datetime.now()
     c = croniter(expr, now - timedelta(seconds=window_seconds))
