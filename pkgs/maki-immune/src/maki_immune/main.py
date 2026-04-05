@@ -235,30 +235,33 @@ async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
 
     Uses NATS KV msg_ttl so the lock auto-expires even if the pod crashes
     mid-deploy (fixes orphaned lock problem — issue #56).
+    Lock key is scoped to SITE_NAME so each site locks independently —
+    cross-site propagation doesn't block on a single global lock.
     """
+    lock_key = f"infrastructure.{SITE_NAME}"
     try:
         try:
-            entry = await _lock_kv.get("infrastructure")
+            entry = await _lock_kv.get(lock_key)
             lock_data = json.loads(entry.value.decode())
             # Still check software TTL for backwards compat with entries
             # written before server-side TTL was added
             if time.time() - lock_data["acquired_at"] < lock_data["ttl"]:
-                log.info("Lock held, cannot acquire", extra={"holder": lock_data["holder"]})
+                log.info("Lock held, cannot acquire", extra={"holder": lock_data["holder"], "site": SITE_NAME})
                 return False
             log.info("Lock expired, acquiring", extra={"previous_holder": lock_data["holder"]})
         except Exception:
             pass
 
-        lock_data = {"holder": holder, "acquired_at": time.time(), "ttl": ttl}
+        lock_data = {"holder": holder, "acquired_at": time.time(), "ttl": ttl, "site": SITE_NAME}
         payload = json.dumps(lock_data).encode()
         # Delete then create with server-side TTL — if pod crashes, NATS
         # auto-purges the entry after ttl+60s (grace period for clock skew)
         try:
-            await _lock_kv.delete("infrastructure")
+            await _lock_kv.delete(lock_key)
         except Exception:
             pass
-        await _lock_kv.create("infrastructure", payload, msg_ttl=ttl + 60)
-        log.info("Lock acquired", extra={"holder": holder, "ttl": ttl, "server_ttl": ttl + 60})
+        await _lock_kv.create(lock_key, payload, msg_ttl=ttl + 60)
+        log.info("Lock acquired", extra={"holder": holder, "site": SITE_NAME, "ttl": ttl, "server_ttl": ttl + 60})
         return True
     except Exception:
         log.exception("Failed to acquire lock")
@@ -267,12 +270,13 @@ async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
 
 async def _release_lock(holder: str):
     """Release infrastructure lock if held by this holder."""
+    lock_key = f"infrastructure.{SITE_NAME}"
     try:
-        entry = await _lock_kv.get("infrastructure")
+        entry = await _lock_kv.get(lock_key)
         lock_data = json.loads(entry.value.decode())
         if lock_data["holder"] == holder:
-            await _lock_kv.delete("infrastructure")
-            log.info("Lock released", extra={"holder": holder})
+            await _lock_kv.delete(lock_key)
+            log.info("Lock released", extra={"holder": holder, "site": SITE_NAME})
         else:
             log.warning(
                 "Lock held by different holder",
@@ -872,7 +876,7 @@ async def _state_request_handler(msg):
     try:
         lock_info = None
         try:
-            entry = await _lock_kv.get("infrastructure")
+            entry = await _lock_kv.get(f"infrastructure.{SITE_NAME}")
             lock_info = json.loads(entry.value.decode())
         except Exception:
             pass
@@ -907,7 +911,7 @@ async def _site_query_handler(msg):
     try:
         lock_info = None
         try:
-            entry = await _lock_kv.get("infrastructure")
+            entry = await _lock_kv.get(f"infrastructure.{SITE_NAME}")
             lock_info = json.loads(entry.value.decode())
         except Exception:
             pass
