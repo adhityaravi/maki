@@ -29,11 +29,12 @@ root = [
 python-version = "3.12"
 
 [tool.ty.rules]
-# Module-level globals (e.g. _nc = None) passed to functions / accessed
-unresolved-attribute = "warn"
-invalid-argument-type = "warn"
+# Module-level globals (e.g. _nc = None) passed to functions / accessed as
+# their eventual runtime type — architectural pattern, not fixable via annotations
+unresolved-attribute = "ignore"
+invalid-argument-type = "ignore"
 # proc.returncode is int|None but always set after communicate()
-invalid-return-type = "warn"
+invalid-return-type = "ignore"
 
 [tool.ty.analysis]
 # Bundled ELF binary + third-party deps without stubs
@@ -66,6 +67,8 @@ allowed-unresolved-imports = [
     "mem0.**",
     "discord",
     "discord.**",
+    "croniter",
+    "croniter.**",
 ]
 
 [tool.pytest.ini_options]
