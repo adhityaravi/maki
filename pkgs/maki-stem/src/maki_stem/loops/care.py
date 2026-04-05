@@ -13,12 +13,15 @@ from datetime import datetime
 from maki_common import kv_get_float, strip_tags
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_REMINDER_OUT
 
-from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext
+from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
 
 log = logging.getLogger(__name__)
 
 CARE_CHECK_INTERVAL = int(os.environ.get("CARE_CHECK_INTERVAL", "60"))
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
+
+# Care fires once daily at 08:00
+CARE_CRON = "0 8 * * *"
 
 MAX_RECENT_REMINDERS = 5  # how many past reminders to inject as dedup context
 CARE_REMINDERS_KEY = "care.recent_reminders"  # NATS KV key for reminder history
@@ -52,14 +55,17 @@ async def _put_recent_reminder(text: str, ctx: StemContext) -> None:
 
 
 async def _care_should_run(config: dict, ctx: StemContext) -> bool:
-    """Guard checks for the care loop: activity threshold, quiet hours, daily cap."""
+    """Guard checks for the care loop: cron window, activity threshold, daily cap.
+
+    Fires at 08:00 every day — one reminder per day max.
+    """
     global _reminders_today, _reminders_today_date
+
+    if not cron_window(CARE_CRON):
+        return False
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
-        return False
-
-    if ctx.in_quiet_hours(config):
         return False
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -67,7 +73,7 @@ async def _care_should_run(config: dict, ctx: StemContext) -> bool:
         _reminders_today = 0
         _reminders_today_date = today
 
-    max_reminders = config.get("max_reminders_per_day", 5)
+    max_reminders = config.get("max_reminders_per_day", 1)
     return _reminders_today < max_reminders
 
 
@@ -147,7 +153,7 @@ async def _care_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 CARE_LOOP_SPEC = LoopSpec(
     name="care",
     check_interval_getter=lambda: CARE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("care_interval", 1800),
+    execution_interval_getter=lambda config: 86400,  # once per day — lock TTL prevents double-fire
     should_run=_care_should_run,
     body=_care_body,
 )

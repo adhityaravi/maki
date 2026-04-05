@@ -14,17 +14,15 @@ from maki_common import kv_get_float, parse_config_tags, strip_tags
 from maki_common.config import apply_config_updates
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_THOUGHT_OUT
 
-from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext
+from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
 
 log = logging.getLogger(__name__)
 
 IDLE_CHECK_INTERVAL = int(os.environ.get("IDLE_CHECK_INTERVAL", "60"))
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
-# Day-of-week scheduling: idle runs Mon/Wed/Fri/Sun, work runs Tue/Thu/Sat.
-# Python weekday(): 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
-_IDLE_DAYS: frozenset[int] = frozenset({0, 2, 4, 6})  # Mon, Wed, Fri, Sun
-_PROACTIVE_WINDOW_HOUR = 21  # 9 PM local — loop fires once in the 21:00–22:00 window
+# Idle fires at 21:00 on Mon/Wed/Fri/Sun (cron: 0=Sun, 1=Mon, 3=Wed, 5=Fri)
+IDLE_CRON = "0 21 * * 0,1,3,5"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
@@ -47,20 +45,20 @@ _thoughts_today_date: str = ""
 
 
 async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
-    """Guard checks for the idle loop: scheduled window, activity threshold, daily cap.
+    """Guard checks for the idle loop: cron window, activity threshold, daily cap.
 
-    Idle loop fires on Mon/Wed/Fri/Sun between 21:00–22:00 only — one thought per day.
+    Fires at 21:00 on Mon/Wed/Fri/Sun — one thought per day max.
     """
     global _thoughts_today, _thoughts_today_date
 
-    now = datetime.now()
-    if now.weekday() not in _IDLE_DAYS or now.hour != _PROACTIVE_WINDOW_HOUR:
+    if not cron_window(IDLE_CRON):
         return False
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
         return False
 
+    now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     if today != _thoughts_today_date:
         _thoughts_today = 0
@@ -165,7 +163,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 IDLE_LOOP_SPEC = LoopSpec(
     name="idle",
     check_interval_getter=lambda: IDLE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("idle_interval", 7200),
+    execution_interval_getter=lambda config: 86400,  # once per day — lock TTL prevents double-fire
     should_run=_idle_should_run,
     body=_idle_body,
 )

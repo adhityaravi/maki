@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from maki_common import kv_get_float, strip_tags
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST, DEPLOY_REQUEST
 
-from .base import USER_INACTIVE_THRESHOLD, LoopSpec, StemContext
+from .base import USER_INACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
 
 log = logging.getLogger(__name__)
 
@@ -23,9 +23,8 @@ WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minut
 WORK_SKIP_LABELS = {"draft", "human"}
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
-# Work loop runs Tue/Thu/Sat in the same 21:00–22:00 window as idle (which runs Mon/Wed/Fri/Sun)
-_WORK_DAYS: frozenset[int] = frozenset({1, 3, 5})  # Tue, Thu, Sat
-_PROACTIVE_WINDOW_HOUR = 21  # 9 PM local
+# Work fires at 21:00 on Tue/Thu/Sat (cron: 2=Tue, 4=Thu, 6=Sat)
+WORK_CRON = "0 21 * * 2,4,6"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
@@ -110,9 +109,8 @@ async def _request_deploy_after_work(issue_number: int, issue_title: str, ctx: S
 
 
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
-    """Pre-claim guard for the work loop: only proceed on Tue/Thu/Sat during 21:00–22:00."""
-    now = datetime.now()
-    return now.weekday() in _WORK_DAYS and now.hour == _PROACTIVE_WINDOW_HOUR
+    """Pre-claim guard for the work loop: only proceed when the cron window is open."""
+    return cron_window(WORK_CRON)
 
 
 async def _work_should_run(config: dict, ctx: StemContext) -> bool:
@@ -297,7 +295,7 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 WORK_LOOP_SPEC = LoopSpec(
     name="work",
     check_interval_getter=lambda: WORK_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("work_interval", WORK_CHECK_INTERVAL),
+    execution_interval_getter=lambda config: 86400,  # once per day — lock TTL prevents double-fire
     pre_claim_guard=_work_pre_claim_guard,
     should_run=_work_should_run,
     body=_work_body,

@@ -6,7 +6,10 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
+
+from croniter import croniter
 
 from maki_common import load_kv_config, try_claim_loop
 
@@ -15,6 +18,21 @@ log = logging.getLogger(__name__)
 # Shared thresholds used by multiple loops
 RECENTLY_ACTIVE_THRESHOLD = 600  # 10 minutes
 USER_INACTIVE_THRESHOLD = 7200  # 2 hours
+
+# How long the cron window stays open — loop must fire within this many seconds of the scheduled time
+CRON_WINDOW_SECONDS = 300  # 5 minutes
+
+
+def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
+    """Return True if the cron expression was due within the last *window_seconds*.
+
+    Replaces hand-rolled weekday/hour checks with a single declarative expression.
+    Example: cron_window("0 21 * * 1,3,5") fires between 21:00 and 21:05 on Tue/Thu/Sat.
+    """
+    now = datetime.now()
+    c = croniter(expr, now - timedelta(seconds=window_seconds))
+    next_scheduled = c.get_next(datetime)
+    return next_scheduled <= now
 
 
 @dataclass

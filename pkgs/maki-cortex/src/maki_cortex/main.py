@@ -134,10 +134,6 @@ Use "automated" label too. Example: `labels="P3,automated"`.
 - Store learnings with add_memory.
 - If nothing genuinely new to say or file → respond with exactly [SILENT]
 
-You can adjust your idle loop via tags:
-[CONFIG:idle_interval=3600] — reflection frequency (seconds)
-[CONFIG:max_thoughts_per_day=3] — daily thought limit
-
 ## Open GitHub Issues
 {open_issues}
 
