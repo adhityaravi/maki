@@ -2,7 +2,9 @@
 <img src="assets/images/maki.png" alt="maki" width="200">
 </div>
 
-Maki is a persistant LLM based assistant. It runs as a combination of deterministic and inference (inference using Claude Code) based microservices on Kubenetes. It is working a distributed system with HA across 3 sites with geographical redundancy. It has a persistant memory system using mem0 for selctive memory storage using patroni with Postgres as the vector db backend and Neo4j as the graph memory backend. It uses the NATS messaging system as its nervous system for its components to communicate with one another. The NATS broker is also used to form a singular maki hive mind with all of available the maki clusters. It runs cron-ish loops for self-preservation and evolution. Most of the code in the code base are ideated written by maki itself.
+Maki is a persistant LLM based assistant. It runs as a combination of deterministic and inference (inference using Claude Code) based microservices on Kubenetes. 
+
+It is working as a distributed system with HA across 3 sites with geographical redundancy. It has a persistant memory system using mem0 for selctive memory storage. Patroni with Postgres is the vector db backend and Neo4j the graph memory backend. It uses the NATS messaging queue as its nervous system for the components to communicate with one another. The NATS broker is also used to form a singular maki hive mind with the same memory with all of available the maki clusters. It runs cron-ish loops for self-preservation using a immune system and evolution. Most of the code in the code base are ideated written by maki itself.
 
 ## Components
 
