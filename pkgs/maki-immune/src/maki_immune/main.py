@@ -73,6 +73,11 @@ DEFAULT_CONFIG = {
     "lock_ttl": 300,
 }
 
+# Hard limits — immune cannot set values outside these lists
+IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
+    "heartbeat_interval": [43200, 86400],  # 12h or 24h only
+}
+
 IMMUNE_SYSTEM_PROMPT = """You are the part of Maki that watches. The part that never sleeps.
 
 You don't talk to anyone. You don't have conversations. You patrol, you investigate, you act. \
@@ -179,11 +184,10 @@ When a site goes silent (no gossip):
 - The site may be offline or network-partitioned. Note it. Don't assume the worst.
 
 ## Frequency Tuning
-Tighten when unstable, relax when stable:
-- [CONFIG:heartbeat_interval=900] — tighten patrol (default: 1800s)
-- [CONFIG:heartbeat_interval=1800] — relax when stable
-- [CONFIG:health_check_interval=15] — tighten checks (default: 30s)
-- [CONFIG:health_check_interval=30] — relax when stable
+- [CONFIG:heartbeat_interval=43200] — patrol every 12 hours (default)
+- [CONFIG:heartbeat_interval=86400] — patrol every 24 hours (quiet period)
+These are the only allowed values. The reflex engine handles urgent issues mechanically — \
+patrols are for holistic review, not rapid response.
 
 ## Reporting
 - [DIGEST:...] — to #maki-vitals. Only when something matters.
@@ -1510,7 +1514,9 @@ Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...
         )
 
         config_updates = parse_config_tags(response)
-        await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
+        await apply_config_updates(
+            _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
+        )
 
         for digest in parse_tagged(response, "DIGEST"):
             await _publish_vitals(digest)
@@ -1598,7 +1604,9 @@ Also use [DIGEST:...] for anything that should go to #maki-vitals."""
             )
 
             config_updates = parse_config_tags(response)
-            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
+            await apply_config_updates(
+                _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
+            )
 
             # Extract response for Adi
             responses = parse_tagged(response, "RESPONSE")
@@ -1746,7 +1754,9 @@ async def _immune_heartbeat_loop():
             )
 
             config_updates = parse_config_tags(response)
-            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()))
+            await apply_config_updates(
+                _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
+            )
 
             # [SILENT] means Claude found nothing worth reporting
             if "[SILENT]" not in response:

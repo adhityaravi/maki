@@ -123,15 +123,24 @@ async def invoke_claude(
                 "mode": mode,
             },
         )
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        text_parts.append(block.text)
-            elif isinstance(message, ResultMessage):
-                duration_ms = (time.monotonic() - t0) * 1000
-                usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
-                log.info("Token usage", extra=usage.to_log_dict())
+        got_result = False
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+                elif isinstance(message, ResultMessage):
+                    duration_ms = (time.monotonic() - t0) * 1000
+                    usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
+                    log.info("Token usage", extra=usage.to_log_dict())
+                    got_result = True
+        except Exception:
+            if got_result:
+                # SDK CLI process exited after delivering the result — benign
+                log.debug("SDK process exited after result (expected)")
+            else:
+                raise
 
         result = "\n".join(text_parts)
         log.info("Claude response received", extra={"response_len": len(result)})
@@ -181,18 +190,26 @@ async def stream_claude(
         t0 = time.monotonic()
         extra = {"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode}
         log.info("Streaming Claude", extra=extra)
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        log.info("Stream chunk", extra={"chunk_len": len(block.text)})
-                        yield block.text
-            elif isinstance(message, ResultMessage):
-                duration_ms = (time.monotonic() - t0) * 1000
-                usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
-                log.info("Token usage", extra=usage.to_log_dict())
-                if usage_out is not None:
-                    usage_out.append(usage)
+        got_result = False
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            log.info("Stream chunk", extra={"chunk_len": len(block.text)})
+                            yield block.text
+                elif isinstance(message, ResultMessage):
+                    duration_ms = (time.monotonic() - t0) * 1000
+                    usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
+                    log.info("Token usage", extra=usage.to_log_dict())
+                    if usage_out is not None:
+                        usage_out.append(usage)
+                    got_result = True
+        except Exception:
+            if got_result:
+                log.debug("SDK process exited after result (expected)")
+            else:
+                raise
         log.info("Stream complete")
 
     if semaphore:

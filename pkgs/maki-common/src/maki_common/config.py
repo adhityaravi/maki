@@ -40,6 +40,7 @@ async def apply_config_updates(
     kv: KeyValue,
     updates: list[tuple[str, str]],
     allowed_keys: set[str] | None = None,
+    validators: dict[str, list] | None = None,
 ) -> None:
     """Apply parsed config updates to a KV bucket.
 
@@ -47,6 +48,8 @@ async def apply_config_updates(
         kv: NATS KV bucket.
         updates: List of (key, raw_value) from parse_config_tags().
         allowed_keys: If provided, only these keys are accepted.
+        validators: Optional dict of key → list of allowed values.
+            If the parsed value is not in the list, the update is rejected.
     """
     for key, raw_value in updates:
         if allowed_keys and key not in allowed_keys:
@@ -54,6 +57,13 @@ async def apply_config_updates(
             continue
         try:
             parsed = json.loads(raw_value)
+            if validators and key in validators:
+                if parsed not in validators[key]:
+                    log.warning(
+                        "Rejected config update: value not allowed",
+                        extra={"key": key, "value": parsed, "allowed": validators[key]},
+                    )
+                    continue
             await kv.put(key, json.dumps(parsed).encode())
             log.info("Config self-tuned", extra={"key": key, "value": parsed})
         except Exception:

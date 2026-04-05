@@ -27,16 +27,17 @@ IDLE_CRON = "0 21 * * 0,1,3,5"
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
-# Rotating memory search queries — varied by hour so each cycle surfaces different memories
+# Rotating memory search queries — varied by hour so each cycle surfaces different memories.
+# Weighted toward code health and maintainability — not every thought should be a new feature.
 _IDLE_MEMORY_QUERIES = [
-    "recent work and open problems",
+    "code duplication, long functions, and refactoring opportunities",
     "infrastructure and system health patterns",
     "Adi's projects and goals",
     "code quality issues and technical debt",
-    "decisions made and their outcomes",
-    "recurring patterns and blockers",
+    "my own prompts, identity, behavior, and how I could improve myself",
+    "messy code, unclear naming, missing abstractions",
     "things Adi mentioned but never followed up on",
-    "creative ideas and future plans",
+    "dead code, unused imports, stale config, cleanup opportunities",
 ]
 
 # Module-level daily counters
