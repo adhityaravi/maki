@@ -28,4 +28,4 @@ See [LICENSE](LICENSE).
 
 ## Note
 
-It is tailored specifically to be used by me. While the idea is free to copy, using the same code base on your own infra is not recommended.
+It is tailored specifically to be used by me. While the idea is free to copy as per the License (sadly, what does a License even mean in the age of LLMs huh), using the same code base on your own infra is not recommended.
