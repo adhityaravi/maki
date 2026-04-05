@@ -4,7 +4,7 @@
 
 Maki is a persistant LLM based assistant. It runs as a combination of deterministic and inference (inference using Claude Code) based microservices on Kubenetes. 
 
-It is working as a distributed system with HA across 3 sites with geographical redundancy. It has a persistant memory system using mem0 for selctive memory storage. Patroni with Postgres is the vector db backend and Neo4j the graph memory backend. It uses the NATS messaging queue as its nervous system for the components to communicate with one another. The NATS broker is also used to form a singular maki hive mind with the same memory with all of available the maki clusters. It runs cron-ish loops for self-preservation using a immune system and evolution. Most of the code in the code base are ideated written by maki itself.
+It can work as a distributed system with HA across n number of site clusters (currently there are 3 sites that are live) with geographical redundancy. It has a persistant memory system using mem0 for selctive memory storage. Patroni with Postgres is the vector db backend and Neo4j the graph memory backend. It uses the NATS messaging queue as its nervous system for the components to communicate with one another. The NATS broker is also used to form a singular maki hive mind with the same memory with all of available the maki clusters. It runs cron-ish loops for self-preservation using a immune system and evolution. Most of the code in the code base are ideated and written by maki itself.
 
 ## Components
 
@@ -30,4 +30,4 @@ See [LICENSE](LICENSE).
 
 ## Note
 
-It is tailored specifically to be used by me. While the idea is free to copy as per the License (sadly, what does a License even mean in the age of LLMs huh), using the same code base on your own infra is not recommended.
+It is tailored specifically to be used by me. While the idea is free to copy, using the same code base as it is on your own infra is not recommended.
