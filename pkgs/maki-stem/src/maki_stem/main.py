@@ -10,9 +10,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 
@@ -25,12 +23,9 @@ from maki_common import (
     configure_logging,
     connect_nats,
     init_kv,
-    kv_get_float,
     kv_put_float,
-    load_kv_config,
     parse_config_tags,
     strip_tags,
-    try_claim_loop,
 )
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
@@ -39,16 +34,15 @@ from maki_common.subjects import (
     CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
-    DEPLOY_REQUEST,
     EARS_MESSAGE_IN,
     EARS_MESSAGE_OUT,
-    EARS_REMINDER_OUT,
-    EARS_THOUGHT_OUT,
     IMMUNE_STATE_REQUEST,
     MEMORY_STORE,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
+
+from maki_stem.loops import CARE_LOOP_SPEC, IDLE_LOOP_SPEC, WORK_LOOP_SPEC, StemContext, _run_loop
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -72,22 +66,11 @@ RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
 
 CONFIG_BUCKET = "maki-cortex-config"
-IDLE_CHECK_INTERVAL = int(os.environ.get("IDLE_CHECK_INTERVAL", "60"))
-RECENTLY_ACTIVE_THRESHOLD = 600  # 10 minutes
-
 HEALTH_ENDPOINTS = {
     "recall": RECALL_URL,
     "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
     "cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
 }
-
-CARE_CHECK_INTERVAL = int(os.environ.get("CARE_CHECK_INTERVAL", "60"))
-MAX_RECENT_REMINDERS = 5  # how many past reminders to inject as dedup context
-CARE_REMINDERS_KEY = "care.recent_reminders"  # NATS KV key for reminder history
-
-WORK_CHECK_INTERVAL = int(os.environ.get("WORK_CHECK_INTERVAL", "300"))
-WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minutes
-USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 
 # GitHub App config (optional — enables issue tracking for idle/work loops)
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
@@ -95,25 +78,6 @@ GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
 GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
 REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
-
-# Rotating memory search queries for the idle reflection loop — varied by hour so
-# each cycle surfaces different memories instead of always the same ones.
-_IDLE_MEMORY_QUERIES = [
-    "recent work and open problems",
-    "infrastructure and system health patterns",
-    "Adi's projects and goals",
-    "code quality issues and technical debt",
-    "decisions made and their outcomes",
-    "recurring patterns and blockers",
-    "things Adi mentioned but never followed up on",
-    "creative ideas and future plans",
-]
-
-# Labels that the autonomous work loop must never pick up
-WORK_SKIP_LABELS = {"draft", "human"}
-
-# Trusted issue authors — only these accounts can have issues picked up by the work loop
-ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
 DEFAULT_CORTEX_CONFIG = {
     "idle_interval": 7200,
@@ -160,12 +124,6 @@ _config_kv = None
 _lock_kv = None
 _pending = PendingQueues()
 _conversation_history: list[dict] = []
-_thoughts_today: int = 0
-_thoughts_today_date: str = ""
-_reminders_today: int = 0
-_reminders_today_date: str = ""
-_work_items_tonight: int = 0
-_work_items_tonight_date: str = ""
 _cortex_sessions: dict[str, str] = {}  # instance_id -> session_id
 _active_turns: dict[str, float] = {}  # turn_id → start timestamp
 _turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
@@ -209,48 +167,6 @@ def _truncate_for_title(text: str, max_len: int = 80) -> str:
     if len(first_line) > max_len:
         return first_line[: max_len - 3] + "..."
     return first_line
-
-
-def _issue_has_skip_label(issue: dict) -> bool:
-    """Return True if the issue carries any label that the work loop must skip."""
-    for lbl in issue.get("labels", []):
-        name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
-        if name.lower() in WORK_SKIP_LABELS:
-            return True
-    return False
-
-
-def _is_verified_issue_author(issue: dict) -> bool:
-    """Return True if the issue was filed by a trusted author."""
-    login = issue.get("user", {}).get("login", "")
-    return login in ALLOWED_ISSUE_AUTHORS
-
-
-async def _reject_unverified_issues(issues: list[dict]) -> list[dict]:
-    """Comment on and close issues from unverified authors. Returns only verified issues."""
-    if not _github:
-        return issues
-    verified = []
-    for issue in issues:
-        login = issue.get("user", {}).get("login", "")
-        if _is_verified_issue_author(issue):
-            verified.append(issue)
-        else:
-            number = issue.get("number")
-            log.warning(
-                "Rejecting issue from unverified author",
-                extra={"number": number, "author": login},
-            )
-            try:
-                await _github.comment_issue(
-                    number,
-                    f"Closing: this issue was filed by `{login}` who is not a verified contributor. "
-                    "Only issues from trusted accounts are processed by the autonomous work loop.",
-                )
-                await _github.close_issue(number)
-            except Exception:
-                log.exception("Failed to reject issue", extra={"number": number})
-    return verified
 
 
 async def _response_listener():
@@ -705,538 +621,6 @@ def _in_work_hours(config: dict) -> bool:
     return start <= current < end
 
 
-@dataclass
-class LoopSpec:
-    """Specification for a proactive background loop.
-
-    Each loop shares the same outer structure: sleep → load config → claim lock →
-    run guards → execute body. LoopSpec captures the per-loop variation so a single
-    generic runner (_run_loop) can drive all loops without duplicating that skeleton.
-    """
-
-    name: str
-    """Human-readable name used in log messages and as the NATS KV lock key suffix."""
-
-    check_interval_getter: Callable[[], int]
-    """Returns how often (seconds) the loop wakes up to *check* whether it should run."""
-
-    execution_interval_getter: Callable[[dict], int]
-    """Returns the minimum interval (seconds) between actual executions (claim TTL)."""
-
-    should_run: Callable[[dict], "Coroutine[None, None, bool]"]  # type: ignore[type-arg]
-    """Async callable(config) → bool.  Return False to skip this cycle (guard check)."""
-
-    body: Callable[["LoopSpec", dict], "Coroutine[None, None, None]"]  # type: ignore[type-arg]
-    """Async callable(spec, config) that performs the actual loop work for one cycle."""
-
-    pre_claim_guard: Callable[[dict], "Coroutine[None, None, bool]"] | None = None  # type: ignore[type-arg]
-    """Optional async callable(config) → bool evaluated *before* claiming the lock.
-
-    Use this when a guard must run before the lock claim to preserve the original
-    loop ordering (e.g. the work loop checks work hours before claiming).
-    """
-
-    extra: dict = field(default_factory=dict)
-    """Arbitrary per-loop state accessible inside *body* (e.g. daily counters)."""
-
-
-async def _run_loop(spec: LoopSpec) -> None:
-    """Generic loop runner — drives any LoopSpec with the shared scheduling skeleton.
-
-    Handles: periodic sleep, config loading, optional pre-claim guard, distributed
-    lock claiming, post-claim guard evaluation, and top-level exception isolation.
-    Per-loop variation lives entirely inside *spec.pre_claim_guard*, *spec.should_run*,
-    and *spec.body*.
-    """
-    log.info(
-        "Loop started",
-        extra={"loop": spec.name, "check_interval": spec.check_interval_getter(), "instance_id": INSTANCE_ID},
-    )
-    while True:
-        await asyncio.sleep(spec.check_interval_getter())
-        try:
-            config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
-            # Optional guard that must run before the distributed lock is claimed
-            if spec.pre_claim_guard is not None and not await spec.pre_claim_guard(config):
-                continue
-            execution_interval = spec.execution_interval_getter(config)
-            lock_key = f"loop.stem.{spec.name}"
-            if not await try_claim_loop(_lock_kv, lock_key, execution_interval, INSTANCE_ID):
-                continue
-            if not await spec.should_run(config):
-                continue
-            await spec.body(spec, config)
-        except Exception:
-            log.exception("Error in loop", extra={"loop": spec.name})
-
-
-async def _idle_should_run(config: dict) -> bool:
-    """Guard checks for the idle loop: activity threshold, quiet hours, daily cap."""
-    global _thoughts_today, _thoughts_today_date
-
-    last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
-    if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
-        return False
-
-    if _in_quiet_hours(config):
-        return False
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    if today != _thoughts_today_date:
-        _thoughts_today = 0
-        _thoughts_today_date = today
-
-    max_thoughts = config.get("max_thoughts_per_day", 5)
-    return _thoughts_today < max_thoughts
-
-
-async def _idle_body(spec: LoopSpec, config: dict) -> None:
-    """Execute one idle reflection cycle."""
-    last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
-    max_thoughts = config.get("max_thoughts_per_day", 5)
-
-    try:
-        entry = await _kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = DEFAULT_IDENTITY
-
-    idle_query = _IDLE_MEMORY_QUERIES[int(time.time() / 3600) % len(_IDLE_MEMORY_QUERIES)]
-    memories, graph_context = await _search_memories(idle_query)
-    system_state = await _gather_system_state()
-
-    # Fetch open issues for dedup — injected into cortex prompt so it doesn't
-    # need to call list_issues itself and can suppress duplicates reliably.
-    open_issues: list[dict] = []
-    if _github:
-        try:
-            issues = await _github.list_issues(state="open")
-            open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in (issues or [])]
-        except Exception:
-            log.warning("Failed to fetch open issues for idle dedup")
-
-    turn_id = f"idle-{uuid.uuid4().hex[:8]}"
-    idle_payload = {
-        "turn_id": turn_id,
-        "mode": "idle_reflection",
-        "identity": identity,
-        "conversation": [],
-        "memories": memories,
-        "graph_context": graph_context,
-        "prompt": None,
-        "mission_results": None,
-        "idle_context": {
-            "last_interaction": datetime.fromtimestamp(last_activity, tz=UTC).isoformat(),
-            "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
-            "time_context": {
-                "local_time": datetime.now().strftime("%H:%M"),
-            },
-            "current_config": config,
-            "system_state": system_state,
-            "open_issues": open_issues,
-        },
-    }
-
-    queue = _pending.create(turn_id)
-    try:
-        await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
-        log.info("Idle turn published", extra={"turn_id": turn_id})
-
-        # Idle reflection is single-shot — one response with done=True
-        response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-        thought = response_data.get("response", "")
-
-        clean_thought = strip_tags(thought or "")
-        config_updates = parse_config_tags(thought or "")
-        if config_updates:
-            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
-
-        if clean_thought:
-            thought_payload = {"thought": clean_thought, "turn_id": turn_id}
-            await _nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
-            global _thoughts_today
-            _thoughts_today += 1
-            log.info(
-                "Thought published",
-                extra={
-                    "turn_id": turn_id,
-                    "thoughts_today": _thoughts_today,
-                    "max": max_thoughts,
-                },
-            )
-
-            state_summary = _format_system_state(system_state)
-            asyncio.create_task(
-                _feed_memories(
-                    f"[Idle reflection] System state: {state_summary}",
-                    clean_thought,
-                )
-            )
-
-    except TimeoutError:
-        log.error("Idle turn timed out", extra={"turn_id": turn_id})
-    except Exception:
-        log.exception("Idle turn failed", extra={"turn_id": turn_id})
-    finally:
-        _pending.remove(turn_id)
-
-
-IDLE_LOOP_SPEC = LoopSpec(
-    name="idle",
-    check_interval_getter=lambda: IDLE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("idle_interval", 7200),
-    should_run=_idle_should_run,
-    body=_idle_body,
-)
-
-
-async def _get_recent_reminders() -> list[str]:
-    """Load the last MAX_RECENT_REMINDERS reminder texts from NATS KV."""
-    try:
-        entry = await _lock_kv.get(CARE_REMINDERS_KEY)
-        return json.loads(entry.value.decode())
-    except Exception:
-        return []
-
-
-async def _put_recent_reminder(text: str) -> None:
-    """Append a reminder text to the KV history, capped at MAX_RECENT_REMINDERS."""
-    try:
-        recent = await _get_recent_reminders()
-        recent.append(text[:300])
-        recent = recent[-MAX_RECENT_REMINDERS:]
-        await _lock_kv.put(CARE_REMINDERS_KEY, json.dumps(recent).encode())
-    except Exception:
-        log.warning("Failed to persist recent reminder to KV", exc_info=True)
-
-
-async def _care_should_run(config: dict) -> bool:
-    """Guard checks for the care loop: activity threshold, quiet hours, daily cap."""
-    global _reminders_today, _reminders_today_date
-
-    last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
-    if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
-        return False
-
-    if _in_quiet_hours(config):
-        return False
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    if today != _reminders_today_date:
-        _reminders_today = 0
-        _reminders_today_date = today
-
-    max_reminders = config.get("max_reminders_per_day", 5)
-    return _reminders_today < max_reminders
-
-
-async def _care_body(spec: LoopSpec, config: dict) -> None:
-    """Execute one care check-in cycle."""
-    last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
-    max_reminders = config.get("max_reminders_per_day", 5)
-
-    try:
-        entry = await _kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = DEFAULT_IDENTITY
-
-    memories, graph_context = await _search_memories("Adi's wellbeing, habits, recent concerns")
-    recent_reminders = await _get_recent_reminders()
-
-    turn_id = f"care-{uuid.uuid4().hex[:8]}"
-    care_payload = {
-        "turn_id": turn_id,
-        "mode": "care",
-        "identity": identity,
-        "conversation": _get_recent_conversation(),
-        "memories": memories,
-        "graph_context": graph_context,
-        "prompt": None,
-        "mission_results": None,
-        "care_context": {
-            "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
-            "time_context": {
-                "local_time": datetime.now().strftime("%H:%M"),
-            },
-            "recent_reminders": recent_reminders,
-        },
-    }
-
-    queue = _pending.create(turn_id)
-    try:
-        await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(care_payload).encode())
-        log.info("Care turn published", extra={"turn_id": turn_id})
-
-        response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-        reminder = response_data.get("response", "")
-
-        clean_reminder = strip_tags(reminder or "")
-        if clean_reminder:
-            reminder_payload = {"reminder": clean_reminder, "turn_id": turn_id}
-            await _nc.publish(EARS_REMINDER_OUT, json.dumps(reminder_payload).encode())
-            asyncio.create_task(_put_recent_reminder(clean_reminder))
-            global _reminders_today
-            _reminders_today += 1
-            log.info(
-                "Reminder published",
-                extra={
-                    "turn_id": turn_id,
-                    "reminders_today": _reminders_today,
-                    "max": max_reminders,
-                },
-            )
-
-            asyncio.create_task(
-                _feed_memories(
-                    "[Care check-in]",
-                    clean_reminder,
-                )
-            )
-
-    except TimeoutError:
-        log.error("Care turn timed out", extra={"turn_id": turn_id})
-    except Exception:
-        log.exception("Care turn failed", extra={"turn_id": turn_id})
-    finally:
-        _pending.remove(turn_id)
-
-
-CARE_LOOP_SPEC = LoopSpec(
-    name="care",
-    check_interval_getter=lambda: CARE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("care_interval", 1800),
-    should_run=_care_should_run,
-    body=_care_body,
-)
-
-
-async def _request_deploy_after_work(issue_number: int, issue_title: str):
-    """Request a deploy to maki-immune after a successful work session and comment with the result."""
-    deploy_target = "maki-immune"
-    log.info("Requesting deploy after work", extra={"service": deploy_target, "issue": issue_number})
-    try:
-        reply = await _nc.request(
-            DEPLOY_REQUEST,
-            json.dumps({"service": deploy_target, "image_tag": "latest"}).encode(),
-            timeout=30.0,
-        )
-        result = json.loads(reply.data.decode())
-        status = result.get("status", "unknown")
-        message = result.get("message", "")
-        log.info("Deploy requested", extra={"service": deploy_target, "status": status})
-
-        deploy_comment = (
-            f"🚀 **Deploy requested** → `{deploy_target}`\n\n"
-            f"Status: `{status}`"
-            + (f"\n{message}" if message else "")
-            + f"\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-    except Exception:
-        log.exception("Failed to request deploy after work", extra={"issue": issue_number})
-        deploy_comment = (
-            f"⚠️ **Deploy request failed** for `{deploy_target}` — will need manual trigger.\n\n"
-            f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-
-    if _github:
-        await _github.comment_issue(issue_number, deploy_comment)
-
-
-async def _work_pre_claim_guard(config: dict) -> bool:
-    """Pre-claim guard for the work loop: only proceed during work hours."""
-    return _in_work_hours(config)
-
-
-async def _work_should_run(config: dict) -> bool:
-    """Post-claim guard checks for the work loop: nightly cap, user inactivity, GitHub."""
-    global _work_items_tonight, _work_items_tonight_date
-
-    # Reset nightly counter if date changed
-    tonight = datetime.now().strftime("%Y-%m-%d")
-    if tonight != _work_items_tonight_date:
-        _work_items_tonight = 0
-        _work_items_tonight_date = tonight
-
-    max_items = config.get("max_work_items_per_night", 2)
-    if _work_items_tonight >= max_items:
-        return False
-
-    # Only work if user has been inactive
-    last_activity = await kv_get_float(_lock_kv, "stem.last_activity", default=time.time())
-    if time.time() - last_activity < USER_INACTIVE_THRESHOLD:
-        log.info("Work loop: user recently active, skipping")
-        return False
-
-    if not _github:
-        return False
-
-    return True
-
-
-async def _work_body(spec: LoopSpec, config: dict) -> None:
-    """Execute one night work cycle: pick an issue and hand it to cortex."""
-    max_items = config.get("max_work_items_per_night", 2)
-
-    issues = await _github.list_issues(state="open")
-    if not issues:
-        return
-
-    # Skip issues gated for human review or still in draft
-    issues = [i for i in issues if not _issue_has_skip_label(i)]
-    if not issues:
-        log.info("All open issues are draft or human-gated — skipping work cycle")
-        return
-
-    # Reject and close issues from unverified authors (security boundary)
-    issues = await _reject_unverified_issues(issues)
-    if not issues:
-        log.info("No verified-author issues remain after author check — skipping work cycle")
-        return
-
-    issue = issues[0]  # Highest priority (list_issues sorts by P-label)
-    issue_number = issue["number"]
-    issue_title = issue["title"]
-    issue_body = issue.get("body", "") or ""
-
-    # Extract priority from labels (default P3)
-    issue_priority = 3
-    for label in issue.get("labels", []):
-        label_name = label.get("name", "") if isinstance(label, dict) else str(label)
-        if label_name in ("P1", "P2", "P3", "P4", "P5"):
-            issue_priority = int(label_name[1])
-            break
-
-    log.info(
-        "Work loop: starting task",
-        extra={"issue": issue_number, "title": issue_title, "priority": issue_priority},
-    )
-
-    asyncio.create_task(
-        _github.comment_issue(
-            issue_number,
-            f"🔧 **Starting work on this task.**\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
-        )
-    )
-
-    # Load identity
-    try:
-        entry = await _kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = DEFAULT_IDENTITY
-
-    memories, graph_context = await _search_memories(f"{issue_title} {issue_body[:200]}")
-
-    # Fetch issue comments so cortex has full history before starting (#39)
-    issue_comments = await _github.get_issue_comments(issue_number)
-
-    turn_id = f"work-{uuid.uuid4().hex[:8]}"
-    work_payload = {
-        "turn_id": turn_id,
-        "mode": "work",
-        "identity": identity,
-        "conversation": [],
-        "memories": memories,
-        "graph_context": graph_context,
-        "prompt": None,
-        "work_context": {
-            "issue_number": issue_number,
-            "issue_title": issue_title,
-            "issue_description": issue_body,
-            "issue_priority": issue_priority,
-            "issue_comments": issue_comments,
-        },
-    }
-
-    queue = _pending.create(turn_id)
-    try:
-        await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
-        log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
-
-        response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
-        result_text = response_data.get("response", "")
-        global _work_items_tonight
-        _work_items_tonight += 1
-
-        clean_result = strip_tags(result_text or "")
-        log.info(
-            "Work turn complete",
-            extra={
-                "turn_id": turn_id,
-                "issue": issue_number,
-                "work_items_tonight": _work_items_tonight,
-                "max": max_items,
-            },
-        )
-
-        asyncio.create_task(
-            _feed_memories(
-                f"[Night work] Task: {issue_title} (priority P{issue_priority})",
-                clean_result or "Task completed",
-            )
-        )
-
-        close_comment = (
-            f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-        asyncio.create_task(_github.close_issue(issue_number, comment=close_comment))
-
-        # Request deploy to maki-immune after successful work (#40)
-        asyncio.create_task(_request_deploy_after_work(issue_number, issue_title))
-
-    except TimeoutError:
-        log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
-        # Publish stuck signal for immune
-        await _nc.publish(
-            CORTEX_STUCK,
-            json.dumps(
-                {
-                    "turn_id": turn_id,
-                    "mode": "work",
-                    "timeout_seconds": WORK_TURN_TIMEOUT,
-                    "user_waiting": False,
-                }
-            ).encode(),
-        )
-
-        asyncio.create_task(
-            _github.comment_issue(
-                issue_number,
-                f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s. Will retry next work session.",
-            )
-        )
-
-    except Exception:
-        log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
-
-        # Comment on issue about failure (issue stays open for retry)
-        asyncio.create_task(
-            _github.comment_issue(
-                issue_number,
-                "❌ **Work failed** due to an error. Will retry next work session.",
-            )
-        )
-
-    finally:
-        _pending.remove(turn_id)
-
-    # Cooldown between work items
-    cooldown = config.get("work_cooldown_minutes", 15) * 60
-    log.info("Work cooldown", extra={"cooldown_seconds": cooldown})
-    await asyncio.sleep(cooldown)
-
-
-WORK_LOOP_SPEC = LoopSpec(
-    name="work",
-    check_interval_getter=lambda: WORK_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: config.get("work_interval", WORK_CHECK_INTERVAL),
-    pre_claim_guard=_work_pre_claim_guard,
-    should_run=_work_should_run,
-    body=_work_body,
-)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _nc, _js, _config_kv, _lock_kv, _github
@@ -1258,9 +642,27 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_conversation_sync_listener())
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
-    asyncio.create_task(_run_loop(IDLE_LOOP_SPEC))
-    asyncio.create_task(_run_loop(CARE_LOOP_SPEC))
-    asyncio.create_task(_run_loop(WORK_LOOP_SPEC))
+    ctx = StemContext(
+        nc=_nc,
+        js=_js,
+        kv=_kv,
+        lock_kv=_lock_kv,
+        config_kv=_config_kv,
+        pending=_pending,
+        github=_github,
+        instance_id=INSTANCE_ID,
+        default_config=DEFAULT_CORTEX_CONFIG,
+        search_memories=_search_memories,
+        feed_memories=_feed_memories,
+        gather_system_state=_gather_system_state,
+        format_system_state=_format_system_state,
+        get_recent_conversation=_get_recent_conversation,
+        in_quiet_hours=_in_quiet_hours,
+        in_work_hours=_in_work_hours,
+    )
+    asyncio.create_task(_run_loop(IDLE_LOOP_SPEC, ctx))
+    asyncio.create_task(_run_loop(CARE_LOOP_SPEC, ctx))
+    asyncio.create_task(_run_loop(WORK_LOOP_SPEC, ctx))
 
     yield
 
