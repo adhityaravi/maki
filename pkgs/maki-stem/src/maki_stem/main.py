@@ -84,10 +84,10 @@ DEFAULT_CORTEX_CONFIG = {
     "care_interval": 1800,
     "quiet_hours_start": "23:00",
     "quiet_hours_end": "07:00",
-    "max_thoughts_per_day": 5,
+    "max_thoughts_per_day": 1,
     "max_reminders_per_day": 5,
-    "work_hours_start": "01:00",
-    "work_hours_end": "06:00",
+    "work_hours_start": "21:00",
+    "work_hours_end": "22:00",
     "max_work_items_per_night": 2,
     "work_cooldown_minutes": 15,
 }

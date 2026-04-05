@@ -21,6 +21,11 @@ log = logging.getLogger(__name__)
 IDLE_CHECK_INTERVAL = int(os.environ.get("IDLE_CHECK_INTERVAL", "60"))
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
+# Day-of-week scheduling: idle runs Mon/Wed/Fri/Sun, work runs Tue/Thu/Sat.
+# Python weekday(): 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun
+_IDLE_DAYS: frozenset[int] = frozenset({0, 2, 4, 6})  # Mon, Wed, Fri, Sun
+_PROACTIVE_WINDOW_HOUR = 21  # 9 PM local — loop fires once in the 21:00–22:00 window
+
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
@@ -42,22 +47,26 @@ _thoughts_today_date: str = ""
 
 
 async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
-    """Guard checks for the idle loop: activity threshold, quiet hours, daily cap."""
+    """Guard checks for the idle loop: scheduled window, activity threshold, daily cap.
+
+    Idle loop fires on Mon/Wed/Fri/Sun between 21:00–22:00 only — one thought per day.
+    """
     global _thoughts_today, _thoughts_today_date
+
+    now = datetime.now()
+    if now.weekday() not in _IDLE_DAYS or now.hour != _PROACTIVE_WINDOW_HOUR:
+        return False
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
         return False
 
-    if ctx.in_quiet_hours(config):
-        return False
-
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
     if today != _thoughts_today_date:
         _thoughts_today = 0
         _thoughts_today_date = today
 
-    max_thoughts = config.get("max_thoughts_per_day", 5)
+    max_thoughts = config.get("max_thoughts_per_day", 1)
     return _thoughts_today < max_thoughts
 
 

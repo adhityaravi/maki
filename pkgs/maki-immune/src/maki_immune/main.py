@@ -65,7 +65,7 @@ SITE_NAME = os.environ.get("SITE_NAME", "unknown")
 GOSSIP_STALE_THRESHOLD = CHECK_INTERVAL * 3  # 90s — prune peers silent longer than this
 
 DEFAULT_CONFIG = {
-    "heartbeat_interval": 1800,
+    "heartbeat_interval": 43200,  # 12 hours — periodic LLM patrol cadence
     "health_check_interval": 30,
     "reflex_restart_max": 3,
     "lock_ttl": 300,

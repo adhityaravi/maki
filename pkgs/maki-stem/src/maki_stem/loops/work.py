@@ -23,6 +23,10 @@ WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minut
 WORK_SKIP_LABELS = {"draft", "human"}
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
+# Work loop runs Tue/Thu/Sat in the same 21:00–22:00 window as idle (which runs Mon/Wed/Fri/Sun)
+_WORK_DAYS: frozenset[int] = frozenset({1, 3, 5})  # Tue, Thu, Sat
+_PROACTIVE_WINDOW_HOUR = 21  # 9 PM local
+
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
@@ -106,8 +110,9 @@ async def _request_deploy_after_work(issue_number: int, issue_title: str, ctx: S
 
 
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
-    """Pre-claim guard for the work loop: only proceed during work hours."""
-    return ctx.in_work_hours(config)
+    """Pre-claim guard for the work loop: only proceed on Tue/Thu/Sat during 21:00–22:00."""
+    now = datetime.now()
+    return now.weekday() in _WORK_DAYS and now.hour == _PROACTIVE_WINDOW_HOUR
 
 
 async def _work_should_run(config: dict, ctx: StemContext) -> bool:
