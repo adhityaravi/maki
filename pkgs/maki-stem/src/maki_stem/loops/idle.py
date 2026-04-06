@@ -14,7 +14,15 @@ from maki_common import kv_get_float, parse_config_tags, strip_tags
 from maki_common.config import apply_config_updates
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_THOUGHT_OUT
 
-from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
+from .base import (
+    RECENTLY_ACTIVE_THRESHOLD,
+    UNKNOWN_ISSUER_LABEL,
+    LoopSpec,
+    StemContext,
+    cron_window,
+    is_verified_issue_author,
+    issue_has_label,
+)
 
 log = logging.getLogger(__name__)
 
@@ -88,11 +96,19 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 
     # Fetch open issues for dedup — injected into cortex prompt so it doesn't
     # need to call list_issues itself and can suppress duplicates reliably.
+    # Issues with unknown-issuer label or from non-allowlisted authors are excluded;
+    # newly discovered unknown-author issues get tagged silently in the background.
     open_issues: list[dict] = []
     if ctx.github:
         try:
             issues = await ctx.github.list_issues(state="open")
-            open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in (issues or [])]
+            for i in issues or []:
+                if issue_has_label(i, UNKNOWN_ISSUER_LABEL):
+                    continue
+                if not is_verified_issue_author(i):
+                    asyncio.create_task(ctx.github.add_label(i.get("number"), UNKNOWN_ISSUER_LABEL))
+                    continue
+                open_issues.append({"number": i.get("number"), "title": i.get("title", "")})
         except Exception:
             log.warning("Failed to fetch open issues for idle dedup")
 

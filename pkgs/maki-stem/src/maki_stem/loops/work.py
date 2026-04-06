@@ -13,15 +13,22 @@ from datetime import UTC, datetime
 from maki_common import kv_get_float, strip_tags
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST, DEPLOY_REQUEST
 
-from .base import USER_INACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
+from .base import (
+    UNKNOWN_ISSUER_LABEL,
+    USER_INACTIVE_THRESHOLD,
+    LoopSpec,
+    StemContext,
+    cron_window,
+    is_verified_issue_author,
+    issue_has_label,
+)
 
 log = logging.getLogger(__name__)
 
 WORK_CHECK_INTERVAL = int(os.environ.get("WORK_CHECK_INTERVAL", "300"))
 WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minutes
 
-WORK_SKIP_LABELS = {"draft", "human"}
-ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
+WORK_SKIP_LABELS = {"draft", "human", UNKNOWN_ISSUER_LABEL}
 
 # Work fires at 03:00 on Tue/Thu/Sat (cron: 2=Tue, 4=Thu, 6=Sat)
 WORK_CRON = "0 3 * * 2,4,6"
@@ -43,36 +50,25 @@ def _issue_has_skip_label(issue: dict) -> bool:
     return False
 
 
-def _is_verified_issue_author(issue: dict) -> bool:
-    """Return True if the issue was filed by a trusted author."""
-    login = issue.get("user", {}).get("login", "")
-    return login in ALLOWED_ISSUE_AUTHORS
-
-
-async def _reject_unverified_issues(issues: list[dict], ctx: StemContext) -> list[dict]:
-    """Comment on and close issues from unverified authors. Returns only verified issues."""
+async def _tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[dict]:
+    """Tag issues from unverified authors with UNKNOWN_ISSUER_LABEL. Returns only verified issues."""
     if not ctx.github:
         return issues
     verified = []
     for issue in issues:
         login = issue.get("user", {}).get("login", "")
-        if _is_verified_issue_author(issue):
+        if is_verified_issue_author(issue):
             verified.append(issue)
-        else:
+        elif not issue_has_label(issue, UNKNOWN_ISSUER_LABEL):
             number = issue.get("number")
             log.warning(
-                "Rejecting issue from unverified author",
+                "Tagging issue from unverified author",
                 extra={"number": number, "author": login},
             )
             try:
-                await ctx.github.comment_issue(
-                    number,
-                    f"Closing: this issue was filed by `{login}` who is not a verified contributor. "
-                    "Only issues from trusted accounts are processed by the autonomous work loop.",
-                )
-                await ctx.github.close_issue(number)
+                await ctx.github.add_label(number, UNKNOWN_ISSUER_LABEL)
             except Exception:
-                log.exception("Failed to reject issue", extra={"number": number})
+                log.exception("Failed to tag unverified issue", extra={"number": number})
     return verified
 
 
@@ -155,8 +151,8 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         log.info("All open issues are draft or human-gated — skipping work cycle")
         return
 
-    # Reject and close issues from unverified authors (security boundary)
-    issues = await _reject_unverified_issues(issues, ctx)
+    # Tag and filter issues from unverified authors (security boundary)
+    issues = await _tag_unverified_issues(issues, ctx)
     if not issues:
         log.info("No verified-author issues remain after author check — skipping work cycle")
         return

@@ -18,6 +18,27 @@ log = logging.getLogger(__name__)
 RECENTLY_ACTIVE_THRESHOLD = 600  # 10 minutes
 USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 
+# Issue author allowlist — only issues from these accounts are processed by any loop.
+# Unknown-author issues get tagged with UNKNOWN_ISSUER_LABEL and ignored.
+UNKNOWN_ISSUER_LABEL = "unknown-issuer"
+ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
+
+
+def is_verified_issue_author(issue: dict) -> bool:
+    """Return True if the issue was filed by a trusted author."""
+    login = issue.get("user", {}).get("login", "")
+    return login in ALLOWED_ISSUE_AUTHORS
+
+
+def issue_has_label(issue: dict, label: str) -> bool:
+    """Return True if the issue carries the given label (case-insensitive)."""
+    for lbl in issue.get("labels", []):
+        name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
+        if name.lower() == label.lower():
+            return True
+    return False
+
+
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
 CRON_WINDOW_SECONDS = 1800  # 30 minutes
 
