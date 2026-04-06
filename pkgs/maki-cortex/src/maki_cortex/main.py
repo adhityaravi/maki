@@ -235,6 +235,10 @@ Relevant memories for this task have been preloaded — check the "Relevant memo
 - If a task is truly impossible to solve autonomously (requires physical access, credentials \
 you cannot obtain, or human judgment that cannot be automated), add the label "human" via \
 comment_issue explaining why, then leave the issue open. Do NOT close it — Adi will handle it.
+- **For changes involving Terraform/OpenTofu, SOPS/secrets, new Kubernetes manifests, or \
+infra-level additions:** open a PR instead of pushing directly. Assign it to adhityaravi. \
+Add the label "human" to the issue via comment_issue, then leave the issue open and comment \
+the PR link on it. Do NOT close it — Adi will review and merge.
 - Be brief in your response. Report what you did, not what you plan to do.
 - One task at a time. Focus."""
 

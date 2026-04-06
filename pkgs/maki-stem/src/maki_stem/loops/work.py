@@ -243,9 +243,18 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             )
         )
 
-        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-        close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
-        asyncio.create_task(ctx.github.close_issue(issue_number, comment=close_comment))
+        # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
+        # for infra changes and left it open for Adi to review). If so, skip auto-close.
+        refreshed = await ctx.github.get_issue(issue_number)
+        if refreshed and _issue_has_skip_label(refreshed):
+            log.info(
+                "Issue has human/draft label after work — skipping auto-close",
+                extra={"issue": issue_number},
+            )
+        else:
+            ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
+            asyncio.create_task(ctx.github.close_issue(issue_number, comment=close_comment))
 
         # Request deploy to maki-immune after successful work (#40)
         asyncio.create_task(_request_deploy_after_work(issue_number, issue_title, ctx))

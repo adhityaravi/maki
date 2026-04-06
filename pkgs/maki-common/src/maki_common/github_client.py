@@ -194,6 +194,19 @@ class GitHubIssueClient:
             log.exception("Failed to comment on issue", extra={"number": number})
             return False
 
+    async def get_issue(self, number: int) -> dict[str, Any] | None:
+        """Fetch a single issue by number. Returns the issue dict or None on failure."""
+        try:
+            resp = await self._client.get(
+                f"{API}/repos/{self._repo_path}/issues/{number}",
+                headers=await self._auth.headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            log.exception("Failed to fetch issue", extra={"number": number})
+            return None
+
     async def close_issue(self, number: int, comment: str = "") -> bool:
         """Close an issue, optionally with a closing comment. Returns True on success."""
         try:
