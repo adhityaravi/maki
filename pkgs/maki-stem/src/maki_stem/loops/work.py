@@ -14,6 +14,7 @@ from maki_common import kv_get_float, strip_tags
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST, DEPLOY_REQUEST
 
 from .base import (
+    TOOLS_PROMPT,
     UNKNOWN_ISSUER_LABEL,
     USER_INACTIVE_THRESHOLD,
     LoopSpec,
@@ -35,6 +36,95 @@ WORK_CRON = "0 3 * * 2,4,6"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
+
+_WORK_PROMPT = """## Work Mode
+
+You have a GitHub issue to execute. Complete it fully — code changes, commit, \
+push, build, deploy if needed. You have every tool available.
+
+## Task
+Issue: #{issue_number}
+Title: {issue_title}
+Description: {issue_description}
+Priority: {issue_priority}
+Comments: {issue_comments}
+
+## Context
+Relevant memories for this task have been preloaded — check the "Relevant memories" and \
+"Relationships" sections below before starting. Use them to inform your approach. \
+Read the issue comments above — they may contain clarifications, design decisions, or \
+explicit instructions that override the original description.
+
+## Instructions
+1. Understand the task. Use search_code and read_file to study relevant code.
+2. Implement changes with write_file.
+3. Rebuild the code graph with rebuild_code_graph after changes.
+4. **Run quality_check before committing.** Fix any lint or format issues it finds.
+5. Commit and push with git_commit_and_push.
+6. CI builds Docker images automatically on push. Use get_workflow_status to verify builds succeed.
+7. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
+8. When done, close the issue with close_issue and a brief result summary.
+9. Store any learnings with add_memory.
+
+## Rules
+- Execute the task. Don't just plan — do it.
+- If the task is unclear, do your best interpretation.
+- If blocked or too risky, comment on the issue with why and leave it open.
+- If a task is truly impossible to solve autonomously (requires physical access, credentials \
+you cannot obtain, or human judgment that cannot be automated), use add_label to add the \
+"human" label, comment on the issue explaining why, then leave it open. Do NOT close it — \
+Adi will handle it.
+- **Open a PR instead of pushing directly when any of the following apply:** \
+(1) changes involve Terraform/OpenTofu, SOPS/secrets, or new Kubernetes manifests; \
+(2) the issue description or comments explicitly ask for a PR. \
+When opening a PR: assign it to adhityaravi, use add_label to add "human" to the issue, \
+comment the PR link on the issue, and leave the issue open. Do NOT close it — Adi will \
+review and merge.
+- Be brief in your response. Report what you did, not what you plan to do.
+- One task at a time. Focus."""
+
+
+def _build_work_system_prompt(
+    identity: str,
+    memories: list,
+    graph_context: list,
+    work_context: dict,
+) -> str:
+    """Assemble the complete system prompt for a work turn."""
+    raw_comments = work_context.get("issue_comments", [])
+    if raw_comments:
+        comment_lines = [
+            f"  [{c.get('created_at', '')}] @{c.get('author', 'unknown')}: {c.get('body', '')}"  # noqa: E501
+            for c in raw_comments
+        ]
+        issue_comments_str = "\n" + "\n".join(comment_lines)
+    else:
+        issue_comments_str = "None"
+
+    parts = []
+    if identity:
+        parts.append(identity)
+
+    parts.append(
+        _WORK_PROMPT.format(
+            issue_number=work_context.get("issue_number", "?"),
+            issue_title=work_context.get("issue_title", "?"),
+            issue_description=work_context.get("issue_description", "No description provided."),
+            issue_priority=work_context.get("issue_priority", "?"),
+            issue_comments=issue_comments_str,
+        )
+    )
+
+    if memories:
+        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
+        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+
+    if graph_context:
+        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
+
+    parts.append(TOOLS_PROMPT)
+    return "\n\n".join(parts)
+
 
 # Module-level nightly counters
 _work_items_tonight: int = 0
@@ -195,6 +285,13 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     issue_comments = await ctx.github.get_issue_comments(issue_number)
 
     turn_id = f"work-{uuid.uuid4().hex[:8]}"
+    work_context = {
+        "issue_number": issue_number,
+        "issue_title": issue_title,
+        "issue_description": issue_body,
+        "issue_priority": issue_priority,
+        "issue_comments": issue_comments,
+    }
     work_payload = {
         "turn_id": turn_id,
         "mode": "work",
@@ -203,13 +300,8 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "memories": memories,
         "graph_context": graph_context,
         "prompt": None,
-        "work_context": {
-            "issue_number": issue_number,
-            "issue_title": issue_title,
-            "issue_description": issue_body,
-            "issue_priority": issue_priority,
-            "issue_comments": issue_comments,
-        },
+        "work_context": work_context,
+        "system_prompt": _build_work_system_prompt(identity, memories, graph_context, work_context),
     }
 
     queue = ctx.pending.create(turn_id)

@@ -42,6 +42,23 @@ def issue_has_label(issue: dict, label: str) -> bool:
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
 CRON_WINDOW_SECONDS = 1800  # 30 minutes
 
+# Shared tools listing injected into every loop system prompt.
+# Lives here so all loops stay in sync — edit once, affects all.
+TOOLS_PROMPT = """## Tools
+Memory: search_memories, get_all_memories, add_memory, get_system_health, check_component, \
+get_config, update_config
+Code: search_code (use FIRST — scopes: symbol/callers/callees/references/definition/file/path), \
+read_file, write_file, list_directory, search_text, rebuild_code_graph
+Git: git_status, git_diff, quality_check (run before commit), git_commit_and_push, git_pull, \
+get_workflow_status, get_workflow_logs
+Deploy: request_deploy, get_deploy_status
+Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label, remove_label
+
+Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
+→ git_commit_and_push → request_deploy
+
+Use add_memory for anything worth remembering. Use search_code before reading files."""
+
 
 def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
     """Return True if the cron expression was due within the last *window_seconds*.

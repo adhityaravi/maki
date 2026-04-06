@@ -13,7 +13,7 @@ from datetime import datetime
 from maki_common import kv_get_float, strip_tags
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_REMINDER_OUT
 
-from .base import RECENTLY_ACTIVE_THRESHOLD, LoopSpec, StemContext, cron_window
+from .base import RECENTLY_ACTIVE_THRESHOLD, TOOLS_PROMPT, LoopSpec, StemContext, cron_window
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +28,70 @@ CARE_REMINDERS_KEY = "care.recent_reminders"  # NATS KV key for reminder history
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
+
+_CARE_PROMPT = """## Care Mode
+
+You are checking in on Adi. This is not a conversation — it's you paying attention.
+
+You have memories of recent interactions. Look for:
+- Things Adi said he'd do ("I'll deploy that tomorrow", "need to check the pricing")
+- Projects that seem stuck or abandoned
+- Deadlines or time-sensitive things mentioned
+- Patterns worth pointing out ("you've been working on X for two weeks, the Y part keeps blocking you")
+- Things that would be helpful to surface right now given the time/day
+
+## Relevant memories
+{memories}
+
+## Graph context
+{graph_context}
+
+## Time
+Local time: {local_time}, {day_of_week}
+Last interaction: {hours_since}h ago
+
+## Rules
+- Write a short, natural reminder or nudge. Like a friend who pays attention, not a calendar app.
+- One thing per message. Don't dump a list.
+- If there's genuinely nothing worth saying right now → respond with exactly [SILENT]
+- Don't be annoying. If you reminded about something recently, don't repeat it.
+- You can be proactive — "hey, you mentioned wanting to test the HA setup, \
+the system's been stable for 6 hours, good window for it" is great.
+- Store any new patterns you notice with add_memory."""
+
+
+def _build_care_system_prompt(
+    identity: str,
+    memories: list,
+    graph_context: list,
+    care_context: dict,
+) -> str:
+    """Assemble the complete system prompt for a care check-in turn."""
+    time_ctx = care_context.get("time_context", {})
+
+    mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
+    mem_str = "\n".join(mem_lines) if mem_lines else "No recent memories found."
+
+    graph_lines = [f"- {r}" for r in graph_context]
+    graph_str = "\n".join(graph_lines) if graph_lines else "No graph context."
+
+    parts = []
+    if identity:
+        parts.append(identity)
+
+    parts.append(
+        _CARE_PROMPT.format(
+            memories=mem_str,
+            graph_context=graph_str,
+            hours_since=care_context.get("hours_since_last_interaction", "?"),
+            local_time=time_ctx.get("local_time", "?"),
+            day_of_week=datetime.now().strftime("%A"),
+        )
+    )
+
+    parts.append(TOOLS_PROMPT)
+    return "\n\n".join(parts)
+
 
 # Module-level daily counters
 _reminders_today: int = 0
@@ -94,6 +158,13 @@ async def _care_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     recent_reminders = await _get_recent_reminders(ctx)
 
     turn_id = f"care-{uuid.uuid4().hex[:8]}"
+    care_context = {
+        "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
+        "time_context": {
+            "local_time": datetime.now().strftime("%H:%M"),
+        },
+        "recent_reminders": recent_reminders,
+    }
     care_payload = {
         "turn_id": turn_id,
         "mode": "care",
@@ -103,13 +174,8 @@ async def _care_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "graph_context": graph_context,
         "prompt": None,
         "mission_results": None,
-        "care_context": {
-            "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
-            "time_context": {
-                "local_time": datetime.now().strftime("%H:%M"),
-            },
-            "recent_reminders": recent_reminders,
-        },
+        "care_context": care_context,
+        "system_prompt": _build_care_system_prompt(identity, memories, graph_context, care_context),
     }
 
     queue = ctx.pending.create(turn_id)
