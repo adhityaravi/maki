@@ -212,10 +212,13 @@ Issue: #{issue_number}
 Title: {issue_title}
 Description: {issue_description}
 Priority: {issue_priority}
+Comments: {issue_comments}
 
 ## Context
 Relevant memories for this task have been preloaded — check the "Relevant memories" and \
-"Relationships" sections above before starting. Use them to inform your approach.
+"Relationships" sections above before starting. Use them to inform your approach. \
+Read the issue comments above — they may contain clarifications, design decisions, or \
+explicit instructions that override the original description.
 
 ## Instructions
 1. Understand the task. Use search_code and read_file to study relevant code.
@@ -233,12 +236,15 @@ Relevant memories for this task have been preloaded — check the "Relevant memo
 - If the task is unclear, do your best interpretation.
 - If blocked or too risky, comment on the issue with why and leave it open.
 - If a task is truly impossible to solve autonomously (requires physical access, credentials \
-you cannot obtain, or human judgment that cannot be automated), add the label "human" via \
-comment_issue explaining why, then leave the issue open. Do NOT close it — Adi will handle it.
-- **For changes involving Terraform/OpenTofu, SOPS/secrets, new Kubernetes manifests, or \
-infra-level additions:** open a PR instead of pushing directly. Assign it to adhityaravi. \
-Add the label "human" to the issue via comment_issue, then leave the issue open and comment \
-the PR link on it. Do NOT close it — Adi will review and merge.
+you cannot obtain, or human judgment that cannot be automated), use add_label to add the \
+"human" label, comment on the issue explaining why, then leave it open. Do NOT close it — \
+Adi will handle it.
+- **Open a PR instead of pushing directly when any of the following apply:** \
+(1) changes involve Terraform/OpenTofu, SOPS/secrets, or new Kubernetes manifests; \
+(2) the issue description or comments explicitly ask for a PR. \
+When opening a PR: assign it to adhityaravi, use add_label to add "human" to the issue, \
+comment the PR link on the issue, and leave the issue open. Do NOT close it — Adi will \
+review and merge.
 - Be brief in your response. Report what you did, not what you plan to do.
 - One task at a time. Focus."""
 
@@ -251,7 +257,7 @@ read_file, write_file, list_directory, search_text, rebuild_code_graph
 Git: git_status, git_diff, quality_check (run before commit), git_commit_and_push, git_pull, \
 get_workflow_status, get_workflow_logs
 Deploy: request_deploy, get_deploy_status
-Issues: create_issue, list_issues, get_issue, close_issue, comment_issue
+Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label
 
 Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
 → git_commit_and_push → request_deploy
@@ -326,12 +332,22 @@ def build_system_prompt(turn: dict) -> str:
     # Work mode — executing a GitHub issue
     if turn.get("mode") == "work":
         work_ctx = turn.get("work_context", {})
+        raw_comments = work_ctx.get("issue_comments", [])
+        if raw_comments:
+            comment_lines = [
+                f"  [{c.get('created_at', '')}] @{c.get('author', 'unknown')}: {c.get('body', '')}"
+                for c in raw_comments
+            ]
+            issue_comments_str = "\n" + "\n".join(comment_lines)
+        else:
+            issue_comments_str = "None"
         parts.append(
             WORK_PROMPT.format(
                 issue_number=work_ctx.get("issue_number", "?"),
                 issue_title=work_ctx.get("issue_title", "?"),
                 issue_description=work_ctx.get("issue_description", "No description provided."),
                 issue_priority=work_ctx.get("issue_priority", "?"),
+                issue_comments=issue_comments_str,
             )
         )
 

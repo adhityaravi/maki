@@ -373,6 +373,27 @@ def make_github_issues_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def add_label(args: dict[str, Any]) -> dict[str, Any]:
+        """Add a label to an issue."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        label = args.get("label", "")
+        log.info("Tool: add_label", extra={"repo": repo, "number": number, "label": label})
+        if not number or not label:
+            return mcp_result("Error: 'number' and 'label' are required.")
+        try:
+            resp = await client.post(
+                f"{API}/repos/{repo}/issues/{number}/labels",
+                headers=await auth.headers(),
+                json={"labels": [label]},
+            )
+            resp.raise_for_status()
+            return mcp_result(f"Label '{label}' added to #{number}.")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
     return [
         (
             "list_issues",
@@ -404,5 +425,11 @@ def make_github_issues_tools(
             "Add a comment to an issue.",
             {"repo": str, "number": str, "body": str},
             comment_issue,
+        ),
+        (
+            "add_label",
+            "Add a label to an issue. Use this to apply labels like 'human', 'P1', etc.",
+            {"repo": str, "number": str, "label": str},
+            add_label,
         ),
     ]

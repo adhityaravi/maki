@@ -223,3 +223,18 @@ class GitHubIssueClient:
         except Exception:
             log.exception("Failed to close issue", extra={"number": number})
             return False
+
+    async def add_label(self, number: int, label: str) -> bool:
+        """Add a label to an issue. Returns True on success."""
+        try:
+            resp = await self._client.post(
+                f"{API}/repos/{self._repo_path}/issues/{number}/labels",
+                headers=await self._auth.headers(),
+                json={"labels": [label]},
+            )
+            resp.raise_for_status()
+            log.info("GitHub issue label added", extra={"number": number, "label": label})
+            return True
+        except Exception:
+            log.exception("Failed to add label to issue", extra={"number": number, "label": label})
+            return False
