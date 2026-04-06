@@ -394,6 +394,26 @@ def make_github_issues_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def remove_label(args: dict[str, Any]) -> dict[str, Any]:
+        """Remove a label from an issue."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        label = args.get("label", "")
+        log.info("Tool: remove_label", extra={"repo": repo, "number": number, "label": label})
+        if not number or not label:
+            return mcp_result("Error: 'number' and 'label' are required.")
+        try:
+            resp = await client.delete(
+                f"{API}/repos/{repo}/issues/{number}/labels/{label}",
+                headers=await auth.headers(),
+            )
+            resp.raise_for_status()
+            return mcp_result(f"Label '{label}' removed from #{number}.")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
     return [
         (
             "list_issues",
@@ -431,5 +451,11 @@ def make_github_issues_tools(
             "Add a label to an issue. Use this to apply labels like 'human', 'P1', etc.",
             {"repo": str, "number": str, "label": str},
             add_label,
+        ),
+        (
+            "remove_label",
+            "Remove a label from an issue. Use this to undo a label you added in error.",
+            {"repo": str, "number": str, "label": str},
+            remove_label,
         ),
     ]

@@ -257,7 +257,7 @@ read_file, write_file, list_directory, search_text, rebuild_code_graph
 Git: git_status, git_diff, quality_check (run before commit), git_commit_and_push, git_pull, \
 get_workflow_status, get_workflow_logs
 Deploy: request_deploy, get_deploy_status
-Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label
+Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label, remove_label
 
 Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
 → git_commit_and_push → request_deploy

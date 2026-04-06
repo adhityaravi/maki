@@ -238,3 +238,17 @@ class GitHubIssueClient:
         except Exception:
             log.exception("Failed to add label to issue", extra={"number": number, "label": label})
             return False
+
+    async def remove_label(self, number: int, label: str) -> bool:
+        """Remove a label from an issue. Returns True on success."""
+        try:
+            resp = await self._client.delete(
+                f"{API}/repos/{self._repo_path}/issues/{number}/labels/{label}",
+                headers=await self._auth.headers(),
+            )
+            resp.raise_for_status()
+            log.info("GitHub issue label removed", extra={"number": number, "label": label})
+            return True
+        except Exception:
+            log.exception("Failed to remove label from issue", extra={"number": number, "label": label})
+            return False
