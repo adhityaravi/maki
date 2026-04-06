@@ -323,6 +323,47 @@ def make_github_issues_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def create_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Create a pull request."""
+        repo = _resolve_repo(args)
+        title = args.get("title", "")
+        body = args.get("body", "")
+        head = args.get("head", "")
+        base = args.get("base", "main")
+        draft = args.get("draft", "false").lower() == "true"
+        reviewers = args.get("reviewers", "")
+        log.info("Tool: create_pr", extra={"repo": repo, "head": head, "base": base})
+        if not title or not head:
+            return mcp_result("Error: 'title' and 'head' are required.")
+        try:
+            payload: dict[str, Any] = {"title": title, "head": head, "base": base, "draft": draft}
+            if body:
+                payload["body"] = body
+            resp = await client.post(
+                f"{API}/repos/{repo}/pulls",
+                headers=await auth.headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            pr = resp.json()
+            pr_number = pr["number"]
+            pr_url = pr["html_url"]
+
+            # Request reviewers if provided
+            if reviewers:
+                reviewer_list = [r.strip() for r in reviewers.split(",") if r.strip()]
+                await client.post(
+                    f"{API}/repos/{repo}/pulls/{pr_number}/requested_reviewers",
+                    headers=await auth.headers(),
+                    json={"reviewers": reviewer_list},
+                )
+
+            return mcp_result(f"Created PR #{pr_number}: {title}\n{pr_url}")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
     async def close_issue(args: dict[str, Any]) -> dict[str, Any]:
         """Close an issue."""
         repo = _resolve_repo(args)
@@ -433,6 +474,13 @@ def make_github_issues_tools(
             "Create a new issue. Labels are comma-separated.",
             {"repo": str, "title": str, "body": str, "labels": str},
             create_issue,
+        ),
+        (
+            "create_pr",
+            "Create a pull request. 'head' is the source branch, 'base' defaults to 'main'. "
+            "Optionally set 'draft' to 'true' and provide comma-separated 'reviewers'.",
+            {"repo": str, "title": str, "body": str, "head": str, "base": str, "draft": str, "reviewers": str},
+            create_pr,
         ),
         (
             "close_issue",
