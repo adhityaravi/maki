@@ -2,6 +2,9 @@
 
 Subscribes to turn requests via NATS, invokes Claude, publishes responses.
 Normal turns use streaming with MCP tools. Idle reflection stays single-shot.
+
+Tools loaded from maki_common include a full GitHub PR suite:
+list_prs, get_pr, comment_pr, update_pr, merge_pr, close_pr, request_pr_review.
 """
 
 import asyncio

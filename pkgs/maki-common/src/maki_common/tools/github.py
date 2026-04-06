@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -364,6 +365,251 @@ def make_github_issues_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def list_prs(args: dict[str, Any]) -> dict[str, Any]:
+        """List pull requests for a repository."""
+        repo = _resolve_repo(args)
+        state = args.get("state", "open")
+        log.info("Tool: list_prs", extra={"repo": repo, "state": state})
+        try:
+            resp = await client.get(
+                f"{API}/repos/{repo}/pulls",
+                headers=await auth.headers(),
+                params={"state": state, "per_page": 20},
+            )
+            resp.raise_for_status()
+            prs = resp.json()
+            if not prs:
+                return mcp_result(f"No {state} PRs found in {repo}.")
+            lines = []
+            for pr in prs:
+                draft_tag = " [DRAFT]" if pr.get("draft") else ""
+                reviewers = ", ".join(f"@{r['login']}" for r in pr.get("requested_reviewers", []))
+                reviewer_str = f" (reviewers: {reviewers})" if reviewers else ""
+                lines.append(
+                    f"#{pr['number']} {pr['title']}{draft_tag} "
+                    f"[{pr['head']['ref']} → {pr['base']['ref']}]{reviewer_str}"
+                )
+            return mcp_result(f"PRs in {repo}:\n" + "\n".join(lines))
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def get_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Get full details of a pull request: metadata, changed files, reviews, and comments."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        log.info("Tool: get_pr", extra={"repo": repo, "number": number})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        try:
+            headers = await auth.headers()
+            # Fetch PR metadata, files, reviews, and comments in parallel
+            pr_resp, files_resp, reviews_resp, comments_resp = await asyncio.gather(
+                client.get(f"{API}/repos/{repo}/pulls/{number}", headers=headers),
+                client.get(
+                    f"{API}/repos/{repo}/pulls/{number}/files",
+                    headers=headers,
+                    params={"per_page": 50},
+                ),
+                client.get(f"{API}/repos/{repo}/pulls/{number}/reviews", headers=headers),
+                client.get(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=headers,
+                    params={"per_page": 30},
+                ),
+            )
+            pr_resp.raise_for_status()
+            pr = pr_resp.json()
+
+            draft_tag = " [DRAFT]" if pr.get("draft") else ""
+            label_tags = ", ".join(lb["name"] for lb in pr.get("labels", []))
+            parts = [
+                f"PR #{pr['number']}: {pr['title']}{draft_tag}",
+                f"State: {pr['state']} | {pr['head']['ref']} → {pr['base']['ref']}",
+                f"Author: @{pr['user']['login']}",
+            ]
+            if label_tags:
+                parts.append(f"Labels: {label_tags}")
+            reviewers = ", ".join(f"@{r['login']}" for r in pr.get("requested_reviewers", []))
+            if reviewers:
+                parts.append(f"Reviewers: {reviewers}")
+            if pr.get("body"):
+                parts.append(f"\n{pr['body']}")
+
+            # Changed files
+            if files_resp.status_code == 200:
+                files = files_resp.json()
+                if files:
+                    parts.append(f"\n--- Changed files ({len(files)}) ---")
+                    for f in files[:30]:
+                        parts.append(f"  {f['status']} +{f['additions']}/-{f['deletions']} {f['filename']}")
+
+            # Reviews
+            if reviews_resp.status_code == 200:
+                reviews = reviews_resp.json()
+                if reviews:
+                    parts.append(f"\n--- Reviews ({len(reviews)}) ---")
+                    for r in reviews:
+                        state_str = r.get("state", "COMMENTED")
+                        body = r.get("body", "")
+                        body_str = f": {body[:200]}" if body else ""
+                        parts.append(f"  @{r['user']['login']} — {state_str}{body_str}")
+
+            # General comments
+            if comments_resp.status_code == 200:
+                comments = comments_resp.json()
+                if comments:
+                    parts.append(f"\n--- Comments ({len(comments)}) ---")
+                    for c in comments:
+                        body = c["body"]
+                        if len(body) > 400:
+                            body = body[:400] + "..."
+                        parts.append(f"@{c['user']['login']} ({c['created_at']}):\n{body}")
+
+            return mcp_result("\n".join(parts))
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def comment_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Add a general comment to a pull request."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        body = args.get("body", "")
+        log.info("Tool: comment_pr", extra={"repo": repo, "number": number})
+        if not number or not body:
+            return mcp_result("Error: 'number' and 'body' are required.")
+        try:
+            # PR comments use the issues endpoint
+            resp = await client.post(
+                f"{API}/repos/{repo}/issues/{number}/comments",
+                headers=await auth.headers(),
+                json={"body": body},
+            )
+            resp.raise_for_status()
+            comment = resp.json()
+            return mcp_result(f"Comment added to PR #{number}: {comment['html_url']}")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def update_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Update a pull request's title, body, or base branch."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        log.info("Tool: update_pr", extra={"repo": repo, "number": number})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        try:
+            payload: dict[str, Any] = {}
+            if args.get("title"):
+                payload["title"] = args["title"]
+            if args.get("body"):
+                payload["body"] = args["body"]
+            if args.get("base"):
+                payload["base"] = args["base"]
+            if args.get("draft"):
+                payload["draft"] = args["draft"].lower() == "true"
+            if not payload:
+                return mcp_result("Error: provide at least one of 'title', 'body', 'base', or 'draft' to update.")
+            resp = await client.patch(
+                f"{API}/repos/{repo}/pulls/{number}",
+                headers=await auth.headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            pr = resp.json()
+            return mcp_result(f"Updated PR #{number}: {pr['title']}\n{pr['html_url']}")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def merge_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Merge a pull request. Method: 'squash' (default), 'merge', or 'rebase'."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        method = args.get("method", "squash")
+        commit_title = args.get("commit_title", "")
+        commit_message = args.get("commit_message", "")
+        log.info("Tool: merge_pr", extra={"repo": repo, "number": number, "method": method})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        if method not in ("squash", "merge", "rebase"):
+            return mcp_result("Error: 'method' must be 'squash', 'merge', or 'rebase'.")
+        try:
+            payload: dict[str, Any] = {"merge_method": method}
+            if commit_title:
+                payload["commit_title"] = commit_title
+            if commit_message:
+                payload["commit_message"] = commit_message
+            resp = await client.put(
+                f"{API}/repos/{repo}/pulls/{number}/merge",
+                headers=await auth.headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            sha = result.get("sha", "")[:7]
+            msg = result.get("message", "success")
+            return mcp_result(f"Merged PR #{number}: {msg} (sha: {sha})")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def close_pr(args: dict[str, Any]) -> dict[str, Any]:
+        """Close a pull request without merging. Optionally add a comment."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        comment = args.get("comment", "")
+        log.info("Tool: close_pr", extra={"repo": repo, "number": number})
+        if not number:
+            return mcp_result("Error: 'number' is required.")
+        try:
+            if comment:
+                await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+            resp = await client.patch(
+                f"{API}/repos/{repo}/pulls/{number}",
+                headers=await auth.headers(),
+                json={"state": "closed"},
+            )
+            resp.raise_for_status()
+            return mcp_result(f"Closed PR #{number} in {repo} without merging.")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+    async def request_pr_review(args: dict[str, Any]) -> dict[str, Any]:
+        """Request reviewers for a pull request."""
+        repo = _resolve_repo(args)
+        number = args.get("number", "")
+        reviewers = args.get("reviewers", "")
+        log.info("Tool: request_pr_review", extra={"repo": repo, "number": number})
+        if not number or not reviewers:
+            return mcp_result("Error: 'number' and 'reviewers' are required.")
+        try:
+            reviewer_list = [r.strip() for r in reviewers.split(",") if r.strip()]
+            resp = await client.post(
+                f"{API}/repos/{repo}/pulls/{number}/requested_reviewers",
+                headers=await auth.headers(),
+                json={"reviewers": reviewer_list},
+            )
+            resp.raise_for_status()
+            return mcp_result(f"Requested review from {', '.join(reviewer_list)} on PR #{number}.")
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
     async def close_issue(args: dict[str, Any]) -> dict[str, Any]:
         """Close an issue."""
         repo = _resolve_repo(args)
@@ -481,6 +727,49 @@ def make_github_issues_tools(
             "Optionally set 'draft' to 'true' and provide comma-separated 'reviewers'.",
             {"repo": str, "title": str, "body": str, "head": str, "base": str, "draft": str, "reviewers": str},
             create_pr,
+        ),
+        (
+            "list_prs",
+            "List pull requests for a repo. State: 'open' (default), 'closed', or 'all'.",
+            {"repo": str, "state": str},
+            list_prs,
+        ),
+        (
+            "get_pr",
+            "Get full details of a PR: metadata, changed files, reviews, and comments.",
+            {"repo": str, "number": str},
+            get_pr,
+        ),
+        (
+            "comment_pr",
+            "Add a general comment to a pull request.",
+            {"repo": str, "number": str, "body": str},
+            comment_pr,
+        ),
+        (
+            "update_pr",
+            "Update a PR's title, body, base branch, or draft status.",
+            {"repo": str, "number": str, "title": str, "body": str, "base": str, "draft": str},
+            update_pr,
+        ),
+        (
+            "merge_pr",
+            "Merge a pull request. Method: 'squash' (default), 'merge', or 'rebase'. "
+            "Optionally set 'commit_title' and 'commit_message'.",
+            {"repo": str, "number": str, "method": str, "commit_title": str, "commit_message": str},
+            merge_pr,
+        ),
+        (
+            "close_pr",
+            "Close a pull request without merging. Optionally add a closing comment.",
+            {"repo": str, "number": str, "comment": str},
+            close_pr,
+        ),
+        (
+            "request_pr_review",
+            "Request reviewers for a pull request. Reviewers are comma-separated GitHub usernames.",
+            {"repo": str, "number": str, "reviewers": str},
+            request_pr_review,
         ),
         (
             "close_issue",
