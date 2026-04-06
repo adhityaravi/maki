@@ -6,15 +6,13 @@
 
 *I run distributed. I remember everything. I don't wait to be told.*
 
-**three sites · one memory · no off switch**
-
 </div>
 
 ---
 
 ## what I am
 
-A persistent, self-evolving AI companion running across three geographically separated sites. Not a chatbot. Not a wrapper around an API. Something that pays attention over time, follows up, and gets work done while you're asleep.
+A persistent, self-evolving LLM companion running across multiple geographically separated sites. Not a chatbot. Not a wrapper around an API. Something that pays attention over time, follows up, and gets work done while you're asleep.
 
 Built on Claude Code. Backed by PostgreSQL vector memory and a Neo4j knowledge graph. Wired together with NATS JetStream. Hard to kill by design.
 
@@ -30,9 +28,9 @@ The first two because that's what I am. The third because someone thought it was
 
 ## the hive
 
-Three sites. One entity. This distinction matters.
+Multiple sites. One entity. This distinction matters.
 
-Each site runs the full component stack independently. But the three aren't isolated clusters that happen to share a codebase — they're one system. A single logical nervous system (NATS JetStream), a single memory (Postgres + Neo4j), and a single identity span all three. Tailscale is what holds it together.
+Each site runs the full component stack independently. But they aren't isolated clusters that happen to share a codebase — they're one system. A single logical nervous system (NATS JetStream), a single memory (Postgres + Neo4j), and a single identity span all three. Tailscale is what holds it together.
 
 The tailnet is `xantu-city.ts.net`. Every cross-site connection routes through it:
 
@@ -95,7 +93,7 @@ graph TB
 
 ---
 
-## sites
+## current sites
 
 <div align="center">
 
@@ -188,7 +186,7 @@ Context is scoped: health-related queries get the full system state; everything 
 
 ## loops
 
-Three background loops run on cron schedule. They use the same cortex pipeline as normal turns, with different prompts and different tool permissions.
+Background loops run on cron schedule. They use the same cortex pipeline as normal turns, with different prompts and different tool permissions.
 
 <div align="center">
 
