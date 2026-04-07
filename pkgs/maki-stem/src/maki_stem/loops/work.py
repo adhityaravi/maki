@@ -11,7 +11,7 @@ import uuid
 from datetime import UTC, datetime
 
 from maki_common import kv_get_float, strip_tags
-from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST, DEPLOY_REQUEST
+from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST
 
 from .base import (
     TOOLS_PROMPT,
@@ -61,8 +61,12 @@ explicit instructions that override the original description.
 3. Rebuild the code graph with rebuild_code_graph after changes.
 4. **Run quality_check before committing.** Fix any lint or format issues it finds.
 5. Commit and push with git_commit_and_push.
-6. CI builds Docker images automatically on push. Use get_workflow_status to verify builds succeed.
-7. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
+6. CI builds Docker images automatically on push. Use get_workflow_status to verify builds succeed. \
+Wait for CI to complete before deploying — images won't exist until then.
+7. Deploy only the affected components using request_deploy with the SHA tag from the push \
+(format: sha-<first 7 chars of commit>). Deployable components: stem, cortex, immune, ears, \
+recall, synapse. If maki-common was changed, deploy all of them. \
+Immune monitors health and auto-rollbacks if unhealthy.
 8. When done, close the issue with close_issue and a brief result summary.
 9. Store any learnings with add_memory.
 
@@ -160,38 +164,6 @@ async def _tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[d
             except Exception:
                 log.exception("Failed to tag unverified issue", extra={"number": number})
     return verified
-
-
-async def _request_deploy_after_work(issue_number: int, issue_title: str, ctx: StemContext) -> None:
-    """Request a deploy to maki-immune after a successful work session and comment with the result."""
-    deploy_target = "maki-immune"
-    log.info("Requesting deploy after work", extra={"service": deploy_target, "issue": issue_number})
-    try:
-        reply = await ctx.nc.request(
-            DEPLOY_REQUEST,
-            json.dumps({"service": deploy_target, "image_tag": "latest"}).encode(),
-            timeout=30.0,
-        )
-        result = json.loads(reply.data.decode())
-        status = result.get("status", "unknown")
-        message = result.get("message", "")
-        log.info("Deploy requested", extra={"service": deploy_target, "status": status})
-
-        msg_part = f"\n{message}" if message else ""
-        deploy_comment = (
-            f"🚀 **Deploy requested** → `{deploy_target}`\n\n"
-            f"Status: `{status}`{msg_part}\n\n"
-            f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-    except Exception:
-        log.exception("Failed to request deploy after work", extra={"issue": issue_number})
-        deploy_comment = (
-            f"⚠️ **Deploy request failed** for `{deploy_target}` — will need manual trigger.\n\n"
-            f"Time: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-
-    if ctx.github:
-        await ctx.github.comment_issue(issue_number, deploy_comment)
 
 
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
@@ -343,9 +315,6 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
             close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
             asyncio.create_task(ctx.github.close_issue(issue_number, comment=close_comment))
-
-        # Request deploy to maki-immune after successful work (#40)
-        asyncio.create_task(_request_deploy_after_work(issue_number, issue_title, ctx))
 
     except TimeoutError:
         log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
