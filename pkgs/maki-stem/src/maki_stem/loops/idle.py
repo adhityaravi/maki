@@ -176,7 +176,7 @@ _thoughts_today_date: str = ""
 async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
     """Guard checks for the idle loop: cron window, activity threshold, daily cap.
 
-    Fires at 21:00 on Mon/Wed/Fri/Sun — one thought per day max.
+    Fires every 3 hours, every day — up to max_thoughts_per_day per day (default 8).
     """
     global _thoughts_today, _thoughts_today_date
 
@@ -193,7 +193,7 @@ async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
         _thoughts_today = 0
         _thoughts_today_date = today
 
-    max_thoughts = config.get("max_thoughts_per_day", 1)
+    max_thoughts = config.get("max_thoughts_per_day", 8)
     return _thoughts_today < max_thoughts
 
 
@@ -202,7 +202,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     global _thoughts_today
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
-    max_thoughts = config.get("max_thoughts_per_day", 5)
+    max_thoughts = config.get("max_thoughts_per_day", 8)
 
     try:
         entry = await ctx.kv.get(KV_KEY)
@@ -306,7 +306,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 IDLE_LOOP_SPEC = LoopSpec(
     name="idle",
     check_interval_getter=lambda: IDLE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: 86400,  # once per day — lock TTL prevents double-fire
+    execution_interval_getter=lambda config: 10800,  # 3h TTL — matches cron, prevents double-fire
     should_run=_idle_should_run,
     body=_idle_body,
 )
