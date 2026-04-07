@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -15,14 +16,58 @@ from nats.js.kv import KeyValue
 log = logging.getLogger(__name__)
 
 
-async def connect_nats(url: str, token: str | None = None) -> Client:
-    """Connect to NATS and return the client."""
+async def connect_nats(
+    url: str,
+    token: str | None = None,
+    max_retries: int = 12,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> Client:
+    """Connect to NATS with exponential backoff retry.
+
+    Retries up to max_retries times before giving up. Delay doubles each
+    attempt (capped at max_delay), giving roughly 2 minutes of patience for
+    NATS to become available — enough to survive cold-start races where the
+    pod comes up before maki-nerve-nats is ready.
+
+    Args:
+        url: NATS server URL.
+        token: Optional auth token.
+        max_retries: Maximum number of connection attempts (default 12).
+        base_delay: Initial retry delay in seconds (default 1.0).
+        max_delay: Maximum retry delay in seconds (default 30.0).
+    """
     kwargs: dict[str, Any] = {}
     if token:
         kwargs["token"] = token
-    nc = await nats.connect(url, **kwargs)
-    log.info("Connected to NATS", extra={"nats_url": url, "auth": bool(token)})
-    return nc
+
+    delay = base_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            nc = await nats.connect(url, **kwargs)
+            log.info("Connected to NATS", extra={"nats_url": url, "auth": bool(token), "attempt": attempt})
+            return nc
+        except Exception as exc:
+            if attempt >= max_retries:
+                log.error(
+                    "Failed to connect to NATS after all retries",
+                    extra={"nats_url": url, "attempts": attempt},
+                )
+                raise
+            log.warning(
+                "NATS connection failed, retrying",
+                extra={
+                    "nats_url": url,
+                    "attempt": attempt,
+                    "max_retries": max_retries,
+                    "retry_in": delay,
+                    "error": str(exc),
+                },
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> KeyValue:
