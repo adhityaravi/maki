@@ -32,7 +32,7 @@ DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
 THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-general")
-VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-vitals")
+VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-general")
 REMINDERS_CHANNEL_NAME = os.environ.get("REMINDERS_CHANNEL_NAME", "maki-general")
 IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
 
@@ -286,7 +286,7 @@ async def _immune_response_listener():
 
 
 async def _thought_listener():
-    """Subscribe to NATS for proactive thoughts and post to #maki-thoughts."""
+    """Subscribe to NATS for proactive thoughts and post to #maki-general."""
     sub = await _nc.subscribe(EARS_THOUGHT_OUT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": EARS_THOUGHT_OUT})
     async for msg in sub.messages:
@@ -314,7 +314,7 @@ async def _thought_listener():
 
 
 async def _vitals_listener():
-    """Consume health digests from JetStream and post to #maki-vitals."""
+    """Consume health digests from JetStream and post to #maki-general."""
     sub = await _js.subscribe(EARS_VITALS_OUT, durable=f"ears-vitals-{INSTANCE_ID}", deliver_policy="new")
     log.info("JetStream subscribed", extra={"subject": EARS_VITALS_OUT})
     async for msg in sub.messages:
@@ -340,7 +340,7 @@ async def _vitals_listener():
 
 
 async def _alert_listener():
-    """Consume immune alerts from JetStream and post to #maki-vitals."""
+    """Consume immune alerts from JetStream and post to #maki-general."""
     sub = await _js.subscribe(IMMUNE_ALERT, durable=f"ears-alert-{INSTANCE_ID}", deliver_policy="new")
     log.info("JetStream subscribed", extra={"subject": IMMUNE_ALERT})
     async for msg in sub.messages:
@@ -367,7 +367,7 @@ async def _alert_listener():
 
 
 async def _reminder_listener():
-    """Subscribe to NATS for care reminders and post to #maki-reminders."""
+    """Subscribe to NATS for care reminders and post to #maki-general."""
     sub = await _nc.subscribe(EARS_REMINDER_OUT, queue="maki-ears")
     log.info("Subscribed", extra={"subject": EARS_REMINDER_OUT})
     async for msg in sub.messages:
