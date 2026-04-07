@@ -13,6 +13,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from importlib.metadata import entry_points
 
 import httpx
 import nats.js.api
@@ -43,12 +44,6 @@ from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
 
 from maki_stem.loops import IDLE_LOOP_SPEC, WORK_LOOP_SPEC, LoopSpec, StemContext, _run_loop
-
-try:
-    from importlib.metadata import entry_points
-except ImportError:
-    # Python < 3.10 fallback
-    from importlib_metadata import entry_points  # type: ignore[import-not-found,unused-ignore]
 
 configure_logging()
 log = logging.getLogger(__name__)

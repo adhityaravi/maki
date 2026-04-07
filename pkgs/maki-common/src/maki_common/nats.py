@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 import nats
+import nats.js.errors
 from nats.aio.client import Client
 from nats.js.kv import KeyValue
 
