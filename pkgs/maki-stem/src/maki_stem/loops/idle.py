@@ -168,41 +168,23 @@ _IDLE_MEMORY_QUERIES = [
     "dead code, unused imports, stale config, cleanup opportunities",
 ]
 
-# Module-level daily counters
-_thoughts_today: int = 0
-_thoughts_today_date: str = ""
-
 
 async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
-    """Guard checks for the idle loop: cron window, activity threshold, daily cap.
+    """Guard checks for the idle loop: cron window and activity threshold.
 
-    Fires every 3 hours, every day — up to max_thoughts_per_day per day (default 8).
+    Frequency is controlled by the cron expression (IDLE_CRON) and the distributed
+    TTL lock — no redundant in-memory counter needed.
     """
-    global _thoughts_today, _thoughts_today_date
-
     if not cron_window(IDLE_CRON):
         return False
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
-    if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
-        return False
-
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    if today != _thoughts_today_date:
-        _thoughts_today = 0
-        _thoughts_today_date = today
-
-    max_thoughts = config.get("max_thoughts_per_day", 8)
-    return _thoughts_today < max_thoughts
+    return not (time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD)
 
 
 async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one idle reflection cycle."""
-    global _thoughts_today
-
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
-    max_thoughts = config.get("max_thoughts_per_day", 8)
 
     try:
         entry = await ctx.kv.get(KV_KEY)
@@ -277,15 +259,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         if clean_thought:
             thought_payload = {"thought": clean_thought, "turn_id": turn_id}
             await ctx.nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
-            _thoughts_today += 1
-            log.info(
-                "Thought published",
-                extra={
-                    "turn_id": turn_id,
-                    "thoughts_today": _thoughts_today,
-                    "max": max_thoughts,
-                },
-            )
+            log.info("Thought published", extra={"turn_id": turn_id})
 
             state_summary = ctx.format_system_state(system_state)
             asyncio.create_task(

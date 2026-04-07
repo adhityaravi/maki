@@ -80,8 +80,9 @@ GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
 REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
 
+# Idle loop frequency is controlled by IDLE_CRON + the distributed TTL lock in idle.py.
+# No per-loop "max per day" counter — that's redundant, not distributed, and a foot-gun.
 DEFAULT_CORTEX_CONFIG = {
-    "max_thoughts_per_day": 8,  # one per 3h cron window; was incorrectly set to 1
     "max_reminders_per_day": 1,
     "max_work_items_per_night": 2,
     "work_cooldown_minutes": 15,
