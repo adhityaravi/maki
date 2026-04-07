@@ -30,8 +30,8 @@ log = logging.getLogger(__name__)
 IDLE_CHECK_INTERVAL = int(os.environ.get("IDLE_CHECK_INTERVAL", "60"))
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
-# Idle fires at 03:00 on Mon/Wed/Fri/Sun (cron: 0=Sun, 1=Mon, 3=Wed, 5=Fri)
-IDLE_CRON = "0 3 * * 0,1,3,5"
+# Idle fires every 3 hours, every day
+IDLE_CRON = "0 */3 * * *"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
