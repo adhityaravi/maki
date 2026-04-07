@@ -146,7 +146,7 @@ def create_immune_tools(
             "Query a remote site's immune for detailed state: component health with latency/restarts/metrics, "
             "running image tags, deploy history, recent actions, lock status, cortex state, and blacklist. "
             "Use this when gossip shows a problem on another site and you need to investigate deeper.",
-            {"site_name": {"type": "string", "description": "The site name to query (e.g. 'sushitrash', 'ramenslurp', 'ikiikiinu')"}},
+            {"site_name": {"type": "string", "description": "Site name: sushitrash, ramenslurp, or ikiikiinu"}},
             _query_site,
         )
     )
