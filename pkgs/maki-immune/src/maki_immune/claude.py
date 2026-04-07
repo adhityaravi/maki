@@ -309,8 +309,9 @@ Also use [DIGEST:...] for anything that should go to #maki-vitals."""
 
             await _publish_immune_response(message_id, reply)
 
-            for digest in parse_tagged(response, "DIGEST"):
-                await _publish_vitals(digest)
+            # Note: DIGEST tags are intentionally not published to #maki-vitals here —
+            # the full response already goes back to #maki-immune. Publishing DIGESTs
+            # would cause immune updates to leak into #maki-general.
             for alert in parse_tagged(response, "ALERT"):
                 await _publish_alert(alert)
 

@@ -127,18 +127,22 @@ def create_immune_tools(
 
     # Cross-site query tool — ask a specific site's immune for rich state
     from maki_common.subjects import IMMUNE_SITE_QUERY
+    from maki_common.tools.utils import mcp_result as _mcp_result
 
-    async def _query_site(site_name: str) -> str:
+    async def _query_site(args: dict) -> dict:
         """Query a remote site's immune for detailed state."""
+        site_name = args.get("site_name", "")
+        if not site_name:
+            return _mcp_result("site_name is required")
         subject = f"{IMMUNE_SITE_QUERY}.{site_name}"
         try:
             resp = await nc.request(subject, b"{}", timeout=10.0)
             data = json.loads(resp.data.decode())
             if not data:
-                return f"Site '{site_name}' returned empty response — may be unreachable."
-            return json.dumps(data, indent=2, default=str)
+                return _mcp_result(f"Site '{site_name}' returned empty response — may be unreachable.")
+            return _mcp_result(json.dumps(data, indent=2, default=str))
         except Exception as e:
-            return f"Failed to query site '{site_name}': {e}"
+            return _mcp_result(f"Failed to query site '{site_name}': {e}")
 
     all_tools.append(
         (
@@ -146,7 +150,7 @@ def create_immune_tools(
             "Query a remote site's immune for detailed state: component health with latency/restarts/metrics, "
             "running image tags, deploy history, recent actions, lock status, cortex state, and blacklist. "
             "Use this when gossip shows a problem on another site and you need to investigate deeper.",
-            {"site_name": {"type": "string", "description": "Site name: sushitrash, ramenslurp, or ikiikiinu"}},
+            {"site_name": str},
             _query_site,
         )
     )
