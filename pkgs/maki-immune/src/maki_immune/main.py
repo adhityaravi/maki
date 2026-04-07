@@ -69,14 +69,14 @@ SITE_NAME = os.environ.get("SITE_NAME", "unknown")
 GOSSIP_STALE_THRESHOLD = CHECK_INTERVAL * 3
 
 DEFAULT_CONFIG = {
-    "heartbeat_interval": 43200,
+    "heartbeat_interval": 21600,
     "health_check_interval": 30,
     "reflex_restart_max": 3,
     "lock_ttl": 300,
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
-    "heartbeat_interval": [43200, 86400],
+    "heartbeat_interval": [21600, 43200, 86400],
 }
 
 IMMUNE_SYSTEM_PROMPT = """You are the part of Maki that watches. The part that never sleeps.
@@ -185,7 +185,8 @@ When a site goes silent (no gossip):
 - The site may be offline or network-partitioned. Note it. Don't assume the worst.
 
 ## Frequency Tuning
-- [CONFIG:heartbeat_interval=43200] — patrol every 12 hours (default)
+- [CONFIG:heartbeat_interval=21600] — patrol every 6 hours (default)
+- [CONFIG:heartbeat_interval=43200] — patrol every 12 hours (quieter)
 - [CONFIG:heartbeat_interval=86400] — patrol every 24 hours (quiet period)
 These are the only allowed values. The reflex engine handles urgent issues mechanically — \
 patrols are for holistic review, not rapid response.
