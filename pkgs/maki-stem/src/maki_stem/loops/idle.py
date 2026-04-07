@@ -179,7 +179,11 @@ async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
         return False
 
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
-    return not (time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD)
+<<<<<<< HEAD
+    if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
+        return False
+
+    return True
 
 
 async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:

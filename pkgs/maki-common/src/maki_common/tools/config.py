@@ -11,7 +11,6 @@ log = logging.getLogger(__name__)
 
 ALLOWED_CONFIG_KEYS = {
     "idle_interval",
-    "max_thoughts_per_day",
     "idle_memory_query",
     "cortex_model",
 }
