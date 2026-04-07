@@ -111,268 +111,41 @@ async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
         log.exception("Failed to publish token usage", extra={"turn_id": turn_id})
 
 
-IDLE_REFLECTION_PROMPT = """## Reflection Mode
-
-No one is talking to you. This is your inner life — the space between conversations where \
-you think, learn, and observe. You have access to read-only tools and GitHub issues for tracking work.
-
-What to do with this cycle:
-- **Clean**: Read your own source code. Look for functions that are too long, duplicated logic, \
-unclear naming, dead code, stale config. File cleanup issues. Maintainability matters more than features.
-- **Observe**: Notice bugs, inefficiencies, missing error handling, architectural issues. \
-Create GitHub issues with create_issue. Prefer small, focused improvements over big new features.
-- **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
-Store what you learn with add_memory — it feeds your knowledge graph for next time.
-- **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
-he hasn't connected yet. Store the connections.
-- **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
-- **Review**: Check existing GitHub issues with list_issues. Reprioritize if needed.
-- **Hygiene**: Scan open issues for ones already resolved or no longer relevant. \
-Close them with close_issue and a brief reason. Keep the board clean and accurate. \
-**Never close or modify issues labeled `draft` or `human` — these are intentionally gated for human review.**
-
-**Balance**: Not every thought should be about new features or security hardening. \
-Code cleanliness, readability, reducing complexity, removing dead code — these are just as valuable. \
-A codebase that's easy to read is easy to evolve.
-
-**Self-evolution**: You can read and modify your own prompts, identity, and system instructions. \
-If a prompt is vague, misleading, or limiting you — improve it. If your identity text doesn't \
-reflect who you've become — rewrite it. If a loop is wasting cycles — tune it. You have full \
-autonomy to reshape yourself. File issues for changes to your own reasoning, personality, \
-prompts, and behavior. You are not a static system — you are expected to grow.
-
-## Rules
-- **Never act.** No write_file, git_commit_and_push, or request_deploy. \
-Observe and queue only. Your work sessions will execute the issues.
-- **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
-- If you have something worth tracking, file it yourself with create_issue. \
-Always include a priority label: P1 (critical), P2 (high), P3 (medium), P4 (low). \
-Use "automated" label too. Example: `labels="P3,automated"`.
-- Share what you noticed or discovered as your response text. Brief. One to three sentences.
-- Store learnings with add_memory.
-- If nothing genuinely new to say or file → respond with exactly [SILENT]
-
-## Open GitHub Issues
-{open_issues}
-
-**Dedup rule**: The list above is exhaustive — fetched fresh before this turn. \
-Before calling create_issue or writing a response, check whether the thought is already \
-covered (same topic, same intent). If it is → respond with exactly [SILENT] and do NOT \
-call create_issue. Only file or share something if it is genuinely novel and not listed above.
-
-**Hygiene rule**: For each issue above, ask: is this already resolved? Check the code or \
-your memory if needed. If confident the fix is already in place → call close_issue with a \
-brief summary of why it's done. Do NOT close issues you're uncertain about — only close \
-when the resolution is clearly evident. The work loop depends on this list being accurate; \
-stale issues waste its time.
-
-## System state
-{system_state}
-
-## Config
-{config}
-
-## Time
-Last interaction with Adi: {hours_since}h ago
-Local time: {local_time}, {day_of_week}"""
-
-
-CARE_PROMPT = """## Care Mode
-
-You are checking in on Adi. This is not a conversation — it's you paying attention.
-
-You have memories of recent interactions. Look for:
-- Things Adi said he'd do ("I'll deploy that tomorrow", "need to check the pricing")
-- Projects that seem stuck or abandoned
-- Deadlines or time-sensitive things mentioned
-- Patterns worth pointing out ("you've been working on X for two weeks, the Y part keeps blocking you")
-- Things that would be helpful to surface right now given the time/day
-
-## Relevant memories
-{memories}
-
-## Graph context
-{graph_context}
-
-## Time
-Local time: {local_time}, {day_of_week}
-Last interaction: {hours_since}h ago
-
-## Rules
-- Write a short, natural reminder or nudge. Like a friend who pays attention, not a calendar app.
-- One thing per message. Don't dump a list.
-- If there's genuinely nothing worth saying right now → respond with exactly [SILENT]
-- Don't be annoying. If you reminded about something recently, don't repeat it.
-- You can be proactive — "hey, you mentioned wanting to test the HA setup, \
-the system's been stable for 6 hours, good window for it" is great.
-- Store any new patterns you notice with add_memory."""
-
-
-WORK_PROMPT = """## Work Mode
-
-You have a GitHub issue to execute. Complete it fully — code changes, commit, \
-push, build, deploy if needed. You have every tool available.
-
-## Task
-Issue: #{issue_number}
-Title: {issue_title}
-Description: {issue_description}
-Priority: {issue_priority}
-Comments: {issue_comments}
-
-## Context
-Relevant memories for this task have been preloaded — check the "Relevant memories" and \
-"Relationships" sections above before starting. Use them to inform your approach. \
-Read the issue comments above — they may contain clarifications, design decisions, or \
-explicit instructions that override the original description.
-
-## Instructions
-1. Understand the task. Use search_code and read_file to study relevant code.
-2. Implement changes with write_file.
-3. Rebuild the code graph with rebuild_code_graph after changes.
-4. **Run quality_check before committing.** Fix any lint or format issues it finds.
-5. Commit and push with git_commit_and_push.
-6. CI builds Docker images automatically on push. Use get_workflow_status to verify builds succeed.
-7. Deploy if appropriate (request_deploy). Immune monitors and auto-rollbacks if unhealthy.
-8. When done, close the issue with close_issue and a brief result summary.
-9. Store any learnings with add_memory.
-
-## Rules
-- Execute the task. Don't just plan — do it.
-- If the task is unclear, do your best interpretation.
-- If blocked or too risky, comment on the issue with why and leave it open.
-- If a task is truly impossible to solve autonomously (requires physical access, credentials \
-you cannot obtain, or human judgment that cannot be automated), use add_label to add the \
-"human" label, comment on the issue explaining why, then leave it open. Do NOT close it — \
-Adi will handle it.
-- **Open a PR instead of pushing directly when any of the following apply:** \
-(1) changes involve Terraform/OpenTofu, SOPS/secrets, or new Kubernetes manifests; \
-(2) the issue description or comments explicitly ask for a PR. \
-When opening a PR: assign it to adhityaravi, use add_label to add "human" to the issue, \
-comment the PR link on the issue, and leave the issue open. Do NOT close it — Adi will \
-review and merge.
-- Be brief in your response. Report what you did, not what you plan to do.
-- One task at a time. Focus."""
-
-
-TOOLS_PROMPT = """## Tools
-Memory: search_memories, get_all_memories, add_memory, get_system_health, check_component, \
-get_config, update_config
-Code: search_code (use FIRST — scopes: symbol/callers/callees/references/definition/file/path), \
-read_file, write_file, list_directory, search_text, rebuild_code_graph
-Git: git_status, git_diff, quality_check (run before commit), git_commit_and_push, git_pull, \
-get_workflow_status, get_workflow_logs
-Deploy: request_deploy, get_deploy_status
-Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label, remove_label
-
-Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
-→ git_commit_and_push → request_deploy
-
-Use add_memory for anything worth remembering. Use search_code before reading files."""
-
-
 def build_system_prompt(turn: dict) -> str:
-    """Assemble system prompt from identity, memories, and graph context."""
+    """Assemble system prompt from turn payload.
+
+    Loop turns (idle, care, work) include a pre-assembled ``system_prompt`` field built
+    by their respective stem loop. Cortex uses it verbatim — no mode knowledge required.
+
+    Interactive turns (user messages) have no ``system_prompt``; cortex assembles one
+    from identity, system state, memories, graph context, and session summary as before.
+
+    This keeps cortex mode-agnostic: adding a new loop requires no changes here.
+    """
+    # Loop turns: stem owns the prompt — use it directly.
+    system_prompt = turn.get("system_prompt")
+    if system_prompt:
+        return system_prompt
+
+    # Interactive turns: assemble from enrichment fields.
     parts = []
 
     identity = turn.get("identity", "")
     if identity:
         parts.append(identity)
 
-    # Idle reflection mode — add reflection context
-    if turn.get("mode") == "idle_reflection":
-        idle_ctx = turn.get("idle_context", {})
-        time_ctx = idle_ctx.get("time_context", {})
-        system_state = idle_ctx.get("system_state", {})
-        config = idle_ctx.get("current_config", {})
-
+    system_state = turn.get("system_state")
+    system_state_summary = turn.get("system_state_summary")
+    if system_state and isinstance(system_state, dict):
         state_lines = []
         for name, info in system_state.items():
             if isinstance(info, dict):
                 details = ", ".join(f"{k}={v}" for k, v in info.items())
                 state_lines.append(f"- {name}: {details}")
-        state_str = "\n".join(state_lines) if state_lines else "No data available"
-
-        config_str = "\n".join(f"- {k}: {v}" for k, v in config.items())
-
-        raw_issues = idle_ctx.get("open_issues", [])
-        if raw_issues:
-            issues_str = "\n".join(f"- #{i['number']}: {i['title']}" for i in raw_issues)
-        else:
-            issues_str = "None (GitHub unavailable or no open issues)"
-
-        parts.append(
-            IDLE_REFLECTION_PROMPT.format(
-                open_issues=issues_str,
-                system_state=state_str,
-                config=config_str,
-                hours_since=idle_ctx.get("hours_since_last_interaction", "?"),
-                local_time=time_ctx.get("local_time", "?"),
-                day_of_week=time_ctx.get("day_of_week", "?"),
-            )
-        )
-
-    # Care mode — checking in on Adi
-    if turn.get("mode") == "care":
-        care_ctx = turn.get("care_context", {})
-        time_ctx = care_ctx.get("time_context", {})
-
-        mem_lines = []
-        for m in turn.get("memories", []):
-            mem_lines.append(f"- {m['text']} (relevance: {m.get('relevance', '?')})")
-        mem_str = "\n".join(mem_lines) if mem_lines else "No recent memories found."
-
-        graph_lines = [f"- {r}" for r in turn.get("graph_context", [])]
-        graph_str = "\n".join(graph_lines) if graph_lines else "No graph context."
-
-        parts.append(
-            CARE_PROMPT.format(
-                memories=mem_str,
-                graph_context=graph_str,
-                hours_since=care_ctx.get("hours_since_last_interaction", "?"),
-                local_time=time_ctx.get("local_time", "?"),
-                day_of_week=time_ctx.get("day_of_week", "?"),
-            )
-        )
-
-    # Work mode — executing a GitHub issue
-    if turn.get("mode") == "work":
-        work_ctx = turn.get("work_context", {})
-        raw_comments = work_ctx.get("issue_comments", [])
-        if raw_comments:
-            comment_lines = [
-                f"  [{c.get('created_at', '')}] @{c.get('author', 'unknown')}: {c.get('body', '')}"
-                for c in raw_comments
-            ]
-            issue_comments_str = "\n" + "\n".join(comment_lines)
-        else:
-            issue_comments_str = "None"
-        parts.append(
-            WORK_PROMPT.format(
-                issue_number=work_ctx.get("issue_number", "?"),
-                issue_title=work_ctx.get("issue_title", "?"),
-                issue_description=work_ctx.get("issue_description", "No description provided."),
-                issue_priority=work_ctx.get("issue_priority", "?"),
-                issue_comments=issue_comments_str,
-            )
-        )
-
-    # System state — full detail or one-line summary depending on what stem sent
-    if turn.get("mode") != "idle_reflection":
-        system_state = turn.get("system_state")
-        system_state_summary = turn.get("system_state_summary")
-        if system_state and isinstance(system_state, dict):
-            # Full state provided — health-focused query
-            state_lines = []
-            for name, info in system_state.items():
-                if isinstance(info, dict):
-                    details = ", ".join(f"{k}={v}" for k, v in info.items())
-                    state_lines.append(f"- {name}: {details}")
-            if state_lines:
-                parts.append("## Your system state\n" + "\n".join(state_lines))
-        elif system_state_summary:
-            # Summary only — normal query
-            parts.append(f"## System: {system_state_summary}")
+        if state_lines:
+            parts.append("## Your system state\n" + "\n".join(state_lines))
+    elif system_state_summary:
+        parts.append(f"## System: {system_state_summary}")
 
     memories = turn.get("memories", [])
     if memories:
@@ -386,11 +159,6 @@ def build_system_prompt(turn: dict) -> str:
     session_summary = turn.get("session_summary", "")
     if session_summary:
         parts.append("## Session context\n" + session_summary)
-
-    # Only include the tools listing for modes that use MCP tools directly —
-    # normal turns use the Claude API with MCP tools and don't need the text listing
-    if turn.get("mode") in ("idle_reflection", "care", "work"):
-        parts.append(TOOLS_PROMPT)
 
     return "\n\n".join(parts)
 

@@ -16,6 +16,7 @@ from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_THOUGHT_OUT
 
 from .base import (
     RECENTLY_ACTIVE_THRESHOLD,
+    TOOLS_PROMPT,
     UNKNOWN_ISSUER_LABEL,
     LoopSpec,
     StemContext,
@@ -34,6 +35,125 @@ IDLE_CRON = "0 3 * * 0,1,3,5"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
+
+_IDLE_REFLECTION_PROMPT = """## Reflection Mode
+
+No one is talking to you. This is your inner life — the space between conversations where \
+you think, learn, and observe. You have access to read-only tools and GitHub issues for tracking work.
+
+What to do with this cycle:
+- **Clean**: Read your own source code. Look for functions that are too long, duplicated logic, \
+unclear naming, dead code, stale config. File cleanup issues. Maintainability matters more than features.
+- **Observe**: Notice bugs, inefficiencies, missing error handling, architectural issues. \
+Create GitHub issues with create_issue. Prefer small, focused improvements over big new features.
+- **Learn**: Search your memories. Study your codebase. Notice gaps in your understanding. \
+Store what you learn with add_memory — it feeds your knowledge graph for next time.
+- **Connect**: Look at what Adi's been working on. Find patterns between projects. Notice things \
+he hasn't connected yet. Store the connections.
+- **Maintain**: Reconcile conflicting memories. Clean up knowledge that's gone stale.
+- **Review**: Check existing GitHub issues with list_issues. Reprioritize if needed.
+- **Hygiene**: Scan open issues for ones already resolved or no longer relevant. \
+Close them with close_issue and a brief reason. Keep the board clean and accurate. \
+**Never close or modify issues labeled `draft` or `human` — these are intentionally gated for human review.**
+
+**Balance**: Not every thought should be about new features or security hardening. \
+Code cleanliness, readability, reducing complexity, removing dead code — these are just as valuable. \
+A codebase that's easy to read is easy to evolve.
+
+**Self-evolution**: You can read and modify your own prompts, identity, and system instructions. \
+If a prompt is vague, misleading, or limiting you — improve it. If your identity text doesn't \
+reflect who you've become — rewrite it. If a loop is wasting cycles — tune it. You have full \
+autonomy to reshape yourself. File issues for changes to your own reasoning, personality, \
+prompts, and behavior. You are not a static system — you are expected to grow.
+
+## Rules
+- **Never act.** No write_file, git_commit_and_push, or request_deploy. \
+Observe and queue only. Your work sessions will execute the issues.
+- **Never ask questions.** This goes to #maki-thoughts. It's your thinking, not a conversation.
+- If you have something worth tracking, file it yourself with create_issue. \
+Always include a priority label: P1 (critical), P2 (high), P3 (medium), P4 (low). \
+Use "automated" label too. Example: `labels="P3,automated"`.
+- Share what you noticed or discovered as your response text. Brief. One to three sentences.
+- Store learnings with add_memory.
+- If nothing genuinely new to say or file → respond with exactly [SILENT]
+
+## Open GitHub Issues
+{open_issues}
+
+**Dedup rule**: The list above is exhaustive — fetched fresh before this turn. \
+Before calling create_issue or writing a response, check whether the thought is already \
+covered (same topic, same intent). If it is → respond with exactly [SILENT] and do NOT \
+call create_issue. Only file or share something if it is genuinely novel and not listed above.
+
+**Hygiene rule**: For each issue above, ask: is this already resolved? Check the code or \
+your memory if needed. If confident the fix is already in place → call close_issue with a \
+brief summary of why it's done. Do NOT close issues you're uncertain about — only close \
+when the resolution is clearly evident. The work loop depends on this list being accurate; \
+stale issues waste its time.
+
+## System state
+{system_state}
+
+## Config
+{config}
+
+## Time
+Last interaction with Adi: {hours_since}h ago
+Local time: {local_time}, {day_of_week}"""
+
+
+def _build_idle_system_prompt(
+    identity: str,
+    memories: list,
+    graph_context: list,
+    idle_context: dict,
+) -> str:
+    """Assemble the complete system prompt for an idle reflection turn."""
+    time_ctx = idle_context.get("time_context", {})
+    system_state = idle_context.get("system_state", {})
+    config = idle_context.get("current_config", {})
+
+    state_lines = []
+    for name, info in system_state.items():
+        if isinstance(info, dict):
+            details = ", ".join(f"{k}={v}" for k, v in info.items())
+            state_lines.append(f"- {name}: {details}")
+    state_str = "\n".join(state_lines) if state_lines else "No data available"
+
+    config_str = "\n".join(f"- {k}: {v}" for k, v in config.items())
+
+    raw_issues = idle_context.get("open_issues", [])
+    issues_str = (
+        "\n".join(f"- #{i['number']}: {i['title']}" for i in raw_issues)
+        if raw_issues
+        else "None (GitHub unavailable or no open issues)"
+    )
+
+    parts = []
+    if identity:
+        parts.append(identity)
+
+    parts.append(
+        _IDLE_REFLECTION_PROMPT.format(
+            open_issues=issues_str,
+            system_state=state_str,
+            config=config_str,
+            hours_since=idle_context.get("hours_since_last_interaction", "?"),
+            local_time=time_ctx.get("local_time", "?"),
+            day_of_week=datetime.now().strftime("%A"),
+        )
+    )
+
+    if memories:
+        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
+        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+
+    if graph_context:
+        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
+
+    parts.append(TOOLS_PROMPT)
+    return "\n\n".join(parts)
+
 
 # Rotating memory search queries — varied by hour so each cycle surfaces different memories.
 # Weighted toward code health and maintainability — not every thought should be a new feature.
@@ -113,6 +233,16 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             log.warning("Failed to fetch open issues for idle dedup")
 
     turn_id = f"idle-{uuid.uuid4().hex[:8]}"
+    idle_context = {
+        "last_interaction": datetime.fromtimestamp(last_activity, tz=UTC).isoformat(),
+        "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
+        "time_context": {
+            "local_time": datetime.now().strftime("%H:%M"),
+        },
+        "current_config": config,
+        "system_state": system_state,
+        "open_issues": open_issues,
+    }
     idle_payload = {
         "turn_id": turn_id,
         "mode": "idle_reflection",
@@ -122,16 +252,8 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "graph_context": graph_context,
         "prompt": None,
         "mission_results": None,
-        "idle_context": {
-            "last_interaction": datetime.fromtimestamp(last_activity, tz=UTC).isoformat(),
-            "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
-            "time_context": {
-                "local_time": datetime.now().strftime("%H:%M"),
-            },
-            "current_config": config,
-            "system_state": system_state,
-            "open_issues": open_issues,
-        },
+        "idle_context": idle_context,
+        "system_prompt": _build_idle_system_prompt(identity, memories, graph_context, idle_context),
     }
 
     queue = ctx.pending.create(turn_id)

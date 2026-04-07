@@ -26,6 +26,8 @@ IMMUNE_SITE_QUERY = "maki.immune.site"  # append .{site_name} at runtime
 DEPLOY_REQUEST = "maki.deploy.request"
 DEPLOY_STATUS_REQUEST = "maki.deploy.status"
 DEPLOY_PROPAGATE = "maki.deploy.propagate"
+RESTART_REQUEST = "maki.restart.request"
+RESTART_PROPAGATE = "maki.restart.propagate"
 
 # Ears (cont.)
 EARS_REMINDER_OUT = "maki.ears.reminder.out"
