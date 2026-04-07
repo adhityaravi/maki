@@ -58,9 +58,7 @@ _vitals_channel_ids: set[int] = set()
 _reminders_channel_ids: set[int] = set()
 _immune_channel_ids: set[int] = set()
 
-intents = discord.Intents.default()
-intents.message_content = True
-_bot = discord.Client(intents=intents)
+_bot = None
 
 
 def _discover_channel(guild, channel_name: str, channel_ids: set[int], label: str):
@@ -78,124 +76,124 @@ def _discover_channel(guild, channel_name: str, channel_ids: set[int], label: st
             )
 
 
-@_bot.event
-async def on_ready():
-    log.info("Discord connected", extra={"bot_name": _bot.user.name, "bot_id": _bot.user.id})
+class MakiDiscordClient(discord.Client):
+    """Discord client for Maki — recreated on each leadership acquisition."""
 
-    for guild in _bot.guilds:
-        _discover_channel(guild, GENERAL_CHANNEL_NAME, _general_channel_ids, "General")
-        _discover_channel(guild, THOUGHTS_CHANNEL_NAME, _thoughts_channel_ids, "Thoughts")
-        _discover_channel(guild, VITALS_CHANNEL_NAME, _vitals_channel_ids, "Vitals")
-        _discover_channel(guild, REMINDERS_CHANNEL_NAME, _reminders_channel_ids, "Reminders")
-        _discover_channel(guild, IMMUNE_CHANNEL_NAME, _immune_channel_ids, "Immune")
+    async def on_ready(self):
+        log.info("Discord connected", extra={"bot_name": self.user.name, "bot_id": self.user.id})
 
-    if not _general_channel_ids:
-        log.warning("No general channel found", extra={"channel_name": GENERAL_CHANNEL_NAME})
-    if not _immune_channel_ids:
-        log.warning("No immune channel found", extra={"channel_name": IMMUNE_CHANNEL_NAME})
+        for guild in self.guilds:
+            _discover_channel(guild, GENERAL_CHANNEL_NAME, _general_channel_ids, "General")
+            _discover_channel(guild, THOUGHTS_CHANNEL_NAME, _thoughts_channel_ids, "Thoughts")
+            _discover_channel(guild, VITALS_CHANNEL_NAME, _vitals_channel_ids, "Vitals")
+            _discover_channel(guild, REMINDERS_CHANNEL_NAME, _reminders_channel_ids, "Reminders")
+            _discover_channel(guild, IMMUNE_CHANNEL_NAME, _immune_channel_ids, "Immune")
 
+        if not _general_channel_ids:
+            log.warning("No general channel found", extra={"channel_name": GENERAL_CHANNEL_NAME})
+        if not _immune_channel_ids:
+            log.warning("No immune channel found", extra={"channel_name": IMMUNE_CHANNEL_NAME})
 
-@_bot.event
-async def on_message(message: discord.Message):
-    if message.author == _bot.user:
-        return
+    async def on_message(self, message: discord.Message):
+        if message.author == self.user:
+            return
 
-    if message.author.id != OWNER_ID:
-        await message.channel.send("Get your own, perv!")
-        return
+        if message.author.id != OWNER_ID:
+            await message.channel.send("Get your own, perv!")
+            return
 
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_general = message.channel.id in _general_channel_ids
-    is_immune = message.channel.id in _immune_channel_ids
+        is_dm = isinstance(message.channel, discord.DMChannel)
+        is_general = message.channel.id in _general_channel_ids
+        is_immune = message.channel.id in _immune_channel_ids
 
-    if not is_dm and not is_general and not is_immune:
-        return
+        if not is_dm and not is_general and not is_immune:
+            return
 
-    content = message.content.strip()
-    if not content:
-        return
+        content = message.content.strip()
+        if not content:
+            return
 
-    log.info(
-        "Message received",
-        extra={
-            "author": message.author.name,
-            "channel_id": message.channel.id,
-            "content_len": len(content),
-            "is_immune": is_immune,
-        },
-    )
+        log.info(
+            "Message received",
+            extra={
+                "author": message.author.name,
+                "channel_id": message.channel.id,
+                "content_len": len(content),
+                "is_immune": is_immune,
+            },
+        )
 
-    # Route immune channel messages directly to immune, bypassing cortex
-    if is_immune:
-        await _handle_immune_command(message, content)
-        return
+        # Route immune channel messages directly to immune, bypassing cortex
+        if is_immune:
+            await _handle_immune_command(message, content)
+            return
 
-    # Dedup: if another ears instance already published this message, skip
-    msg_key = f"msg.{message.id}"
-    try:
-        await _dedup_kv.create(msg_key, b"1")
-    except Exception:
-        log.info("Dedup: message already claimed by another instance", extra={"message_id": str(message.id)})
-        return
-
-    payload = {
-        "message_id": str(message.id),
-        "channel_id": str(message.channel.id),
-        "username": message.author.name,
-        "content": content,
-    }
-
-    try:
-        await _nc.publish(EARS_MESSAGE_IN, json.dumps(payload).encode())
-        log.info("Published to NATS", extra={"subject": EARS_MESSAGE_IN})
-    except Exception:
-        log.exception("Failed to publish message to NATS")
-        await message.channel.send("Sorry, I couldn't process that right now.")
-        return
-
-    thinking_emoji = "\U0001f363"  # 🍣
-    await message.add_reaction(thinking_emoji)
-
-    received_any = False
-    queue = _pending.create(str(message.id))
-    try:
-        async with message.channel.typing():
-            while True:
-                # Use shorter timeout once we've received at least one chunk.
-                # If done signal is lost, we don't hang forever.
-                timeout = CHUNK_INACTIVITY_TIMEOUT if received_any else 1860.0
-
-                try:
-                    data = await asyncio.wait_for(queue.get(), timeout=timeout)
-                except TimeoutError:
-                    if received_any:
-                        log.warning(
-                            "No done signal received after last chunk, assuming done",
-                            extra={"message_id": str(message.id)},
-                        )
-                    else:
-                        await message.channel.send("Sorry, I took too long thinking about that. Try again?")
-                    break
-
-                # Skip reaction messages from cortex
-                if "reaction" in data:
-                    continue
-
-                chunk = data.get("response", "")
-                done = data.get("done", False)
-
-                if chunk:
-                    await _send_response(message.channel, chunk)
-                    received_any = True
-
-                if done:
-                    break
-    finally:
-        _pending.remove(str(message.id))
+        # Dedup: if another ears instance already published this message, skip
+        msg_key = f"msg.{message.id}"
         try:
-            await message.remove_reaction(thinking_emoji, _bot.user)
+            await _dedup_kv.create(msg_key, b"1")
         except Exception:
-            pass
+            log.info("Dedup: message already claimed by another instance", extra={"message_id": str(message.id)})
+            return
+
+        payload = {
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "username": message.author.name,
+            "content": content,
+        }
+
+        try:
+            await _nc.publish(EARS_MESSAGE_IN, json.dumps(payload).encode())
+            log.info("Published to NATS", extra={"subject": EARS_MESSAGE_IN})
+        except Exception:
+            log.exception("Failed to publish message to NATS")
+            await message.channel.send("Sorry, I couldn't process that right now.")
+            return
+
+        thinking_emoji = "\U0001f363"  # 🍣
+        await message.add_reaction(thinking_emoji)
+
+        received_any = False
+        queue = _pending.create(str(message.id))
+        try:
+            async with message.channel.typing():
+                while True:
+                    # Use shorter timeout once we've received at least one chunk.
+                    # If done signal is lost, we don't hang forever.
+                    timeout = CHUNK_INACTIVITY_TIMEOUT if received_any else 1860.0
+
+                    try:
+                        data = await asyncio.wait_for(queue.get(), timeout=timeout)
+                    except TimeoutError:
+                        if received_any:
+                            log.warning(
+                                "No done signal received after last chunk, assuming done",
+                                extra={"message_id": str(message.id)},
+                            )
+                        else:
+                            await message.channel.send("Sorry, I took too long thinking about that. Try again?")
+                        break
+
+                    # Skip reaction messages from cortex
+                    if "reaction" in data:
+                        continue
+
+                    chunk = data.get("response", "")
+                    done = data.get("done", False)
+
+                    if chunk:
+                        await _send_response(message.channel, chunk)
+                        received_any = True
+
+                    if done:
+                        break
+        finally:
+            _pending.remove(str(message.id))
+            try:
+                await message.remove_reaction(thinking_emoji, self.user)
+            except Exception:
+                pass
 
 
 async def _handle_immune_command(message: discord.Message, content: str):
@@ -438,6 +436,15 @@ async def _try_acquire_leadership() -> bool:
             return False
 
 
+def _create_bot():
+    """Create a fresh Discord client instance."""
+    global _bot
+    intents = discord.Intents.default()
+    intents.message_content = True
+    _bot = MakiDiscordClient(intents=intents)
+    return _bot
+
+
 async def _leader_renewal_loop():
     """Renew leadership claim every LEADER_TTL/2 seconds while Discord is connected."""
     interval = LEADER_TTL / 2
@@ -453,7 +460,7 @@ async def _leader_renewal_loop():
 
 
 async def main():
-    global _nc, _js, _dedup_kv, _lock_kv
+    global _nc, _js, _dedup_kv, _lock_kv, _bot
 
     log.info("maki-ears starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
@@ -482,6 +489,16 @@ async def main():
     while True:
         if await _try_acquire_leadership():
             log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
+
+            # Fresh client each time — discord.py closes the aiohttp session on
+            # bot.close(), making the old instance unusable.
+            _bot = _create_bot()
+            _general_channel_ids.clear()
+            _thoughts_channel_ids.clear()
+            _vitals_channel_ids.clear()
+            _reminders_channel_ids.clear()
+            _immune_channel_ids.clear()
+
             asyncio.create_task(_leader_renewal_loop())
 
             try:
