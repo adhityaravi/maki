@@ -81,7 +81,7 @@ REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
 
 DEFAULT_CORTEX_CONFIG = {
-    "max_thoughts_per_day": 1,
+    "max_thoughts_per_day": 8,  # one per 3-hour window; was incorrectly set to 1
     "max_reminders_per_day": 1,
     "max_work_items_per_night": 2,
     "work_cooldown_minutes": 15,
