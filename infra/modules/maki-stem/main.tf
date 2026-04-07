@@ -153,14 +153,23 @@ resource "kubernetes_deployment" "stem" {
             name  = "REPO_NAME"
             value = "maki"
           }
+          startup_probe {
+            http_get {
+              path = "/health"
+              port = 8000
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+            failure_threshold     = 12 # 10 + 12*5 = 70s max startup
+            timeout_seconds       = 3
+          }
           readiness_probe {
             http_get {
               path = "/health"
               port = 8000
             }
-            initial_delay_seconds = 5
-            period_seconds        = 10
-            timeout_seconds       = 5
+            period_seconds  = 10
+            timeout_seconds = 5
           }
           resources {
             requests = {

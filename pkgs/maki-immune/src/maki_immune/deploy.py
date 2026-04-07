@@ -377,7 +377,7 @@ async def deploy_request_handler(msg):
             )
             log.info("Deployment patched", extra={"deployment": deployment_name, "image": image})
 
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
+            healthy = await _monitor_rollout(deployment_name, timeout=90)
 
             if healthy:
                 result = {"status": "success", "message": f"Deployed {deployment_name} with {image}", "image": image}
@@ -571,7 +571,7 @@ async def _deploy_propagate_handler(msg):
             )
             log.info("Propagated deploy applied", extra={"deployment": deployment_name, "image": image})
 
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
+            healthy = await _monitor_rollout(deployment_name, timeout=90)
 
             if healthy:
                 result_status = "success"
@@ -703,7 +703,7 @@ async def restart_request_handler(msg):
             await msg.respond(json.dumps({"status": "error", "message": "K8s client not available"}).encode())
             return
 
-        if not await _acquire_lock("immune-restart", ttl=120):
+        if not await _acquire_lock("immune-restart", ttl=180):
             await msg.respond(
                 json.dumps({"status": "error", "message": "Infrastructure lock held, try again later"}).encode()
             )
@@ -727,7 +727,7 @@ async def restart_request_handler(msg):
             )
             log.info("Rollout restart triggered", extra={"deployment": deployment_name})
 
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
+            healthy = await _monitor_rollout(deployment_name, timeout=90)
 
             if healthy:
                 result = {"status": "success", "message": f"Restarted {deployment_name} successfully"}
@@ -831,7 +831,7 @@ async def _restart_propagate_handler(msg):
             log.error("K8s client not available, cannot propagate restart")
             return
 
-        if not await _acquire_lock("immune-restart", ttl=120):
+        if not await _acquire_lock("immune-restart", ttl=180):
             await _publish_alert(f"Cannot propagate restart of {deployment_name} — lock held")
             return
 
@@ -853,7 +853,7 @@ async def _restart_propagate_handler(msg):
             )
             log.info("Propagated restart applied", extra={"deployment": deployment_name})
 
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
+            healthy = await _monitor_rollout(deployment_name, timeout=90)
 
             if healthy:
                 result_status = "success"
