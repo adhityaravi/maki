@@ -11,35 +11,36 @@ import os
 import time
 import uuid
 
-import httpx
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-from maki_common import configure_logging, connect_nats, init_kv, load_kv_config, parse_config_tags
-from maki_common.claude import invoke_claude
-from maki_common.config import apply_config_updates, parse_tagged
+from maki_common import configure_logging, connect_nats, init_kv, load_kv_config
 from maki_common.health import tcp_health_server
 from maki_common.subjects import (
-    CORTEX_HEALTH,
     CORTEX_STUCK,
     DEPLOY_PROPAGATE,
     DEPLOY_REQUEST,
     DEPLOY_STATUS_REQUEST,
     EARS_IMMUNE_OUT,
     EARS_VITALS_OUT,
-    IMMUNE_ACTION,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
-    IMMUNE_HEALTH,
     IMMUNE_SITE_QUERY,
     IMMUNE_STATE_REQUEST,
+    RESTART_PROPAGATE,
+    RESTART_REQUEST,
 )
+
+from maki_immune import claude as claude_mod
+from maki_immune import deploy as deploy_mod
+from maki_immune import health as health_mod
 
 configure_logging()
 log = logging.getLogger(__name__)
 
+# --- Config ---
+
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
@@ -55,6 +56,7 @@ HEALTH_ENDPOINTS = {
 
 VITALS_STREAM = "maki-vitals"
 DEPLOY_STREAM = "maki-deploy"
+RESTART_STREAM = "maki-restart"
 CONFIG_BUCKET = "maki-immune-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
@@ -64,18 +66,17 @@ RECENT_ACTIONS_MAX = 100
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
-GOSSIP_STALE_THRESHOLD = CHECK_INTERVAL * 3  # 90s — prune peers silent longer than this
+GOSSIP_STALE_THRESHOLD = CHECK_INTERVAL * 3
 
 DEFAULT_CONFIG = {
-    "heartbeat_interval": 43200,  # 12 hours — periodic LLM patrol cadence
+    "heartbeat_interval": 43200,
     "health_check_interval": 30,
     "reflex_restart_max": 3,
     "lock_ttl": 300,
 }
 
-# Hard limits — immune cannot set values outside these lists
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
-    "heartbeat_interval": [43200, 86400],  # 12h or 24h only
+    "heartbeat_interval": [43200, 86400],
 }
 
 IMMUNE_SYSTEM_PROMPT = """You are the part of Maki that watches. The part that never sleeps.
@@ -199,7 +200,8 @@ patrols are for holistic review, not rapid response.
 - When you do report, be sparse. One sentence. The situation, what you found, what you did.
 - Never paraphrase the metrics back. That's noise. Investigate or stay silent."""
 
-# Global state
+# --- Global State ---
+
 _nc = None
 _js = None
 _config_kv = None
@@ -214,37 +216,28 @@ _restart_history: dict[str, list[float]] = {}
 _recent_actions: list[dict] = []
 _deploy_history: dict[str, str] = {}
 _pod_metrics: dict = {}
-_last_cortex_heartbeat: float = 0
-_cortex_active_turn: str | None = None
-_cortex_turn_mode: str | None = None
-_cortex_turn_started: float | None = None
-_last_incident_time: float = 0
 _semaphore = asyncio.Semaphore(1)
-# In-memory set of image tags that failed health checks and were rolled back.
-# Cleared on process restart (intentional — restart implies fresh state).
 _failed_image_blacklist: set[str] = set()
-# Hive state — populated by gossip ring, keyed by site name
 _hive_state: dict[str, dict] = {}
+_running_images: dict[str, str] = {}
+_cortex_state: dict = {
+    "last_heartbeat": 0,
+    "active_turn": None,
+    "turn_mode": None,
+    "turn_started": None,
+}
 
 
 # --- Infrastructure Lock ---
 
 
 async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
-    """Acquire infrastructure lock with server-side TTL.
-
-    Uses NATS KV msg_ttl so the lock auto-expires even if the pod crashes
-    mid-deploy (fixes orphaned lock problem — issue #56).
-    Lock key is scoped to SITE_NAME so each site locks independently —
-    cross-site propagation doesn't block on a single global lock.
-    """
+    """Acquire infrastructure lock with server-side TTL."""
     lock_key = f"infrastructure.{SITE_NAME}"
     try:
         try:
             entry = await _lock_kv.get(lock_key)
             lock_data = json.loads(entry.value.decode())
-            # Still check software TTL for backwards compat with entries
-            # written before server-side TTL was added
             if time.time() - lock_data["acquired_at"] < lock_data["ttl"]:
                 log.info("Lock held, cannot acquire", extra={"holder": lock_data["holder"], "site": SITE_NAME})
                 return False
@@ -254,8 +247,6 @@ async def _acquire_lock(holder: str, ttl: int = 300) -> bool:
 
         lock_data = {"holder": holder, "acquired_at": time.time(), "ttl": ttl, "site": SITE_NAME}
         payload = json.dumps(lock_data).encode()
-        # Delete then create with server-side TTL — if pod crashes, NATS
-        # auto-purges the entry after ttl+60s (grace period for clock skew)
         try:
             await _lock_kv.delete(lock_key)
         except Exception:
@@ -279,47 +270,17 @@ async def _release_lock(holder: str):
             log.info("Lock released", extra={"holder": holder, "site": SITE_NAME})
         else:
             log.warning(
-                "Lock held by different holder",
-                extra={
-                    "current_holder": lock_data["holder"],
-                    "requested_by": holder,
-                },
+                "Lock held by different holder", extra={"current_holder": lock_data["holder"], "requested_by": holder}
             )
     except Exception:
         pass
 
 
-# --- Deploy History ---
-
-
-async def _load_deploy_history():
-    """Load deploy history from KV on startup."""
-    global _deploy_history
-    try:
-        keys = await _deploy_history_kv.keys()
-        for key in keys:
-            entry = await _deploy_history_kv.get(key)
-            _deploy_history[key] = entry.value.decode()
-        if _deploy_history:
-            log.info("Deploy history loaded", extra={"entries": len(_deploy_history)})
-    except Exception:
-        log.info("No deploy history found in KV (first run)")
-
-
-async def _save_deploy_history(deployment_name: str, previous_image: str):
-    """Persist previous image to KV for crash recovery."""
-    _deploy_history[deployment_name] = previous_image
-    try:
-        await _deploy_history_kv.put(deployment_name, previous_image.encode())
-    except Exception:
-        log.warning("Failed to persist deploy history to KV", extra={"deployment": deployment_name})
-
-
-# --- Recent Actions State ---
+# --- Recent Actions Persistence ---
 
 
 async def _load_recent_actions():
-    """Load recent_actions from KV on startup. Starts with empty list if missing."""
+    """Load recent_actions from KV on startup."""
     global _recent_actions
     try:
         entry = await _state_kv.get(RECENT_ACTIONS_KEY)
@@ -332,523 +293,23 @@ async def _load_recent_actions():
 
 
 async def _persist_recent_actions():
-    """Persist current _recent_actions list to KV (fire-and-forget, errors logged)."""
+    """Persist current _recent_actions list to KV."""
     try:
-        await _state_kv.put(
-            RECENT_ACTIONS_KEY,
-            json.dumps(_recent_actions[-RECENT_ACTIONS_MAX:], default=str).encode(),
-        )
+        await _state_kv.put(RECENT_ACTIONS_KEY, json.dumps(_recent_actions[-RECENT_ACTIONS_MAX:], default=str).encode())
     except Exception:
         log.warning("Failed to persist recent_actions to KV")
 
 
 def _schedule_persist_recent_actions():
-    """Schedule _persist_recent_actions as a background task (fire-and-forget)."""
+    """Schedule _persist_recent_actions as a background task."""
     asyncio.ensure_future(_persist_recent_actions())
-
-
-async def _fetch_rollback_logs(deployment_name: str) -> str:
-    """Fetch last 30 log lines from the failing pod before rollback.
-
-    Attached to rollback alerts so we're not blind to why a deploy failed.
-    Returns empty string silently on any error — never blocks the rollback.
-    """
-    if not _k8s_v1:
-        return ""
-    try:
-        pods = await asyncio.to_thread(
-            _k8s_v1.list_namespaced_pod,
-            namespace=NAMESPACE,
-            label_selector=f"app={deployment_name}",
-        )
-        # Prefer the unready pod — that's the one that failed
-        target_pod = None
-        for pod in pods.items:
-            ready = all(cs.ready for cs in (pod.status.container_statuses or []))
-            if not ready:
-                target_pod = pod.metadata.name
-                break
-        if not target_pod and pods.items:
-            target_pod = pods.items[-1].metadata.name
-        if not target_pod:
-            return ""
-        logs = await asyncio.to_thread(
-            _k8s_v1.read_namespaced_pod_log,
-            name=target_pod,
-            namespace=NAMESPACE,
-            tail_lines=30,
-        )
-        if not logs:
-            return ""
-        if len(logs) > 1500:
-            logs = logs[-1500:]
-        return f"\n```\n{logs.strip()}\n```"
-    except Exception:
-        log.debug("Could not fetch rollback logs", exc_info=True)
-        return ""
-
-
-# --- Health State Tracking ---
-
-
-def _update_health(component: str, healthy: bool, details: dict | None = None):
-    """Update component health state and detect transitions."""
-    global _last_incident_time
-    now = time.time()
-
-    if component not in _component_health:
-        _component_health[component] = {
-            "healthy": healthy,
-            "last_check": now,
-            "last_state_change": now,
-            "consecutive_failures": 0 if healthy else 1,
-            "details": details or {},
-        }
-        return
-
-    state = _component_health[component]
-    was_healthy = state["healthy"]
-
-    if was_healthy and not healthy:
-        state["last_state_change"] = now
-        state["consecutive_failures"] = 1
-        _last_incident_time = now
-        log.warning("Component unhealthy", extra={"component": component})
-    elif not was_healthy and healthy:
-        state["last_state_change"] = now
-        state["consecutive_failures"] = 0
-        log.info("Component recovered", extra={"component": component})
-    elif not healthy:
-        state["consecutive_failures"] += 1
-
-    state["healthy"] = healthy
-    state["last_check"] = now
-    state["details"] = details or state["details"]
-
-
-# --- Health Monitor Loop ---
-
-
-async def _check_http_health():
-    """Check HTTP health endpoints for all components, including latency."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        for component, url in HEALTH_ENDPOINTS.items():
-            try:
-                start = time.time()
-                resp = await client.get(f"{url}/health")
-                latency_ms = round((time.time() - start) * 1000, 1)
-                _update_health(
-                    component,
-                    resp.status_code == 200,
-                    {"latency_ms": latency_ms, "status_code": resp.status_code},
-                )
-            except Exception:
-                _update_health(component, False, {"latency_ms": -1})
-
-
-async def _check_k8s_pods():
-    """Check K8s pod status in maki namespace, including resource usage.
-
-    Groups pods by app label and marks the component unhealthy if ANY pod
-    for that app is unhealthy (e.g. ImagePullBackOff on a new pod while
-    the old pod is still running).
-    """
-    if not _k8s_v1:
-        return
-    try:
-        pods = _k8s_v1.list_namespaced_pod(namespace=NAMESPACE)
-
-        # Group pods by app label — multiple pods can exist during rollouts
-        app_pods: dict[str, list[dict]] = {}
-        for pod in pods.items:
-            app_label = pod.metadata.labels.get("app", "") if pod.metadata.labels else ""
-            if not app_label:
-                continue
-
-            phase = pod.status.phase
-            ready = True
-            restarts = 0
-            waiting_reason = None
-            if pod.status.container_statuses:
-                for cs in pod.status.container_statuses:
-                    if not cs.ready:
-                        ready = False
-                    restarts += cs.restart_count
-                    # Detect stuck states like ImagePullBackOff, CrashLoopBackOff
-                    if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                        waiting_reason = cs.state.waiting.reason
-
-            # Get resource limits/requests from spec
-            mem_limit = None
-            cpu_limit = None
-            container = pod.spec.containers[0] if pod.spec.containers else None
-            if container and container.resources:
-                limits = container.resources.limits or {}
-                mem_limit = limits.get("memory")
-                cpu_limit = limits.get("cpu")
-
-            pod_info = {
-                "phase": phase,
-                "ready": ready,
-                "restarts": restarts,
-                "pod_name": pod.metadata.name,
-                "mem_limit": mem_limit,
-                "cpu_limit": cpu_limit,
-                "waiting_reason": waiting_reason,
-                "healthy": phase == "Running" and ready and waiting_reason is None,
-            }
-
-            if app_label not in app_pods:
-                app_pods[app_label] = []
-            app_pods[app_label].append(pod_info)
-
-        # Report health per app — unhealthy if ANY pod is unhealthy
-        for app_label, pod_list in app_pods.items():
-            all_healthy = all(p["healthy"] for p in pod_list)
-            # Use the newest pod's details for reporting, but flag unhealthy ones
-            unhealthy_pods = [p for p in pod_list if not p["healthy"]]
-            # Pick the first unhealthy pod for details if any, otherwise the first pod
-            report_pod = unhealthy_pods[0] if unhealthy_pods else pod_list[0]
-            details = {
-                "phase": report_pod["phase"],
-                "ready": report_pod["ready"],
-                "restarts": report_pod["restarts"],
-                "pod_name": report_pod["pod_name"],
-                "mem_limit": report_pod["mem_limit"],
-                "cpu_limit": report_pod["cpu_limit"],
-            }
-            if report_pod["waiting_reason"]:
-                details["waiting_reason"] = report_pod["waiting_reason"]
-            if len(pod_list) > 1:
-                details["total_pods"] = len(pod_list)
-                details["unhealthy_pods"] = len(unhealthy_pods)
-
-            _update_health(app_label, all_healthy, details)
-    except Exception:
-        log.exception("K8s pod check failed")
-
-    # Collect metrics from metrics API (if available)
-    await _check_pod_metrics()
-
-
-async def _check_pod_metrics():
-    """Fetch pod resource usage from K8s metrics API."""
-    global _pod_metrics
-    try:
-        custom_api = k8s_client.CustomObjectsApi()
-        metrics = await asyncio.to_thread(
-            custom_api.list_namespaced_custom_object,
-            group="metrics.k8s.io",
-            version="v1beta1",
-            namespace=NAMESPACE,
-            plural="pods",
-        )
-        _pod_metrics = {}
-        for item in metrics.get("items", []):
-            pod_name = item["metadata"]["name"]
-            containers = item.get("containers", [])
-            if containers:
-                _pod_metrics[pod_name] = {
-                    "cpu": containers[0].get("usage", {}).get("cpu", "0"),
-                    "memory": containers[0].get("usage", {}).get("memory", "0"),
-                }
-    except Exception:
-        pass  # metrics API may not be available
-
-
-def _hive_cortex_status() -> tuple[int, int]:
-    """Count how many hive peers have healthy cortex. Returns (total_peers, healthy_peers)."""
-    total = 0
-    healthy = 0
-    for _site, state in _hive_state.items():
-        total += 1
-        cortex_info = state.get("cortex", {})
-        age = cortex_info.get("last_heartbeat_age_s")
-        if age is not None and age < 60:
-            healthy += 1
-    return total, healthy
-
-
-def _component_healthy_in_hive(component: str) -> list[str]:
-    """Return list of hive site names where this component is healthy."""
-    healthy_sites = []
-    for site, state in _hive_state.items():
-        peer_health = state.get("component_health", {})
-        comp_state = peer_health.get(component, {})
-        if comp_state.get("healthy"):
-            healthy_sites.append(site)
-    return healthy_sites
-
-
-def _check_cortex_heartbeat():
-    """Check if cortex heartbeat is recent and include turn state + hive context."""
-    if _last_cortex_heartbeat == 0:
-        return
-    age = time.time() - _last_cortex_heartbeat
-    hive_total, hive_healthy = _hive_cortex_status()
-    details: dict = {
-        "last_heartbeat_age_s": round(age, 1),
-        "hive_cortex_total": hive_total,
-        "hive_cortex_healthy": hive_healthy,
-    }
-    if _cortex_active_turn:
-        details["active_turn"] = _cortex_active_turn
-        details["turn_mode"] = _cortex_turn_mode
-        if _cortex_turn_started:
-            details["turn_running_s"] = round(time.time() - _cortex_turn_started, 1)
-
-    local_healthy = age < 60
-    if not local_healthy and hive_healthy > 0:
-        details["hive_note"] = f"cortex healthy on {hive_healthy} other site(s) — local issue only"
-
-    _update_health(
-        "maki-cortex-heartbeat",
-        local_healthy,
-        details,
-    )
-
-
-async def _health_monitor_loop():
-    """Continuous health monitoring — no Claude, triggers reflexes.
-
-    NOT deduplicated — each immune instance monitors its own local cluster.
-    K8s API and HTTP health checks resolve to local pods via in-cluster DNS.
-    """
-    log.info("Health monitor loop started", extra={"interval": CHECK_INTERVAL, "instance_id": INSTANCE_ID})
-
-    while True:
-        try:
-            await _check_http_health()
-            await _check_k8s_pods()
-            _check_cortex_heartbeat()
-
-            config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
-            for component, state in _component_health.items():
-                if not state["healthy"] and state["consecutive_failures"] >= 2:
-                    await _trigger_reflex(component, state, config)
-
-        except Exception:
-            log.exception("Health monitor error")
-
-        await asyncio.sleep(CHECK_INTERVAL)
-
-
-# --- Cortex Heartbeat Listener ---
-
-
-async def _cortex_heartbeat_listener():
-    """Subscribe to cortex health heartbeat and parse enriched turn state."""
-    global _last_cortex_heartbeat, _cortex_active_turn, _cortex_turn_mode, _cortex_turn_started
-    sub = await _nc.subscribe(CORTEX_HEALTH)
-    log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
-    async for msg in sub.messages:
-        try:
-            _last_cortex_heartbeat = time.time()
-            payload = json.loads(msg.data.decode())
-            _cortex_active_turn = payload.get("active_turn")
-            _cortex_turn_mode = payload.get("turn_mode")
-            _cortex_turn_started = payload.get("turn_started")
-        except Exception:
-            pass
-
-
-# --- Gossip Ring ---
-
-_running_images: dict[str, str] = {}  # deployment_name -> image tag (e.g. "sha-7793b98")
-
-
-async def _refresh_running_images():
-    """Query K8s for current image tags on all maki deployments/statefulsets."""
-    global _running_images
-    if not _k8s_apps_v1:
-        return
-    images: dict[str, str] = {}
-    try:
-        deps = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_deployment, namespace=NAMESPACE)
-        for dep in deps.items:
-            name = dep.metadata.name
-            if not name.startswith("maki-") or name == "maki-nerve-nats-box":
-                continue
-            img = dep.spec.template.spec.containers[0].image
-            # Extract tag from full image URL
-            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
-    except Exception:
-        log.exception("Failed to refresh deployment images")
-
-    try:
-        sts_list = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_stateful_set, namespace=NAMESPACE)
-        for sts in sts_list.items:
-            name = sts.metadata.name
-            if not name.startswith("maki-"):
-                continue
-            # Skip third-party statefulsets (embed=ollama, graph=neo4j, nerve=nats)
-            img = sts.spec.template.spec.containers[0].image
-            if "ghcr.io" not in img:
-                continue
-            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
-    except Exception:
-        log.exception("Failed to refresh statefulset images")
-
-    if images:
-        _running_images = images
-
-
-async def _gossip_publisher():
-    """Broadcast local state to all immune instances via NATS gossip."""
-    log.info("Gossip publisher started", extra={"site": SITE_NAME, "interval": CHECK_INTERVAL})
-    while True:
-        try:
-            await _refresh_running_images()
-            payload = {
-                "site": SITE_NAME,
-                "instance_id": INSTANCE_ID,
-                "timestamp": time.time(),
-                "component_health": {
-                    k: {"healthy": v["healthy"], "consecutive_failures": v["consecutive_failures"]}
-                    for k, v in _component_health.items()
-                },
-                "recent_actions": _recent_actions[-10:],
-                "cortex": {
-                    "last_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
-                    if _last_cortex_heartbeat
-                    else None,
-                    "active_turn": _cortex_active_turn,
-                    "turn_mode": _cortex_turn_mode,
-                },
-                "blacklist": list(_failed_image_blacklist),
-                "images": dict(_running_images),
-            }
-            await _nc.publish(IMMUNE_HEALTH, json.dumps(payload).encode())
-        except Exception:
-            log.exception("Gossip publish failed")
-        await asyncio.sleep(CHECK_INTERVAL)
-
-
-async def _gossip_listener():
-    """Subscribe to gossip from all immune instances, build hive-wide state."""
-    sub = await _nc.subscribe(IMMUNE_HEALTH)  # NOT queue-grouped — all instances receive all
-    log.info("Gossip listener started", extra={"subject": IMMUNE_HEALTH})
-    async for msg in sub.messages:
-        try:
-            payload = json.loads(msg.data.decode())
-            site = payload.get("site", "unknown")
-            if site == SITE_NAME:
-                continue  # skip own messages
-
-            was_new = site not in _hive_state
-            _hive_state[site] = {**payload, "received_at": time.time()}
-
-            if was_new:
-                log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
-
-            # Prune stale peers
-            now = time.time()
-            stale = [s for s, v in _hive_state.items() if now - v["received_at"] > GOSSIP_STALE_THRESHOLD]
-            for s in stale:
-                log.warning("Peer went silent, pruning", extra={"site": s})
-                del _hive_state[s]
-
-        except Exception:
-            log.exception("Gossip listener error")
-
-
-# --- Reflex Engine ---
-
-
-async def _trigger_reflex(component: str, state: dict, config: dict):
-    """Autonomous pod restart reflex (Tier 1)."""
-    if component.endswith("-heartbeat"):
-        return
-
-    pod_name = state.get("details", {}).get("pod_name")
-    if not pod_name:
-        return
-
-    now = time.time()
-    hour_ago = now - 3600
-    max_restarts = config.get("reflex_restart_max", 3)
-
-    history = _restart_history.get(component, [])
-    history = [t for t in history if t > hour_ago]
-    _restart_history[component] = history
-
-    if len(history) >= max_restarts:
-        # Check hive — if healthy elsewhere, this is a local problem, don't escalate
-        hive_healthy_elsewhere = _component_healthy_in_hive(component)
-        if hive_healthy_elsewhere:
-            log.warning(
-                "Reflex limit reached but component healthy on other sites — skipping escalation",
-                extra={"component": component, "restarts": len(history), "hive_healthy_sites": hive_healthy_elsewhere},
-            )
-            return
-
-        log.warning(
-            "Reflex limit reached, escalating to Claude",
-            extra={
-                "component": component,
-                "restarts": len(history),
-                "max": max_restarts,
-            },
-        )
-        await _publish_alert(
-            f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"
-        )
-        asyncio.create_task(
-            _escalate_to_claude(
-                component,
-                state,
-                f"Reflex restart limit reached ({len(history)}/{max_restarts} restarts in last hour)",
-            )
-        )
-        return
-
-    if not await _acquire_lock("immune-reflex", ttl=60):
-        log.warning("Cannot acquire lock for reflex restart", extra={"component": component})
-        return
-
-    try:
-        # Count the attempt before the delete — even if it fails (e.g. pod already gone),
-        # we want to hit the rate limit and escalate to Claude for investigation.
-        history.append(now)
-        _restart_history[component] = history
-
-        _k8s_v1.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=10)
-
-        action = {
-            "type": "reflex_restart",
-            "component": component,
-            "pod_name": pod_name,
-            "restart_number": len(history),
-            "max_restarts": max_restarts,
-            "timestamp": now,
-        }
-        _recent_actions.append(action)
-        if len(_recent_actions) > RECENT_ACTIONS_MAX:
-            _recent_actions.pop(0)
-        _schedule_persist_recent_actions()
-
-        log.info(
-            "Reflex restart",
-            extra={
-                "component": component,
-                "pod_name": pod_name,
-                "restart_number": len(history),
-                "max": max_restarts,
-            },
-        )
-        await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-
-    except Exception:
-        log.exception("Failed to restart pod", extra={"pod_name": pod_name})
-    finally:
-        await _release_lock("immune-reflex")
 
 
 # --- NATS Publishing ---
 
 
 async def _publish_alert(alert_text: str):
-    """Publish urgent alert to JetStream (ears will post to #maki-vitals)."""
+    """Publish urgent alert to JetStream."""
     payload = {"alert": alert_text, "timestamp": time.time()}
     await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
     log.info("Alert published", extra={"alert_preview": alert_text[:100]})
@@ -868,7 +329,7 @@ async def _publish_immune_response(message_id: str, response: str):
     log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
 
 
-# --- State Request Handler ---
+# --- State Request Handlers ---
 
 
 async def _state_request_handler(msg):
@@ -885,11 +346,11 @@ async def _state_request_handler(msg):
             "component_health": _component_health,
             "recent_actions": _recent_actions[-10:],
             "lock": lock_info,
-            "last_cortex_heartbeat": _last_cortex_heartbeat,
-            "cortex_active_turn": _cortex_active_turn,
-            "cortex_turn_mode": _cortex_turn_mode,
-            "cortex_turn_started": _cortex_turn_started,
-            "last_incident_time": _last_incident_time,
+            "last_cortex_heartbeat": _cortex_state["last_heartbeat"],
+            "cortex_active_turn": _cortex_state["active_turn"],
+            "cortex_turn_mode": _cortex_state["turn_mode"],
+            "cortex_turn_started": _cortex_state["turn_started"],
+            "last_incident_time": health_mod.get_last_incident_time(),
             "site_name": SITE_NAME,
             "hive_state": _hive_state,
             "images": dict(_running_images),
@@ -902,12 +363,7 @@ async def _state_request_handler(msg):
 
 
 async def _site_query_handler(msg):
-    """Handle rich site query from a remote immune's Claude.
-
-    Returns comprehensive local state — component health with full details,
-    pod metrics, images, deploy history, blacklist, recent actions.
-    Used by immune's query_site tool for cross-site investigation.
-    """
+    """Handle rich site query from a remote immune's Claude."""
     try:
         lock_info = None
         try:
@@ -928,12 +384,12 @@ async def _site_query_handler(msg):
             "lock": lock_info,
             "blacklist": list(_failed_image_blacklist),
             "cortex": {
-                "last_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
-                if _last_cortex_heartbeat
+                "last_heartbeat_age_s": round(time.time() - _cortex_state["last_heartbeat"], 1)
+                if _cortex_state["last_heartbeat"]
                 else None,
-                "active_turn": _cortex_active_turn,
-                "turn_mode": _cortex_turn_mode,
-                "turn_started": _cortex_turn_started,
+                "active_turn": _cortex_state["active_turn"],
+                "turn_mode": _cortex_state["turn_mode"],
+                "turn_started": _cortex_state["turn_started"],
             },
         }
         await msg.respond(json.dumps(state, default=str).encode())
@@ -943,898 +399,13 @@ async def _site_query_handler(msg):
         await msg.respond(b"{}")
 
 
-# --- Deploy Coordination ---
-
-
-def _normalize_image_tag(tag: str) -> str:
-    """Normalize image tag to match Docker workflow convention.
-
-    Docker workflow tags images as sha-<7char_short_sha>.
-    Raw SHA inputs get the sha- prefix added automatically.
-    Rejects inputs that don't look like valid hex commit SHAs.
-    """
-    if tag == "latest":
-        return tag
-    if tag.startswith("sha-"):
-        return tag
-    # Validate that it looks like a hex commit SHA before prefixing
-    import re
-
-    if re.fullmatch(r"[0-9a-f]{7,40}", tag):
-        return f"sha-{tag[:7]}"
-    raise ValueError(f"Invalid image tag '{tag}': expected 'latest', 'sha-<hex>', or a hex commit SHA")
-
-
-async def _restart_dependent(deployment_name: str, reason: str):
-    """Restart a dependent deployment (e.g. stem after cortex rollback)."""
-    if not _k8s_apps_v1:
-        return
-    patch = {
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {"immune.maki/restartedAt": str(time.time())},
-                }
-            }
-        }
-    }
-    await asyncio.to_thread(
-        _k8s_apps_v1.patch_namespaced_deployment,
-        name=deployment_name,
-        namespace=NAMESPACE,
-        body=patch,
-    )
-    log.info("Restarted dependent deployment", extra={"deployment": deployment_name, "reason": reason})
-
-
-async def _deploy_request_handler(msg):
-    """Handle deploy requests from cortex — set image, monitor, rollback if unhealthy."""
-    try:
-        request = json.loads(msg.data.decode())
-        service = request.get("service", "")
-        raw_tag = request.get("image_tag", "latest")
-        try:
-            image_tag = _normalize_image_tag(raw_tag)
-        except ValueError as e:
-            log.warning("Invalid image tag in deploy request", extra={"raw_tag": raw_tag, "error": str(e)})
-            await msg.respond(json.dumps({"status": "error", "message": str(e)}).encode())
-            return
-        deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
-        image = f"{GHCR_PREFIX}/{deployment_name}:{image_tag}"
-
-        log.info(
-            "Deploy request received",
-            extra={"service": service, "raw_tag": raw_tag, "normalized_tag": image_tag, "image": image},
-        )
-
-        # Blacklist check — reject known-bad images unless force=true or tag is "latest"
-        force = request.get("force", False)
-        if image_tag != "latest" and not force and image_tag in _failed_image_blacklist:
-            log.warning(
-                "Deploy rejected: image tag is blacklisted (failed a previous health check)",
-                extra={"image_tag": image_tag, "deployment": deployment_name},
-            )
-            result = {
-                "status": "blacklisted",
-                "message": (
-                    f"Image {image_tag} is blacklisted — it failed a health check in this session. "
-                    "Use force=true to override."
-                ),
-            }
-            await _nc.publish(
-                IMMUNE_ACTION,
-                json.dumps(
-                    {
-                        "type": "deploy_rejected",
-                        "deployment": deployment_name,
-                        "image_tag": image_tag,
-                        "reason": "blacklisted",
-                        "timestamp": time.time(),
-                    }
-                ).encode(),
-            )
-            await msg.respond(json.dumps(result).encode())
-            return
-
-        if not _k8s_apps_v1:
-            await msg.respond(json.dumps({"status": "error", "message": "K8s client not available"}).encode())
-            return
-
-        if not await _acquire_lock("immune-deploy", ttl=180):
-            await msg.respond(
-                json.dumps({"status": "error", "message": "Infrastructure lock held, try again later"}).encode()
-            )
-            return
-
-        try:
-            # Get current image for rollback
-            dep = await asyncio.to_thread(
-                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
-            )
-            previous_image = dep.spec.template.spec.containers[0].image
-            log.info("Current image recorded for rollback", extra={"previous": previous_image})
-
-            # Skip if already on this exact image — avoids no-op deploys,
-            # 60s monitoring wait, and unnecessary propagation
-            if previous_image == image:
-                log.info(
-                    "Already on target image, skipping deploy", extra={"deployment": deployment_name, "image": image}
-                )
-                result = {"status": "skipped", "message": f"Already running {image}"}
-                await msg.respond(json.dumps(result).encode())
-                return
-
-            # Persist previous image for rollback (survives restarts)
-            await _save_deploy_history(deployment_name, previous_image)
-
-            # Patch the deployment with new image
-            patch = {
-                "spec": {
-                    "template": {
-                        "spec": {"containers": [{"name": dep.spec.template.spec.containers[0].name, "image": image}]}
-                    }
-                }
-            }
-            await asyncio.to_thread(
-                _k8s_apps_v1.patch_namespaced_deployment, name=deployment_name, namespace=NAMESPACE, body=patch
-            )
-            log.info("Deployment patched", extra={"deployment": deployment_name, "image": image})
-
-            # Monitor health for 60 seconds
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
-
-            if healthy:
-                result = {"status": "success", "message": f"Deployed {deployment_name} with {image}", "image": image}
-                log.info("Deploy succeeded", extra={"deployment": deployment_name})
-                await _publish_vitals(f"Deployed {deployment_name} → {image_tag} — healthy on {INSTANCE_ID}")
-
-                # Propagate to other clusters via JetStream — survives brief
-                # immune restarts and NATS routing gaps (fixes #52)
-                await _js.publish(
-                    DEPLOY_PROPAGATE,
-                    json.dumps(
-                        {
-                            "service": service,
-                            "image_tag": image_tag,
-                            "deployment_name": deployment_name,
-                            "image": image,
-                            "canary_instance": INSTANCE_ID,
-                        }
-                    ).encode(),
-                )
-            else:
-                # Rollback to previous image
-                log.warning("Deploy unhealthy, rolling back", extra={"deployment": deployment_name})
-                rollback_patch = {
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "containers": [
-                                    {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
-                                ]
-                            }
-                        }
-                    }
-                }
-                await asyncio.to_thread(
-                    _k8s_apps_v1.patch_namespaced_deployment,
-                    name=deployment_name,
-                    namespace=NAMESPACE,
-                    body=rollback_patch,
-                )
-                result = {
-                    "status": "rolled_back",
-                    "message": f"Deploy of {image} failed health check, rolled back to {previous_image}",
-                }
-                # Blacklist this tag so it won't be re-deployed in subsequent cycles
-                if image_tag != "latest":
-                    _failed_image_blacklist.add(image_tag)
-                    log.warning(
-                        "Image tag added to blacklist after failed health check",
-                        extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
-                    )
-                _rollback_logs = await _fetch_rollback_logs(deployment_name)
-                await _publish_alert(
-                    f"Deploy of {deployment_name} → {image_tag} FAILED health check. "
-                    f"Rolled back to {previous_image}{_rollback_logs}"
-                )
-
-                # If cortex was rolled back, restart stem to clear stale pending turns
-                if "cortex" in deployment_name:
-                    try:
-                        await _restart_dependent("maki-stem", reason="cortex rollback")
-                    except Exception:
-                        log.exception("Failed to restart stem after cortex rollback")
-
-            action = {
-                "type": "deploy",
-                "deployment": deployment_name,
-                "image": image,
-                "result": result["status"],
-                "timestamp": time.time(),
-            }
-            _recent_actions.append(action)
-            if len(_recent_actions) > RECENT_ACTIONS_MAX:
-                _recent_actions.pop(0)
-            _schedule_persist_recent_actions()
-            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-
-            await msg.respond(json.dumps(result).encode())
-
-        finally:
-            await _release_lock("immune-deploy")
-
-    except Exception:
-        log.exception("Deploy request handler error")
-        try:
-            await msg.respond(json.dumps({"status": "error", "message": "Internal error"}).encode())
-        except Exception:
-            pass
-
-
-async def _monitor_rollout(deployment_name: str, timeout: int = 60) -> bool:
-    """Monitor deployment health after image update. Returns True if healthy.
-
-    Checks both deployment replica counts AND actual pod states to avoid
-    false positives where old pods satisfy ready_replicas while new pods
-    are stuck in ImagePullBackOff or CrashLoopBackOff.
-    """
-    deadline = time.time() + timeout
-    # Wait a few seconds for the new pod to start scheduling
-    await asyncio.sleep(5)
-
-    while time.time() < deadline:
-        try:
-            dep = await asyncio.to_thread(
-                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
-            )
-            status = dep.status
-            desired = dep.spec.replicas or 1
-            ready = status.ready_replicas or 0
-            updated = status.updated_replicas or 0
-            available = status.available_replicas or 0
-
-            # Check the Progressing condition for definitive rollout status
-            rollout_complete = False
-            rollout_failed = False
-            if status.conditions:
-                for cond in status.conditions:
-                    if cond.type == "Progressing":
-                        if cond.status == "True" and cond.reason == "NewReplicaSetAvailable":
-                            rollout_complete = True
-                        elif cond.status == "False":
-                            rollout_failed = True
-
-            if rollout_failed:
-                log.warning(
-                    "Rollout failed (Progressing=False)",
-                    extra={"deployment": deployment_name},
-                )
-                return False
-
-            # Also check actual pod states — don't trust replica counts alone
-            pods_healthy = True
-            if _k8s_v1:
-                pods = await asyncio.to_thread(
-                    _k8s_v1.list_namespaced_pod,
-                    namespace=NAMESPACE,
-                    label_selector=f"app={deployment_name}",
-                )
-                for pod in pods.items:
-                    if pod.status.container_statuses:
-                        for cs in pod.status.container_statuses:
-                            if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                                reason = cs.state.waiting.reason
-                                if reason in (
-                                    "ImagePullBackOff",
-                                    "ErrImagePull",
-                                    "CrashLoopBackOff",
-                                    "CreateContainerConfigError",
-                                ):
-                                    log.warning(
-                                        "Pod stuck during rollout",
-                                        extra={
-                                            "deployment": deployment_name,
-                                            "pod": pod.metadata.name,
-                                            "reason": reason,
-                                        },
-                                    )
-                                    pods_healthy = False
-
-            if not pods_healthy:
-                # Don't return False immediately — give it a few cycles in case
-                # it's a transient pull issue. But if we're past 30s, fail fast.
-                if time.time() > deadline - 30:
-                    log.warning(
-                        "Pods stuck past grace period, failing rollout",
-                        extra={"deployment": deployment_name},
-                    )
-                    return False
-
-            elif rollout_complete and ready >= desired and updated >= desired and available >= desired:
-                log.info(
-                    "Rollout healthy",
-                    extra={
-                        "deployment": deployment_name,
-                        "ready": ready,
-                        "updated": updated,
-                        "available": available,
-                        "desired": desired,
-                    },
-                )
-                return True
-
-            log.info(
-                "Rollout in progress",
-                extra={
-                    "deployment": deployment_name,
-                    "ready": ready,
-                    "updated": updated,
-                    "available": available,
-                    "desired": desired,
-                    "pods_healthy": pods_healthy,
-                },
-            )
-        except Exception:
-            log.exception("Error checking rollout status")
-
-        await asyncio.sleep(5)
-
-    log.warning("Rollout timed out", extra={"deployment": deployment_name, "timeout": timeout})
-    return False
-
-
-async def _deploy_propagate_listener():
-    """JetStream durable consumer for deploy propagation.
-
-    Each immune instance gets its own durable consumer keyed by INSTANCE_ID,
-    ensuring messages persist until consumed even if the pod restarts briefly.
-    Uses deliver_policy=new so only future propagations are consumed.
-    """
-    from nats.js.api import DeliverPolicy
-
-    sub = await _js.subscribe(
-        DEPLOY_PROPAGATE,
-        durable=f"immune-propagate-{INSTANCE_ID}",
-        deliver_policy=DeliverPolicy.NEW,
-    )
-    log.info("JetStream propagation consumer started", extra={"durable": f"immune-propagate-{INSTANCE_ID}"})
-    async for msg in sub.messages:
-        try:
-            await _deploy_propagate_handler(msg)
-        except Exception:
-            log.exception("Deploy propagation listener error")
-        finally:
-            await msg.ack()
-
-
-async def _deploy_propagate_handler(msg):
-    """Handle deploy propagation from canary — deploy same image locally.
-
-    Broadcast subscription (not queue grouped) — every immune receives this.
-    Each skips if it was the canary that already deployed.
-    Deploys locally, monitors health, rolls back if unhealthy.
-    Canary failure never reaches here — propagation only happens on success.
-    """
-    try:
-        request = json.loads(msg.data.decode())
-        canary = request.get("canary_instance", "")
-        deployment_name = request.get("deployment_name", "")
-        image = request.get("image", "")
-        image_tag = request.get("image_tag", "")
-
-        # Skip if we were the canary — we already deployed
-        if canary == INSTANCE_ID:
-            return
-
-        # Blacklist check — skip if this tag failed a health check on this instance
-        if image_tag and image_tag != "latest" and image_tag in _failed_image_blacklist:
-            log.warning(
-                "Propagated deploy skipped: image tag is blacklisted (failed a previous health check)",
-                extra={"image_tag": image_tag, "deployment": deployment_name, "canary": canary},
-            )
-            await _nc.publish(
-                IMMUNE_ACTION,
-                json.dumps(
-                    {
-                        "type": "deploy_propagation_skipped",
-                        "deployment": deployment_name,
-                        "image_tag": image_tag,
-                        "reason": "blacklisted",
-                        "instance": INSTANCE_ID,
-                        "timestamp": time.time(),
-                    }
-                ).encode(),
-            )
-            return
-
-        log.info(
-            "Deploy propagation received from canary",
-            extra={"canary": canary, "deployment": deployment_name, "image": image},
-        )
-
-        if not _k8s_apps_v1:
-            log.error("K8s client not available, cannot propagate deploy")
-            return
-
-        if not await _acquire_lock("immune-deploy", ttl=180):
-            # Check if we're already on the target image (e.g. canary receiving
-            # its own propagation, or manual update already applied).
-            # No alert needed — just skip.
-            try:
-                dep = await asyncio.to_thread(
-                    _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
-                )
-                if dep.spec.template.spec.containers[0].image == image:
-                    log.info("Lock held but already on target image, skipping", extra={"deployment": deployment_name})
-                    return
-            except Exception:
-                pass
-            await _publish_alert(f"Cannot propagate deploy of {deployment_name} — lock held")
-            return
-
-        try:
-            dep = await asyncio.to_thread(
-                _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
-            )
-            previous_image = dep.spec.template.spec.containers[0].image
-
-            # Already on this image — skip
-            if previous_image == image:
-                log.info("Already on target image, skipping", extra={"deployment": deployment_name})
-                return
-
-            await _save_deploy_history(deployment_name, previous_image)
-
-            patch = {
-                "spec": {
-                    "template": {
-                        "spec": {"containers": [{"name": dep.spec.template.spec.containers[0].name, "image": image}]}
-                    }
-                }
-            }
-            await asyncio.to_thread(
-                _k8s_apps_v1.patch_namespaced_deployment, name=deployment_name, namespace=NAMESPACE, body=patch
-            )
-            log.info("Propagated deploy applied", extra={"deployment": deployment_name, "image": image})
-
-            healthy = await _monitor_rollout(deployment_name, timeout=60)
-
-            if healthy:
-                result_status = "success"
-                log.info("Propagated deploy healthy", extra={"deployment": deployment_name})
-                await _publish_vitals(
-                    f"Propagated deploy of {deployment_name} → {image_tag} — healthy on {INSTANCE_ID}"
-                )
-            else:
-                result_status = "rolled_back"
-                log.warning("Propagated deploy unhealthy, rolling back", extra={"deployment": deployment_name})
-                # Blacklist this tag so it won't be retried on this instance
-                if image_tag and image_tag != "latest":
-                    _failed_image_blacklist.add(image_tag)
-                    log.warning(
-                        "Image tag added to blacklist after failed propagated health check",
-                        extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
-                    )
-                rollback_patch = {
-                    "spec": {
-                        "template": {
-                            "spec": {
-                                "containers": [
-                                    {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
-                                ]
-                            }
-                        }
-                    }
-                }
-                await asyncio.to_thread(
-                    _k8s_apps_v1.patch_namespaced_deployment,
-                    name=deployment_name,
-                    namespace=NAMESPACE,
-                    body=rollback_patch,
-                )
-                _rollback_logs = await _fetch_rollback_logs(deployment_name)
-                await _publish_alert(
-                    f"Propagated deploy of {deployment_name} → {image_tag} FAILED on {INSTANCE_ID}. "
-                    f"Rolled back to {previous_image}. Canary ({canary}) was healthy — investigate."
-                    f"{_rollback_logs}"
-                )
-
-            action = {
-                "type": "deploy_propagation",
-                "deployment": deployment_name,
-                "image": image,
-                "result": result_status,
-                "canary_instance": canary,
-                "instance": INSTANCE_ID,
-                "timestamp": time.time(),
-            }
-            _recent_actions.append(action)
-            if len(_recent_actions) > RECENT_ACTIONS_MAX:
-                _recent_actions.pop(0)
-            _schedule_persist_recent_actions()
-            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-        finally:
-            await _release_lock("immune-deploy")
-
-    except Exception:
-        log.exception("Deploy propagation error")
-
-
-async def _deploy_status_handler(msg):
-    """Handle deploy status requests — return current image and pod state."""
-    try:
-        request = json.loads(msg.data.decode())
-        service = request.get("service", "")
-        deployment_name = f"maki-{service}" if not service.startswith("maki-") else service
-
-        if not _k8s_apps_v1:
-            await msg.respond(json.dumps({"error": "K8s client not available"}).encode())
-            return
-
-        dep = await asyncio.to_thread(
-            _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=NAMESPACE
-        )
-        status = dep.status
-        image = dep.spec.template.spec.containers[0].image
-
-        result = {
-            "deployment": deployment_name,
-            "image": image,
-            "replicas": dep.spec.replicas,
-            "ready_replicas": status.ready_replicas or 0,
-            "updated_replicas": status.updated_replicas or 0,
-            "available_replicas": status.available_replicas or 0,
-        }
-        await msg.respond(json.dumps(result).encode())
-
-    except Exception as e:
-        log.exception("Deploy status handler error")
-        await msg.respond(json.dumps({"error": str(e)}).encode())
-
-
-# --- Claude Reasoning ---
-
-MAX_CLAUDE_TURNS = int(os.environ.get("IMMUNE_MAX_TURNS", "8"))
-
-
-async def _escalate_to_claude(component: str, state: dict, reason: str):
-    """Escalate a problem to Claude for deeper investigation and remediation."""
-    log.info("Escalating to Claude", extra={"component": component, "reason": reason})
-
-    system_state = _build_system_state()
-    recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
-    config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
-    config_str = json.dumps(config, indent=2)
-
-    prompt = IMMUNE_SYSTEM_PROMPT.format(
-        system_state=system_state,
-        recent_actions=recent_actions_str,
-        config=config_str,
-    )
-    prompt += f"""
-
-## ESCALATION
-
-The fast reflex loop has escalated {component} to you because: {reason}
-
-Component details: {json.dumps(state, default=str)}
-
-Investigate this problem using your tools. Read logs, check events, examine the pod.
-Determine root cause and take corrective action if possible.
-Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...]."""
-
-    try:
-        response, _usage = await invoke_claude(
-            prompt,
-            model=MODEL,
-            semaphore=_semaphore,
-            max_turns=MAX_CLAUDE_TURNS,
-            mcp_servers={"maki-immune": _mcp_server},
-        )
-
-        config_updates = parse_config_tags(response)
-        await apply_config_updates(
-            _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
-        )
-
-        for digest in parse_tagged(response, "DIGEST"):
-            await _publish_vitals(digest)
-
-        for alert in parse_tagged(response, "ALERT"):
-            await _publish_alert(alert)
-
-        log.info("Claude escalation complete", extra={"component": component})
-
-    except Exception:
-        log.exception("Claude escalation failed", extra={"component": component})
-
-
-async def _handle_immune_command(msg):
-    """Handle direct commands from Adi via #maki-immune Discord channel.
-
-    This is the backdoor — when cortex is down or unresponsive, Adi can
-    send commands directly to immune through Discord. Immune uses its own
-    Claude instance to investigate and act, completely bypassing cortex.
-    """
-    try:
-        payload = json.loads(msg.data.decode())
-        message_id = payload.get("message_id", "")
-        command = payload.get("command", "")
-        username = payload.get("username", "unknown")
-
-        log.info(
-            "Immune command received",
-            extra={"message_id": message_id, "command": command[:100], "username": username},
-        )
-
-        # Handle blacklist management commands directly (no Claude needed)
-        cmd_lower = command.strip().lower()
-        if cmd_lower in ("clear-blacklist", "clear blacklist"):
-            cleared = list(_failed_image_blacklist)
-            _failed_image_blacklist.clear()
-            reply = f"Blacklist cleared. Removed {len(cleared)} entr{'y' if len(cleared) == 1 else 'ies'}: " + (
-                ", ".join(cleared) if cleared else "none"
-            )
-            log.info("Failed-image blacklist cleared via immune command", extra={"cleared": cleared})
-            await _publish_immune_response(message_id, reply)
-            return
-        if cmd_lower in ("show-blacklist", "show blacklist", "list-blacklist", "list blacklist"):
-            if _failed_image_blacklist:
-                reply = f"Blacklisted image tags ({len(_failed_image_blacklist)}): " + ", ".join(
-                    sorted(_failed_image_blacklist)
-                )
-            else:
-                reply = "Blacklist is empty."
-            await _publish_immune_response(message_id, reply)
-            return
-
-        system_state = _build_system_state()
-        recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
-        config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
-        config_str = json.dumps(config, indent=2)
-
-        prompt = IMMUNE_SYSTEM_PROMPT.format(
-            system_state=system_state,
-            recent_actions=recent_actions_str,
-            config=config_str,
-        )
-        prompt += f"""
-
-## DIRECT COMMAND FROM ADI
-
-Adi is talking to you directly through the #maki-immune backdoor channel.
-This means cortex may be down or unresponsive. Treat this as highest priority.
-
-Adi says: {command}
-
-Investigate and act on this command. Use your tools — read logs, check pods, restart things,
-whatever is needed. Respond with a clear summary of what you found and what you did.
-
-Put your full response in [RESPONSE:...] tags. This will be sent back to Adi in Discord.
-Also use [DIGEST:...] for anything that should go to #maki-vitals."""
-
-        try:
-            response, _usage = await invoke_claude(
-                prompt,
-                model=MODEL,
-                semaphore=_semaphore,
-                max_turns=MAX_CLAUDE_TURNS,
-                mcp_servers={"maki-immune": _mcp_server},
-            )
-
-            config_updates = parse_config_tags(response)
-            await apply_config_updates(
-                _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
-            )
-
-            # Extract response for Adi
-            responses = parse_tagged(response, "RESPONSE")
-            if responses:
-                reply = "\n\n".join(responses)
-            else:
-                # If Claude didn't use RESPONSE tags, send the full response
-                reply = response
-
-            await _publish_immune_response(message_id, reply)
-
-            # Also publish any digests/alerts
-            for digest in parse_tagged(response, "DIGEST"):
-                await _publish_vitals(digest)
-            for alert in parse_tagged(response, "ALERT"):
-                await _publish_alert(alert)
-
-            log.info("Immune command handled", extra={"message_id": message_id})
-
-        except Exception:
-            log.exception("Immune command Claude invocation failed")
-            await _publish_immune_response(
-                message_id, "Failed to process command — Claude invocation error. Check immune logs."
-            )
-
-    except Exception:
-        log.exception("Immune command handler error")
-
-
-def _build_system_state() -> str:
-    """Build system state summary for Claude, including latency and resource data."""
-    lines = []
-    for component, state in sorted(_component_health.items()):
-        status = "HEALTHY" if state["healthy"] else "UNHEALTHY"
-        age = round((time.time() - state["last_state_change"]) / 60, 1)
-        failures = state["consecutive_failures"]
-        details = state.get("details", {})
-
-        parts = [f"state_age={age}min"]
-        if failures:
-            parts.append(f"consecutive_failures={failures}")
-        if details.get("latency_ms") is not None and details["latency_ms"] >= 0:
-            parts.append(f"latency={details['latency_ms']}ms")
-        if details.get("restarts"):
-            parts.append(f"k8s_restarts={details['restarts']}")
-        if details.get("phase"):
-            parts.append(f"phase={details['phase']}")
-        if details.get("mem_limit"):
-            parts.append(f"mem_limit={details['mem_limit']}")
-        if details.get("cpu_limit"):
-            parts.append(f"cpu_limit={details['cpu_limit']}")
-
-        # Attach live resource usage from metrics API
-        pod_name = details.get("pod_name", "")
-        if pod_name and pod_name in _pod_metrics:
-            m = _pod_metrics[pod_name]
-            parts.append(f"cpu_usage={m.get('cpu', '?')}")
-            parts.append(f"mem_usage={m.get('memory', '?')}")
-
-        # Attach cortex turn state for heartbeat component
-        if component == "maki-cortex-heartbeat" and details.get("active_turn"):
-            parts.append(f"active_turn={details['active_turn']}")
-            parts.append(f"mode={details.get('turn_mode', '?')}")
-            turn_running = details.get("turn_running_s")
-            if turn_running is not None:
-                parts.append(f"turn_running={round(turn_running / 60, 1)}min")
-
-        lines.append(f"- {component}: {status} ({', '.join(parts)})")
-
-    if not lines:
-        lines.append("No health data collected yet.")
-
-    # Append local images
-    if _running_images:
-        lines.append(f"\n## Local Images ({SITE_NAME})")
-        for dep, tag in sorted(_running_images.items()):
-            lines.append(f"- {dep}: {tag}")
-
-    # Append hive state with images and drift detection
-    if _hive_state:
-        lines.append(f"\n## Hive State ({len(_hive_state)} peer(s) connected, local site: {SITE_NAME})")
-        for site, state in sorted(_hive_state.items()):
-            peer_health = state.get("component_health", {})
-            total = len(peer_health)
-            healthy = sum(1 for v in peer_health.values() if v.get("healthy"))
-            cortex_info = state.get("cortex", {})
-            cortex_age = cortex_info.get("last_heartbeat_age_s")
-            if cortex_age is not None and cortex_age < 60:
-                turn = cortex_info.get("active_turn")
-                cortex_str = f"cortex active (turn {turn})" if turn else "cortex idle"
-            elif cortex_age is not None:
-                cortex_str = f"cortex DOWN (heartbeat {round(cortex_age)}s ago)"
-            else:
-                cortex_str = "cortex unknown"
-            freshness = round(time.time() - state.get("received_at", 0))
-            lines.append(f"- {site}: {healthy}/{total} healthy, {cortex_str}, last seen {freshness}s ago")
-
-            # Show peer images and flag drift vs local
-            peer_images = state.get("images", {})
-            if peer_images:
-                for dep, tag in sorted(peer_images.items()):
-                    local_tag = _running_images.get(dep)
-                    drift = f" ⚠ DRIFT (local={local_tag})" if local_tag and local_tag != tag else ""
-                    lines.append(f"  - {dep}: {tag}{drift}")
-    else:
-        lines.append(f"\n## Hive State (no peers connected, local site: {SITE_NAME})")
-
-    return "\n".join(lines)
-
-
-async def _immune_heartbeat_loop():
-    """Periodic holistic patrol with Claude reasoning."""
-    log.info("Immune heartbeat loop started", extra={"instance_id": INSTANCE_ID})
-    last_patrol = time.time()
-
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL)
-
-        try:
-            config = await load_kv_config(_config_kv, DEFAULT_CONFIG)
-            interval = config.get("heartbeat_interval", 1800)
-
-            if time.time() - last_patrol < interval:
-                continue
-
-            log.info("Immune heartbeat triggered — starting patrol")
-            last_patrol = time.time()
-
-            system_state = _build_system_state()
-            recent_actions_str = json.dumps(_recent_actions[-10:], indent=2) if _recent_actions else "None"
-            config_str = json.dumps(config, indent=2)
-
-            prompt = IMMUNE_SYSTEM_PROMPT.format(
-                system_state=system_state,
-                recent_actions=recent_actions_str,
-                config=config_str,
-            )
-
-            response, _usage = await invoke_claude(
-                prompt,
-                model=MODEL,
-                semaphore=_semaphore,
-                max_turns=MAX_CLAUDE_TURNS,
-                mcp_servers={"maki-immune": _mcp_server},
-            )
-
-            config_updates = parse_config_tags(response)
-            await apply_config_updates(
-                _config_kv, config_updates, allowed_keys=set(DEFAULT_CONFIG.keys()), validators=IMMUNE_CONFIG_VALIDATORS
-            )
-
-            # [SILENT] means Claude found nothing worth reporting
-            if "[SILENT]" not in response:
-                for digest in parse_tagged(response, "DIGEST"):
-                    await _publish_vitals(digest)
-
-            for alert in parse_tagged(response, "ALERT"):
-                await _publish_alert(alert)
-
-            log.info("Immune heartbeat complete", extra={"silent": "[SILENT]" in response})
-
-        except Exception:
-            log.exception("Immune heartbeat error")
-
-
-# --- Cortex Stuck Handler ---
-
-
-async def _cortex_stuck_handler(msg):
-    """Handle cortex stuck signal — immediately escalate to Claude."""
-    try:
-        payload = json.loads(msg.data.decode())
-        turn_id = payload.get("turn_id", "unknown")
-        mode = payload.get("mode", "unknown")
-        timeout_s = payload.get("timeout_seconds", 0)
-        user_waiting = payload.get("user_waiting", False)
-
-        log.warning(
-            "Cortex stuck signal received",
-            extra={"turn_id": turn_id, "mode": mode, "timeout_s": timeout_s, "user_waiting": user_waiting},
-        )
-
-        state = {
-            "turn_id": turn_id,
-            "mode": mode,
-            "timeout_seconds": timeout_s,
-            "user_waiting": user_waiting,
-            "cortex_heartbeat_age_s": round(time.time() - _last_cortex_heartbeat, 1)
-            if _last_cortex_heartbeat
-            else None,
-        }
-        reason = f"Cortex turn {turn_id} (mode={mode}) timed out after {timeout_s}s" + (
-            ". User is waiting for a response." if user_waiting else "."
-        )
-
-        asyncio.create_task(_escalate_to_claude("maki-cortex", state, reason))
-
-    except Exception:
-        log.exception("Cortex stuck handler error")
-
-
 # --- Main ---
 
 
 async def main():
     global _nc, _js, _config_kv, _lock_kv, _deploy_history_kv, _state_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
 
-    log.info("maki-immune starting", extra={"nats_url": NATS_URL, "model": MODEL})
+    log.info("maki-immune starting", extra={"nats_url": NATS_URL})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
@@ -1844,49 +415,35 @@ async def main():
     _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
     _state_kv = await init_kv(_js, STATE_BUCKET)
 
-    # Vitals stream — ensures deploy results survive transient ears restarts
+    # JetStream streams
     from nats.js.api import RetentionPolicy, StorageType
 
-    try:
-        await _js.find_stream_name_by_subject(EARS_VITALS_OUT)
-    except Exception:
-        await _js.add_stream(
-            name=VITALS_STREAM,
-            subjects=[EARS_VITALS_OUT, IMMUNE_ALERT],
-            retention=RetentionPolicy.LIMITS,
-            max_age=3600,  # 1 hour retention
-            storage=StorageType.FILE,
-        )
-        log.info("Created vitals stream", extra={"stream": VITALS_STREAM})
+    for stream_name, subjects in [
+        (VITALS_STREAM, [EARS_VITALS_OUT, IMMUNE_ALERT]),
+        (DEPLOY_STREAM, [DEPLOY_PROPAGATE]),
+        (RESTART_STREAM, [RESTART_PROPAGATE]),
+    ]:
+        try:
+            await _js.find_stream_name_by_subject(subjects[0])
+        except Exception:
+            await _js.add_stream(
+                name=stream_name,
+                subjects=subjects,
+                retention=RetentionPolicy.LIMITS,
+                max_age=3600,
+                storage=StorageType.FILE,
+            )
+            log.info("Created stream", extra={"stream": stream_name})
 
-    # Deploy propagation stream — ensures propagation reaches all sites even
-    # during brief immune restarts or NATS routing gaps (fixes #52)
-    try:
-        await _js.find_stream_name_by_subject(DEPLOY_PROPAGATE)
-    except Exception:
-        await _js.add_stream(
-            name=DEPLOY_STREAM,
-            subjects=[DEPLOY_PROPAGATE],
-            retention=RetentionPolicy.LIMITS,
-            max_age=3600,  # 1 hour retention
-            storage=StorageType.FILE,
-        )
-        log.info("Created deploy stream", extra={"stream": DEPLOY_STREAM})
-
-    # Load previous deploy history for rollback support
-    await _load_deploy_history()
-
-    # Load recent action history for continuity across restarts
+    # Load persistent state
     await _load_recent_actions()
 
     # Clone or pull the repo for local code access (read-only)
     from maki_common.repo import init_repo
 
-    await init_repo(
-        REPO_PATH,
-        clone_url="https://github.com/adhityaravi/maki.git",
-    )
+    await init_repo(REPO_PATH, clone_url="https://github.com/adhityaravi/maki.git")
 
+    # K8s client
     try:
         k8s_config.load_incluster_config()
         _k8s_v1 = k8s_client.CoreV1Api()
@@ -1895,7 +452,7 @@ async def main():
     except Exception:
         log.warning("K8s in-cluster config not available, pod operations disabled")
 
-    # Create MCP tool server for Claude
+    # MCP tool server for Claude
     from maki_common.tools import create_immune_tools
 
     async def _config_getter():
@@ -1918,36 +475,116 @@ async def main():
     )
     log.info("Immune MCP tools registered")
 
+    # Initialize modules
+    deploy_mod.init(
+        nc=_nc,
+        js=_js,
+        k8s_v1=_k8s_v1,
+        k8s_apps_v1=_k8s_apps_v1,
+        deploy_history_kv=_deploy_history_kv,
+        namespace=NAMESPACE,
+        instance_id=INSTANCE_ID,
+        ghcr_prefix=GHCR_PREFIX,
+        recent_actions=_recent_actions,
+        recent_actions_max=RECENT_ACTIONS_MAX,
+        deploy_history=_deploy_history,
+        failed_image_blacklist=_failed_image_blacklist,
+        acquire_lock=_acquire_lock,
+        release_lock=_release_lock,
+        publish_alert=_publish_alert,
+        publish_vitals=_publish_vitals,
+        schedule_persist_recent_actions=_schedule_persist_recent_actions,
+    )
+    await deploy_mod.load_deploy_history()
+
+    claude_mod.init(
+        nc=_nc,
+        namespace=NAMESPACE,
+        instance_id=INSTANCE_ID,
+        site_name=SITE_NAME,
+        check_interval=CHECK_INTERVAL,
+        component_health=_component_health,
+        pod_metrics=_pod_metrics,
+        recent_actions=_recent_actions,
+        running_images=_running_images,
+        hive_state=_hive_state,
+        cortex_state=_cortex_state,
+        failed_image_blacklist=_failed_image_blacklist,
+        config_kv=_config_kv,
+        default_config=DEFAULT_CONFIG,
+        config_validators=IMMUNE_CONFIG_VALIDATORS,
+        mcp_server=_mcp_server,
+        semaphore=_semaphore,
+        system_prompt=IMMUNE_SYSTEM_PROMPT,
+        publish_alert=_publish_alert,
+        publish_vitals=_publish_vitals,
+        publish_immune_response=_publish_immune_response,
+    )
+
+    health_mod.init(
+        nc=_nc,
+        k8s_v1=_k8s_v1,
+        k8s_apps_v1=_k8s_apps_v1,
+        namespace=NAMESPACE,
+        instance_id=INSTANCE_ID,
+        site_name=SITE_NAME,
+        check_interval=CHECK_INTERVAL,
+        gossip_stale_threshold=GOSSIP_STALE_THRESHOLD,
+        health_endpoints=HEALTH_ENDPOINTS,
+        default_config=DEFAULT_CONFIG,
+        config_kv=_config_kv,
+        component_health=_component_health,
+        pod_metrics=_pod_metrics,
+        restart_history=_restart_history,
+        recent_actions=_recent_actions,
+        recent_actions_max=RECENT_ACTIONS_MAX,
+        running_images=_running_images,
+        hive_state=_hive_state,
+        failed_image_blacklist=_failed_image_blacklist,
+        cortex_state=_cortex_state,
+        acquire_lock=_acquire_lock,
+        release_lock=_release_lock,
+        publish_alert=_publish_alert,
+        publish_vitals=_publish_vitals,
+        schedule_persist_recent_actions=_schedule_persist_recent_actions,
+        escalate_to_claude=claude_mod.escalate_to_claude,
+    )
+
+    # Subscriptions
     await _nc.subscribe(IMMUNE_STATE_REQUEST, queue="maki-immune", cb=_state_request_handler)
     log.info("Subscribed", extra={"subject": IMMUNE_STATE_REQUEST})
 
-    # Site-specific query — no queue group, targets this site only
     site_query_subject = f"{IMMUNE_SITE_QUERY}.{SITE_NAME}"
     await _nc.subscribe(site_query_subject, cb=_site_query_handler)
     log.info("Subscribed", extra={"subject": site_query_subject})
 
-    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=_deploy_request_handler)
+    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
 
-    # DEPLOY_PROPAGATE via JetStream durable consumer — each immune instance
-    # gets its own durable so messages persist until consumed (fixes #52)
-    asyncio.create_task(_deploy_propagate_listener())
-    log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
-
-    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=_deploy_status_handler)
+    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
 
-    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=_cortex_stuck_handler)
+    await _nc.subscribe(RESTART_REQUEST, queue="maki-immune", cb=deploy_mod.restart_request_handler)
+    log.info("Subscribed", extra={"subject": RESTART_REQUEST})
+
+    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=claude_mod.cortex_stuck_handler)
     log.info("Subscribed", extra={"subject": CORTEX_STUCK})
 
-    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=_handle_immune_command)
+    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=claude_mod.handle_immune_command)
     log.info("Subscribed", extra={"subject": IMMUNE_COMMAND})
 
-    asyncio.create_task(_health_monitor_loop())
-    asyncio.create_task(_immune_heartbeat_loop())
-    asyncio.create_task(_cortex_heartbeat_listener())
-    asyncio.create_task(_gossip_publisher())
-    asyncio.create_task(_gossip_listener())
+    # Background tasks
+    asyncio.create_task(deploy_mod.deploy_propagate_listener())
+    log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
+
+    asyncio.create_task(deploy_mod.restart_propagate_listener())
+    log.info("Started JetStream restart propagation listener", extra={"subject": RESTART_PROPAGATE})
+
+    asyncio.create_task(health_mod.health_monitor_loop())
+    asyncio.create_task(claude_mod.immune_heartbeat_loop())
+    asyncio.create_task(health_mod.cortex_heartbeat_listener())
+    asyncio.create_task(health_mod.gossip_publisher())
+    asyncio.create_task(health_mod.gossip_listener())
 
     server = await tcp_health_server(port=HEALTH_PORT)
     log.info("Health server listening", extra={"port": HEALTH_PORT})

@@ -54,6 +54,37 @@ resource "kubernetes_deployment" "stem" {
             }
           }
         }
+        volume {
+          name = "maki-loops"
+          empty_dir {}
+        }
+        init_container {
+          name  = "install-loops"
+          image = "python:3.12-slim"
+          command = [
+            "/bin/sh",
+            "-c",
+            <<-EOT
+              set -e
+              apt-get update && apt-get install -y git
+              pip install --target=/maki-loops "git+https://$GITHUB_PAT@github.com/adhityaravi/maki-loops.git"
+              echo "maki-loops installed successfully"
+            EOT
+          ]
+          env {
+            name = "GITHUB_PAT"
+            value_from {
+              secret_key_ref {
+                name = "maki-github-pat"
+                key  = "token"
+              }
+            }
+          }
+          volume_mount {
+            name       = "maki-loops"
+            mount_path = "/maki-loops"
+          }
+        }
         container {
           name  = "stem"
           image = "${var.image_registry}/maki-stem:latest"
@@ -65,6 +96,15 @@ resource "kubernetes_deployment" "stem" {
             name       = "github-key"
             mount_path = "/etc/maki-github"
             read_only  = true
+          }
+          volume_mount {
+            name       = "maki-loops"
+            mount_path = "/maki-loops"
+            read_only  = true
+          }
+          env {
+            name  = "PYTHONPATH"
+            value = "/maki-loops"
           }
           env {
             name  = "NATS_URL"

@@ -77,3 +77,13 @@ resource "kubernetes_secret" "github_app" {
     "private-key.pem" = data.sops_file.secrets.data["github_private_key_pem"]
   }
 }
+
+resource "kubernetes_secret" "github_pat" {
+  metadata {
+    name      = "maki-github-pat"
+    namespace = var.namespace
+  }
+  data = {
+    token = data.sops_file.secrets.data["github_pat"]
+  }
+}

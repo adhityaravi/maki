@@ -42,7 +42,13 @@ from maki_common.subjects import (
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
 
-from maki_stem.loops import CARE_LOOP_SPEC, IDLE_LOOP_SPEC, WORK_LOOP_SPEC, StemContext, _run_loop
+from maki_stem.loops import IDLE_LOOP_SPEC, WORK_LOOP_SPEC, LoopSpec, StemContext, _run_loop
+
+try:
+    from importlib.metadata import entry_points
+except ImportError:
+    # Python < 3.10 fallback
+    from importlib_metadata import entry_points  # type: ignore[import-not-found,unused-ignore]
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -615,6 +621,44 @@ def _in_work_hours(config: dict) -> bool:
     return start <= current < end
 
 
+def _discover_loops() -> list[LoopSpec]:
+    """Discover loop specs from entry points and builtin loops.
+
+    Looks for 'maki.loops' entry points — allows private maki-loops package
+    to register additional loops (e.g., care, daytrading) without modifying this code.
+
+    Returns builtin loops (idle, work) + any discovered from entry points.
+    Duplicate names are logged and skipped (first one wins).
+    """
+    loops = [IDLE_LOOP_SPEC, WORK_LOOP_SPEC]
+    seen_names = {spec.name for spec in loops}
+
+    try:
+        eps = entry_points(group="maki.loops")
+        for ep in eps:
+            try:
+                spec = ep.load()
+                if not isinstance(spec, LoopSpec):
+                    log.warning(
+                        "Entry point returned non-LoopSpec, skipping",
+                        extra={"entry_point": ep.name, "type": type(spec).__name__},
+                    )
+                    continue
+                if spec.name in seen_names:
+                    log.warning("Duplicate loop name, skipping", extra={"name": spec.name, "entry_point": ep.name})
+                    continue
+                loops.append(spec)
+                seen_names.add(spec.name)
+                log.info("Discovered external loop", extra={"name": spec.name, "entry_point": ep.name})
+            except Exception:
+                log.exception("Failed to load loop entry point", extra={"entry_point": ep.name})
+    except Exception:
+        log.exception("Failed to discover loop entry points")
+
+    log.info("Loop discovery complete", extra={"total_loops": len(loops), "loop_names": list(seen_names)})
+    return loops
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _nc, _js, _config_kv, _lock_kv, _github
@@ -654,9 +698,11 @@ async def lifespan(app: FastAPI):
         in_quiet_hours=_in_quiet_hours,
         in_work_hours=_in_work_hours,
     )
-    asyncio.create_task(_run_loop(IDLE_LOOP_SPEC, ctx))
-    asyncio.create_task(_run_loop(CARE_LOOP_SPEC, ctx))
-    asyncio.create_task(_run_loop(WORK_LOOP_SPEC, ctx))
+
+    # Discover and start all loops (builtin + external via entry points)
+    loops = _discover_loops()
+    for spec in loops:
+        asyncio.create_task(_run_loop(spec, ctx))
 
     yield
 
