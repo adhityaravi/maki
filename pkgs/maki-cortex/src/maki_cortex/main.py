@@ -2,6 +2,9 @@
 
 Subscribes to turn requests via NATS, invokes Claude, publishes responses.
 Normal turns use streaming with MCP tools. Idle reflection stays single-shot.
+
+Tools loaded from maki_common include a full GitHub PR suite:
+list_prs, get_pr, comment_pr, update_pr, merge_pr, close_pr, request_pr_review.
 """
 
 import asyncio
@@ -56,30 +59,33 @@ _active_turn: str | None = None
 _active_turn_mode: str | None = None
 _active_turn_started: float | None = None
 
-# Error patterns that should be silent (not forwarded to Discord)
-_SILENT_ERROR_PATTERNS = [
-    "rate_limit",
-    "rate limit",
-    "overloaded",
-    "max_turns",
-    "MaxTurnsError",
-    "turn limit",
-    "capacity",
-    "quota",
-    "billing",
-    "credit",
-    "limit",
-    "resets",
-    "429",
-    "529",
-    "503",
-]
+# Error patterns that should be silent (not forwarded to Discord).
+# Stored as a frozenset of lowercase strings for O(1) substring scanning.
+_SILENT_ERROR_PATTERNS: frozenset[str] = frozenset(
+    {
+        "rate_limit",
+        "rate limit",
+        "overloaded",
+        "max_turns",
+        "maxturnserror",
+        "turn limit",
+        "capacity",
+        "quota",
+        "billing",
+        "credit",
+        "limit",
+        "resets",
+        "429",
+        "529",
+        "503",
+    }
+)
 
 
 def _is_silent_error(exc: Exception) -> bool:
-    """Check if an error should be silently swallowed instead of sent to Discord."""
+    """Return True if *exc* should be swallowed silently (not forwarded to Discord)."""
     error_str = str(exc).lower()
-    return any(pattern.lower() in error_str for pattern in _SILENT_ERROR_PATTERNS)
+    return any(pattern in error_str for pattern in _SILENT_ERROR_PATTERNS)
 
 
 async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
