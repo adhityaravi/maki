@@ -640,11 +640,11 @@ def _discover_loops() -> list[LoopSpec]:
                     )
                     continue
                 if spec.name in seen_names:
-                    log.warning("Duplicate loop name, skipping", extra={"name": spec.name, "entry_point": ep.name})
+                    log.warning("Duplicate loop name, skipping", extra={"loop_name": spec.name, "entry_point": ep.name})
                     continue
                 loops.append(spec)
                 seen_names.add(spec.name)
-                log.info("Discovered external loop", extra={"name": spec.name, "entry_point": ep.name})
+                log.info("Discovered external loop", extra={"loop_name": spec.name, "entry_point": ep.name})
             except Exception:
                 log.exception("Failed to load loop entry point", extra={"entry_point": ep.name})
     except Exception:
