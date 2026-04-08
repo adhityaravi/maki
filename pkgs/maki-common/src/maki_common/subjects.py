@@ -11,6 +11,7 @@ CORTEX_TOKEN_USAGE = "maki.cortex.token.usage"
 EARS_IN = "maki.ears.in"
 EARS_OUT = "maki.ears.out"
 EARS_VITALS_OUT = "maki.ears.vitals.out"
+EARS_IMMUNE_OUT = "maki.ears.immune.out"
 
 # Immune (ops intelligence)
 IMMUNE_HEALTH = "maki.immune.health"

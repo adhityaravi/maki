@@ -20,7 +20,7 @@ from maki_common.subjects import (
     DEPLOY_PROPAGATE,
     DEPLOY_REQUEST,
     DEPLOY_STATUS_REQUEST,
-    EARS_OUT,
+    EARS_IMMUNE_OUT,
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
@@ -325,9 +325,9 @@ async def _publish_vitals(digest: str):
 
 
 async def _publish_immune_response(message_id: str, response: str):
-    """Publish immune command response back to ears via EARS_OUT."""
-    payload = {"message_id": message_id, "response": response, "source": "immune"}
-    await _nc.publish(EARS_OUT, json.dumps(payload).encode())
+    """Publish immune command response back to ears for #maki-immune."""
+    payload = {"message_id": message_id, "response": response}
+    await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
     log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
 
 
