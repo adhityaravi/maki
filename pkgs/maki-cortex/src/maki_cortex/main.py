@@ -243,6 +243,14 @@ async def handle_turn_request(msg, nc, mcp_server):
                     )
                     await proc.communicate()
                 log.info("Auto-sync before turn", extra={"turn_id": turn_id})
+                # Invalidate code graph cache — files on disk changed
+                from maki_common.tools.codegraph_tools import _graph  # noqa: F811
+
+                if _graph is not None:
+                    import maki_common.tools.codegraph_tools as _cg
+
+                    _cg._graph = None
+                    _cg._graph_repo_path = None
             except Exception:
                 log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
 
@@ -352,7 +360,10 @@ async def heartbeat_loop(nc):
 
 
 async def main():
-    log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS, "session_id": SESSION_ID})
+    log.info(
+        "maki-cortex starting",
+        extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS, "session_id": SESSION_ID},
+    )
 
     # Health server first — readiness probe must succeed immediately regardless of
     # how long NATS or git clone take. Nothing below should block the probe.
