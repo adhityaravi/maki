@@ -27,15 +27,14 @@ def make_config_tools(
     async def get_config(args: dict[str, Any]) -> dict[str, Any]:
         """Read all configuration values."""
         log.info("Tool: get_config")
-        try:
-            keys = await config_kv.keys()
-            config = {}
-            for key in keys:
+        config = {}
+        for key in effective_keys:
+            try:
                 entry = await config_kv.get(key)
                 config[key] = entry.value.decode()
-            return mcp_result(str(config))
-        except Exception as e:
-            return mcp_result(f"Failed to read config: {e}")
+            except Exception:
+                config[key] = ""
+        return mcp_result(str(config))
 
     async def update_config(args: dict[str, Any]) -> dict[str, Any]:
         """Update a configuration value."""

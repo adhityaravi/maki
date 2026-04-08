@@ -352,7 +352,7 @@ async def heartbeat_loop(nc):
 
 
 async def main():
-    log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS})
+    log.info("maki-cortex starting", extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS, "session_id": SESSION_ID})
 
     # Health server first — readiness probe must succeed immediately regardless of
     # how long NATS or git clone take. Nothing below should block the probe.
