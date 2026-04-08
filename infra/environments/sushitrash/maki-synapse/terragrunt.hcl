@@ -24,5 +24,4 @@ dependencies {
 inputs = {
   namespace      = dependency.namespace.outputs.name
   image_registry = local.env.locals.image_registry
-  claude_model   = local.env.locals.claude_model
 }

@@ -10,5 +10,5 @@ variable "image_registry" {
 
 variable "claude_model" {
   type    = string
-  default = "claude-sonnet-4-6"
+  default = "claude-haiku-4-5-20251001"
 }

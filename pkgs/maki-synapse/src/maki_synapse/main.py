@@ -118,12 +118,20 @@ def build_tool_prompt(tools: list[ToolDefinition]) -> str:
 
 
 def extract_json_str(text: str) -> str:
-    """Extract JSON from text that may contain markdown code blocks."""
+    """Extract JSON from text that may contain markdown code blocks or preamble."""
+    text = text.strip()
+    # Markdown code block
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
+    # Direct JSON object or array
     start = text.find("{")
     end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    # JSON array
+    start = text.find("[")
+    end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
         return text[start : end + 1]
     return text
@@ -160,8 +168,13 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.tools:
         system_prompt += build_tool_prompt(req.tools)
 
-    if req.response_format and req.response_format.get("type") == "json_object":
-        system_prompt += "\n\nYou MUST respond with valid JSON only."
+    json_mode = req.response_format and req.response_format.get("type") == "json_object"
+    if json_mode:
+        system_prompt += (
+            "\n\nIMPORTANT: You MUST respond with valid JSON only. "
+            "No explanation, no markdown fencing, no text before or after the JSON. "
+            "Output a single JSON object starting with { and ending with }."
+        )
 
     user_prompt = "\n".join(user_parts)
     full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}" if system_prompt else user_prompt
@@ -170,6 +183,21 @@ async def chat_completions(req: ChatCompletionRequest):
         log.info("Invoking Claude", extra={"tools": bool(req.tools), "user_prompt_len": len(user_prompt)})
         text, _usage = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
         log.info("Claude response", extra={"response_len": len(text)})
+
+        # JSON mode: validate extraction, retry once on failure
+        if json_mode:
+            raw = extract_json_str(text)
+            try:
+                json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
+                retry_prompt = (
+                    f"{full_prompt}\n\n"
+                    "Your previous response was not valid JSON. "
+                    "Respond with ONLY the raw JSON object. No other text."
+                )
+                text, _usage = await invoke_claude(retry_prompt, model=MODEL, semaphore=_semaphore)
+                log.info("Retry response", extra={"response_len": len(text)})
     except Exception as e:
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))
