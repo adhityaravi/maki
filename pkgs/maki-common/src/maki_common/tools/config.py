@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
+from maki_common.subjects import CONFIG_SYNC
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -17,6 +19,7 @@ ALLOWED_CONFIG_KEYS = {
 def make_config_tools(
     config_kv: Any,
     allowed_keys: set[str] | None = None,
+    nc: Any | None = None,
 ) -> list[tuple[str, str, dict[str, type], Any]]:
     """Return (name, description, params, handler) tuples for config tools."""
     effective_keys = allowed_keys or ALLOWED_CONFIG_KEYS
@@ -43,6 +46,9 @@ def make_config_tools(
             return mcp_result(f"Key '{key}' not allowed. Allowed keys: {', '.join(sorted(effective_keys))}")
         try:
             await config_kv.put(key, value.encode())
+            # Propagate to all sites so config survives leadership migration
+            if nc is not None:
+                await nc.publish(CONFIG_SYNC, json.dumps({"key": key, "value": value}).encode())
             return mcp_result(f"Updated {key} = {value}")
         except Exception as e:
             return mcp_result(f"Failed to update config: {e}")
@@ -50,7 +56,7 @@ def make_config_tools(
     return [
         (
             "get_config",
-            "Read all current configuration values (idle interval, thought limits, etc.).",
+            "Read all current configuration values (chat_model, etc.).",
             {},
             get_config,
         ),

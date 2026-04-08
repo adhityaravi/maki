@@ -31,6 +31,7 @@ from maki_common import (
 )
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
+    CONFIG_SYNC,
     CONVERSATION_STREAM,
     CORTEX_HEALTH,
     CORTEX_STUCK,
@@ -675,6 +676,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_conversation_sync_listener())
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
+    asyncio.create_task(_config_sync_listener())
     ctx = StemContext(
         nc=_nc,
         js=_js,
@@ -934,6 +936,22 @@ async def _ears_listener():
             asyncio.create_task(_handle_discord_message(data))
         except Exception:
             log.exception("Error dispatching Discord message")
+
+
+async def _config_sync_listener():
+    """Apply config updates broadcast from other sites."""
+    sub = await _nc.subscribe(CONFIG_SYNC)
+    log.info("Subscribed", extra={"subject": CONFIG_SYNC})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            key = data.get("key", "")
+            value = data.get("value", "")
+            if key and _config_kv is not None:
+                await _config_kv.put(key, value.encode())
+                log.info("Config synced from peer", extra={"key": key, "value": value})
+        except Exception:
+            log.exception("Config sync error")
 
 
 @app.get("/health")

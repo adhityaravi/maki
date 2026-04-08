@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 
-from maki_common import configure_logging, connect_nats
+from maki_common import configure_logging, connect_nats, init_kv
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
@@ -360,6 +360,8 @@ async def main():
     log.info("Health server started", extra={"port": HEALTH_PORT})
 
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    js = nc.jetstream()
+    config_kv = await init_kv(js, "maki-cortex-config")
 
     # Load GitHub App private key if configured
     global _github_private_key
@@ -410,6 +412,7 @@ async def main():
         nc=nc,
         recall_url=RECALL_URL,
         health_endpoints=HEALTH_ENDPOINTS,
+        config_kv=config_kv,
         repo_path=REPO_PATH,
         github_app_id=GITHUB_APP_ID,
         github_private_key=github_private_key,

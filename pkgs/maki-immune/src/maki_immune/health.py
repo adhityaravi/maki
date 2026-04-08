@@ -26,6 +26,7 @@ _gossip_stale_threshold: int = 90
 _health_endpoints: dict[str, str] = {}
 _default_config: dict[str, Any] = {}
 _config_kv: Any = None
+_cortex_config_kv: Any = None  # stem's cortex config (chat_model etc.)
 _component_health: Any = None
 _pod_metrics: Any = None
 _restart_history: Any = None
@@ -66,6 +67,7 @@ def init(
     health_endpoints,
     default_config,
     config_kv,
+    cortex_config_kv,
     component_health,
     pod_metrics,
     restart_history,
@@ -83,7 +85,7 @@ def init(
     escalate_to_claude,
 ):
     global _nc, _k8s_v1, _k8s_apps_v1, _namespace, _instance_id, _site_name
-    global _check_interval, _gossip_stale_threshold, _health_endpoints, _default_config, _config_kv
+    global _check_interval, _gossip_stale_threshold, _health_endpoints, _default_config, _config_kv, _cortex_config_kv
     global _component_health, _pod_metrics, _restart_history, _recent_actions, _recent_actions_max
     global _running_images, _hive_state, _failed_image_blacklist, _cortex_state
     global _acquire_lock, _release_lock, _publish_alert, _publish_vitals, _schedule_persist
@@ -99,6 +101,7 @@ def init(
     _health_endpoints = health_endpoints
     _default_config = default_config
     _config_kv = config_kv
+    _cortex_config_kv = cortex_config_kv
     _component_health = component_health
     _pod_metrics = pod_metrics
     _restart_history = restart_history
@@ -518,11 +521,11 @@ async def gossip_publisher():
     while True:
         try:
             await _refresh_running_images()
-            # Load current config for gossip
+            # Load cortex config (chat_model etc.) for gossip
             try:
-                config = await load_kv_config(_config_kv, _default_config)
+                cortex_config = await load_kv_config(_cortex_config_kv, {})
             except Exception:
-                config = {}
+                cortex_config = {}
 
             payload = {
                 "site": _site_name,
@@ -540,7 +543,7 @@ async def gossip_publisher():
                     "active_turn": _cortex_state["active_turn"],
                     "turn_mode": _cortex_state["turn_mode"],
                 },
-                "config": config,
+                "cortex_config": cortex_config,
                 "token_usage_today": {
                     "date": _token_stats["date"],
                     "total_tokens": _token_stats["total_tokens"],

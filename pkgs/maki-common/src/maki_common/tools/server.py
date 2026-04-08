@@ -206,7 +206,7 @@ def create_cortex_tools(
     if config_kv is not None:
         from maki_common.tools.config import make_config_tools
 
-        all_tools.extend(make_config_tools(config_kv))
+        all_tools.extend(make_config_tools(config_kv, nc=nc))
 
     # Local code + CodeGraph tools (replaces GitHub API file tools)
     github_auth = None

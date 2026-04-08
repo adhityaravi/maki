@@ -58,6 +58,7 @@ VITALS_STREAM = "maki-vitals"
 DEPLOY_STREAM = "maki-deploy"
 RESTART_STREAM = "maki-restart"
 CONFIG_BUCKET = "maki-immune-config"
+CORTEX_CONFIG_BUCKET = "maki-cortex-config"
 LOCK_BUCKET = "maki-lock"
 DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
 STATE_BUCKET = "maki-immune-state"
@@ -412,6 +413,7 @@ async def main():
     _js = _nc.jetstream()
 
     _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
+    _cortex_config_kv = await init_kv(_js, CORTEX_CONFIG_BUCKET)
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
     _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
     _state_kv = await init_kv(_js, STATE_BUCKET)
@@ -534,6 +536,7 @@ async def main():
         health_endpoints=HEALTH_ENDPOINTS,
         default_config=DEFAULT_CONFIG,
         config_kv=_config_kv,
+        cortex_config_kv=_cortex_config_kv,
         component_health=_component_health,
         pod_metrics=_pod_metrics,
         restart_history=_restart_history,

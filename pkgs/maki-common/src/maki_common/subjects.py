@@ -32,6 +32,9 @@ RESTART_PROPAGATE = "maki.restart.propagate"
 # Ears (cont.)
 EARS_REMINDER_OUT = "maki.ears.reminder.out"
 
+# Config sync (cross-site propagation)
+CONFIG_SYNC = "maki.config.sync"
+
 # Memory
 MEMORY_STORE = "maki.memory.store"
 
