@@ -56,6 +56,9 @@ _github_private_key: str | None = None
 _active_turn: str | None = None
 _active_turn_mode: str | None = None
 _active_turn_started: float | None = None
+_active_task: asyncio.Task | None = None  # for preemption: cancel background turns
+
+_BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care"})
 
 # Error patterns that should be silent (not forwarded to Discord).
 # Stored as a frozenset of lowercase strings for O(1) substring scanning.
@@ -306,6 +309,12 @@ async def handle_turn_request(msg, nc, mcp_server):
             if usage_out:
                 await _publish_token_usage(nc, turn_id, usage_out[0])
 
+    except asyncio.CancelledError:
+        log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
+        done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
+        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        return
+
     except Exception as exc:
         log.exception("Error handling turn request")
         turn_id = "unknown"
@@ -335,6 +344,7 @@ async def handle_turn_request(msg, nc, mcp_server):
         _active_turn = None
         _active_turn_mode = None
         _active_turn_started = None
+        _active_task = None
 
 
 async def heartbeat_loop(nc):
@@ -440,7 +450,23 @@ async def main():
     log.info("Heartbeat loop started")
 
     async for msg in sub.messages:
-        asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
+        global _active_task
+        try:
+            turn = json.loads(msg.data.decode())
+            mode = turn.get("mode", "")
+        except Exception:
+            mode = ""
+
+        is_background = mode in _BACKGROUND_MODES
+
+        # Preempt: interactive turn cancels running background turn
+        if not is_background and _active_task and _active_turn_mode in _BACKGROUND_MODES:
+            _active_task.cancel()
+            log.info("Preempted background turn", extra={"cancelled_mode": _active_turn_mode})
+
+        task = asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
+        if is_background:
+            _active_task = task
 
 
 def cli():
