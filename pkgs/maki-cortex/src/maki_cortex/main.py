@@ -44,8 +44,6 @@ HEALTH_ENDPOINTS = {
     "cortex": f"http://localhost:{HEALTH_PORT}",
 }
 
-WORK_MAX_TURNS = int(os.environ.get("CORTEX_WORK_MAX_TURNS", "100"))
-
 # Unique per startup — lets stem detect cortex restarts
 SESSION_ID = uuid.uuid4().hex[:12]
 
@@ -189,22 +187,19 @@ async def handle_turn_request(msg, nc, mcp_server):
         turn = json.loads(msg.data.decode())
         turn_id = turn.get("turn_id", "unknown")
         mode = turn.get("mode", "normal")
-        is_idle = mode == "idle_reflection"
-        is_care = mode == "care"
-        is_work = mode == "work"
+        turn_model = turn.get("model") or MODEL
         prompt = turn.get("prompt") or ""
-        if is_idle:
-            prompt = "Reflect."
-        elif is_care:
-            prompt = "Check in."
-        elif is_work:
-            prompt = "Execute this task."
+        use_stream = turn.get("stream", True)
+        max_turns = turn.get("max_turns", MAX_TURNS)
+        git_pull = turn.get("git_pull", True)
         log.info(
             "Turn request received",
             extra={
                 "turn_id": turn_id,
                 "mode": mode,
                 "prompt_len": len(prompt),
+                "model": turn_model,
+                "stream": use_stream,
             },
         )
 
@@ -213,8 +208,8 @@ async def handle_turn_request(msg, nc, mcp_server):
         _active_turn_mode = mode
         _active_turn_started = time.time()
 
-        # Auto-pull latest code before work turns
-        if is_work and os.path.exists(REPO_PATH):
+        # Auto-pull latest code if requested by the loop
+        if git_pull and os.path.exists(REPO_PATH):
             try:
                 if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
                     from maki_common.tools.github import GitHubAuth
@@ -234,19 +229,20 @@ async def handle_turn_request(msg, nc, mcp_server):
                         stderr=asyncio.subprocess.PIPE,
                     )
                     await proc.communicate()
-                proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    REPO_PATH,
-                    "pull",
-                    "--rebase",
-                    "origin",
-                    "main",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout_bytes, stderr_bytes = await proc.communicate()
-                log.info("Auto-pull before work", extra={"rc": proc.returncode, "turn_id": turn_id})
+                # Hard reset to origin/main — no rebase, no merge conflicts.
+                # Any local-only state is stale (work turns commit+push everything).
+                for git_cmd in (
+                    ["git", "-C", REPO_PATH, "fetch", "origin", "main"],
+                    ["git", "-C", REPO_PATH, "reset", "--hard", "origin/main"],
+                    ["git", "-C", REPO_PATH, "clean", "-fd"],
+                ):
+                    proc = await asyncio.create_subprocess_exec(
+                        *git_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                log.info("Auto-sync before turn", extra={"turn_id": turn_id})
             except Exception:
                 log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
 
@@ -263,14 +259,13 @@ async def handle_turn_request(msg, nc, mcp_server):
             human_parts.append(prompt)
         full_prompt = "\n\n".join(human_parts) if human_parts else ""
 
-        if is_idle or is_care or is_work:
-            # Single-shot with tools — idle/care/work modes
-            effective_max_turns = WORK_MAX_TURNS if is_work else MAX_TURNS
+        if not use_stream:
+            # Single-shot with tools
             response_text, usage = await invoke_claude(
                 full_prompt,
-                model=MODEL,
+                model=turn_model,
                 semaphore=_semaphore,
-                max_turns=effective_max_turns,
+                max_turns=max_turns,
                 mcp_servers={"maki": mcp_server},
                 mode=mode,
                 system_prompt=static_context or None,
@@ -280,13 +275,13 @@ async def handle_turn_request(msg, nc, mcp_server):
             log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
             await _publish_token_usage(nc, turn_id, usage)
         else:
-            # Normal turn: streaming with tools
+            # Streaming with tools
             usage_out: list[TokenUsage] = []
             async with _semaphore:
                 async for chunk in stream_claude(
                     full_prompt,
-                    model=MODEL,
-                    max_turns=MAX_TURNS,
+                    model=turn_model,
+                    max_turns=max_turns,
                     mcp_servers={"maki": mcp_server},
                     mode=mode,
                     usage_out=usage_out,

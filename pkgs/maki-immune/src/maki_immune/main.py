@@ -584,6 +584,7 @@ async def main():
     asyncio.create_task(health_mod.health_monitor_loop())
     asyncio.create_task(claude_mod.immune_heartbeat_loop())
     asyncio.create_task(health_mod.cortex_heartbeat_listener())
+    asyncio.create_task(health_mod.token_usage_listener())
     asyncio.create_task(health_mod.gossip_publisher())
     asyncio.create_task(health_mod.gossip_listener())
 

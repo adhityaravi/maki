@@ -126,6 +126,9 @@ class LoopSpec:
     loop ordering (e.g. the work loop checks work hours before claiming).
     """
 
+    model: str | None = None
+    """Claude model override for this loop's cortex turns. None = cortex default."""
+
     extra: dict = field(default_factory=dict)
     """Arbitrary per-loop state accessible inside *body* (e.g. daily counters)."""
 

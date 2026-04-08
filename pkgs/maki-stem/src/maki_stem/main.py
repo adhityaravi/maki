@@ -25,6 +25,7 @@ from maki_common import (
     connect_nats,
     init_kv,
     kv_put_float,
+    load_kv_config,
     parse_config_tags,
     strip_tags,
 )
@@ -83,8 +84,7 @@ REPO_NAME = os.environ.get("REPO_NAME", "maki")
 # Idle loop frequency is controlled by IDLE_CRON + the distributed TTL lock in idle.py.
 # No per-loop "max per day" counter — that's redundant, not distributed, and a foot-gun.
 DEFAULT_CORTEX_CONFIG = {
-    "max_work_items_per_night": 2,
-    "work_cooldown_minutes": 15,
+    "chat_model": "",  # empty = cortex default; set to e.g. "claude-opus-4-6" to override
 }
 
 DEFAULT_IDENTITY = """You are Maki.
@@ -744,6 +744,9 @@ async def _process_turn(
         turn_system_state = None
         turn_system_state_summary = _summarize_system_state(system_state)
 
+    config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
+    chat_model = config.get("chat_model", "")
+
     turn_payload = {
         "turn_id": turn_id,
         "identity": identity,
@@ -754,7 +757,7 @@ async def _process_turn(
         "system_state": turn_system_state,
         "system_state_summary": turn_system_state_summary,
         "prompt": message,
-        "mission_results": None,
+        **({"model": chat_model} if chat_model else {}),
     }
 
     queue = _pending.create(turn_id)

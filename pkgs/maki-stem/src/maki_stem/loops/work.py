@@ -130,11 +130,6 @@ def _build_work_system_prompt(
     return "\n\n".join(parts)
 
 
-# Module-level nightly counters
-_work_items_tonight: int = 0
-_work_items_tonight_date: str = ""
-
-
 def _issue_has_skip_label(issue: dict) -> bool:
     """Return True if the issue carries any label that the work loop must skip."""
     for lbl in issue.get("labels", []):
@@ -172,19 +167,7 @@ async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
 
 
 async def _work_should_run(config: dict, ctx: StemContext) -> bool:
-    """Post-claim guard checks for the work loop: nightly cap, user inactivity, GitHub."""
-    global _work_items_tonight, _work_items_tonight_date
-
-    # Reset nightly counter if date changed
-    tonight = datetime.now().strftime("%Y-%m-%d")
-    if tonight != _work_items_tonight_date:
-        _work_items_tonight = 0
-        _work_items_tonight_date = tonight
-
-    max_items = config.get("max_work_items_per_night", 2)
-    if _work_items_tonight >= max_items:
-        return False
-
+    """Post-claim guard: user inactivity and GitHub availability."""
     # Only work if user has been inactive
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < USER_INACTIVE_THRESHOLD:
@@ -199,10 +182,6 @@ async def _work_should_run(config: dict, ctx: StemContext) -> bool:
 
 async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one night work cycle: pick an issue and hand it to cortex."""
-    global _work_items_tonight
-
-    max_items = config.get("max_work_items_per_night", 2)
-
     issues = await ctx.github.list_issues(state="open")
     if not issues:
         return
@@ -271,9 +250,13 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "conversation": [],
         "memories": memories,
         "graph_context": graph_context,
-        "prompt": None,
+        "prompt": "Execute this task.",
+        "stream": False,
+        "max_turns": int(os.environ.get("CORTEX_WORK_MAX_TURNS", "100")),
+        "git_pull": True,
         "work_context": work_context,
         "system_prompt": _build_work_system_prompt(identity, memories, graph_context, work_context),
+        **({"model": spec.model} if spec.model else {}),
     }
 
     queue = ctx.pending.create(turn_id)
@@ -283,17 +266,10 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 
         response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
         result_text = response_data.get("response", "")
-        _work_items_tonight += 1
-
         clean_result = strip_tags(result_text or "")
         log.info(
             "Work turn complete",
-            extra={
-                "turn_id": turn_id,
-                "issue": issue_number,
-                "work_items_tonight": _work_items_tonight,
-                "max": max_items,
-            },
+            extra={"turn_id": turn_id, "issue": issue_number},
         )
 
         asyncio.create_task(
@@ -352,11 +328,6 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     finally:
         ctx.pending.remove(turn_id)
 
-    # Cooldown between work items
-    cooldown = config.get("work_cooldown_minutes", 15) * 60
-    log.info("Work cooldown", extra={"cooldown_seconds": cooldown})
-    await asyncio.sleep(cooldown)
-
 
 WORK_LOOP_SPEC = LoopSpec(
     name="work",
@@ -365,4 +336,5 @@ WORK_LOOP_SPEC = LoopSpec(
     pre_claim_guard=_work_pre_claim_guard,
     should_run=_work_should_run,
     body=_work_body,
+    model="claude-opus-4-6",
 )

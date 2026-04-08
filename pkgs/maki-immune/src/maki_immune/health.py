@@ -4,12 +4,13 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
 from kubernetes import client as k8s_client
 from maki_common import load_kv_config
-from maki_common.subjects import IMMUNE_ACTION, IMMUNE_HEALTH
+from maki_common.subjects import CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,15 @@ _publish_vitals: Any = None
 _schedule_persist: Any = None
 _escalate_to_claude: Any = None  # callback, avoids circular import with claude.py
 _last_incident_time: float = 0
+
+# Token usage tracking — accumulated per day, reset on date change
+_token_stats: dict[str, Any] = {
+    "date": "",
+    "total_tokens": 0,
+    "total_cost_usd": 0.0,
+    "turns": 0,
+    "by_model": {},  # model -> {tokens, cost_usd, turns}
+}
 
 
 def init(
@@ -331,6 +341,38 @@ async def cortex_heartbeat_listener():
             pass
 
 
+async def token_usage_listener():
+    """Subscribe to cortex token usage and accumulate daily stats."""
+    sub = await _nc.subscribe(CORTEX_TOKEN_USAGE)
+    log.info("Subscribed", extra={"subject": CORTEX_TOKEN_USAGE})
+    async for msg in sub.messages:
+        try:
+            payload = json.loads(msg.data.decode())
+            today = datetime.now().strftime("%Y-%m-%d")
+            if _token_stats["date"] != today:
+                _token_stats["date"] = today
+                _token_stats["total_tokens"] = 0
+                _token_stats["total_cost_usd"] = 0.0
+                _token_stats["turns"] = 0
+                _token_stats["by_model"] = {}
+
+            tokens = payload.get("total_tokens", 0)
+            cost = payload.get("total_cost_usd", 0.0)
+            model = payload.get("mode", "unknown")
+
+            _token_stats["total_tokens"] += tokens
+            _token_stats["total_cost_usd"] += cost
+            _token_stats["turns"] += 1
+
+            if model not in _token_stats["by_model"]:
+                _token_stats["by_model"][model] = {"tokens": 0, "cost_usd": 0.0, "turns": 0}
+            _token_stats["by_model"][model]["tokens"] += tokens
+            _token_stats["by_model"][model]["cost_usd"] += cost
+            _token_stats["by_model"][model]["turns"] += 1
+        except Exception:
+            pass
+
+
 # --- Health Monitor Loop ---
 
 
@@ -476,6 +518,12 @@ async def gossip_publisher():
     while True:
         try:
             await _refresh_running_images()
+            # Load current config for gossip
+            try:
+                config = await load_kv_config(_config_kv, _default_config)
+            except Exception:
+                config = {}
+
             payload = {
                 "site": _site_name,
                 "instance_id": _instance_id,
@@ -491,6 +539,14 @@ async def gossip_publisher():
                     else None,
                     "active_turn": _cortex_state["active_turn"],
                     "turn_mode": _cortex_state["turn_mode"],
+                },
+                "config": config,
+                "token_usage_today": {
+                    "date": _token_stats["date"],
+                    "total_tokens": _token_stats["total_tokens"],
+                    "total_cost_usd": round(_token_stats["total_cost_usd"], 4),
+                    "turns": _token_stats["turns"],
+                    "by_model": _token_stats["by_model"],
                 },
                 "blacklist": list(_failed_image_blacklist),
                 "images": dict(_running_images),

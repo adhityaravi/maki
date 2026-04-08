@@ -10,9 +10,7 @@ from maki_common.tools.utils import mcp_result
 log = logging.getLogger(__name__)
 
 ALLOWED_CONFIG_KEYS = {
-    "idle_interval",
-    "idle_memory_query",
-    "cortex_model",
+    "chat_model",
 }
 
 

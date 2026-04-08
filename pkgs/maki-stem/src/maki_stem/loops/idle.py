@@ -235,10 +235,11 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "conversation": [],
         "memories": memories,
         "graph_context": graph_context,
-        "prompt": None,
-        "mission_results": None,
+        "prompt": "Reflect.",
+        "stream": False,
         "idle_context": idle_context,
         "system_prompt": _build_idle_system_prompt(identity, memories, graph_context, idle_context),
+        **({"model": spec.model} if spec.model else {}),
     }
 
     queue = ctx.pending.create(turn_id)
