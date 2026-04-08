@@ -37,8 +37,8 @@ from maki_common.subjects import (
     CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
-    EARS_MESSAGE_IN,
-    EARS_MESSAGE_OUT,
+    EARS_IN,
+    EARS_OUT,
     IMMUNE_STATE_REQUEST,
     MEMORY_STORE,
 )
@@ -127,7 +127,7 @@ _github = None  # GitHubIssueClient, initialized in lifespan if creds available
 _sub_response = None  # NATS subscription: CORTEX_TURN_RESPONSE
 _sub_cortex_health = None  # NATS subscription: CORTEX_HEALTH
 _sub_memory_store = None  # NATS subscription: MEMORY_STORE
-_sub_ears = None  # NATS subscription: EARS_MESSAGE_IN
+_sub_ears = None  # NATS subscription: EARS_IN
 
 
 def _init_github_client():
@@ -721,7 +721,7 @@ async def _process_turn(
     """Core turn logic with streaming. Returns (turn_id, full_response_text).
 
     If forward_to is provided (dict with message_id, channel_id),
-    streams each chunk to EARS_MESSAGE_OUT as it arrives from cortex.
+    streams each chunk to EARS_OUT as it arrives from cortex.
     """
     await kv_put_float(_lock_kv, "stem.last_activity", time.time())
 
@@ -801,7 +801,7 @@ async def _process_turn(
                     "response": chunk_text,
                     "done": done,
                 }
-                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(ears_msg).encode())
+                await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
 
             if done:
                 break
@@ -893,7 +893,7 @@ async def _handle_discord_message(data: dict):
                 "done": True,
             }
             try:
-                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
             except Exception:
                 log.exception("Failed to send timeout error to ears")
         except RuntimeError as e:
@@ -905,7 +905,7 @@ async def _handle_discord_message(data: dict):
                     "response": "I lost my train of thought (my brain restarted). What were you saying?",
                     "done": True,
                 }
-                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
             except Exception:
                 log.exception("Failed to send cancellation error to ears")
         except Exception:
@@ -917,7 +917,7 @@ async def _handle_discord_message(data: dict):
                     "response": "",
                     "done": True,
                 }
-                await _nc.publish(EARS_MESSAGE_OUT, json.dumps(error_msg).encode())
+                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
             except Exception:
                 log.exception("Failed to send error to ears")
 
@@ -925,9 +925,9 @@ async def _handle_discord_message(data: dict):
 async def _ears_listener():
     """Listen for incoming Discord messages via NATS and dispatch as tasks."""
     global _sub_ears
-    _sub_ears = await _nc.subscribe(EARS_MESSAGE_IN, queue="maki-stem")
+    _sub_ears = await _nc.subscribe(EARS_IN, queue="maki-stem")
     sub = _sub_ears
-    log.info("Subscribed", extra={"subject": EARS_MESSAGE_IN})
+    log.info("Subscribed", extra={"subject": EARS_IN})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())

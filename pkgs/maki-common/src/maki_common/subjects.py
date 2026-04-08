@@ -8,9 +8,8 @@ CORTEX_STUCK = "maki.cortex.stuck"
 CORTEX_TOKEN_USAGE = "maki.cortex.token.usage"
 
 # Ears (Discord interface)
-EARS_MESSAGE_IN = "maki.ears.message.in"
-EARS_MESSAGE_OUT = "maki.ears.message.out"
-EARS_THOUGHT_OUT = "maki.ears.thought.out"
+EARS_IN = "maki.ears.in"
+EARS_OUT = "maki.ears.out"
 EARS_VITALS_OUT = "maki.ears.vitals.out"
 EARS_IMMUNE_OUT = "maki.ears.immune.out"
 
@@ -28,9 +27,6 @@ DEPLOY_STATUS_REQUEST = "maki.deploy.status"
 DEPLOY_PROPAGATE = "maki.deploy.propagate"
 RESTART_REQUEST = "maki.restart.request"
 RESTART_PROPAGATE = "maki.restart.propagate"
-
-# Ears (cont.)
-EARS_REMINDER_OUT = "maki.ears.reminder.out"
 
 # Config sync (cross-site propagation)
 CONFIG_SYNC = "maki.config.sync"

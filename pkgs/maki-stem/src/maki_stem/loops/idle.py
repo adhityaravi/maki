@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 
 from maki_common import kv_get_float, parse_config_tags, strip_tags
 from maki_common.config import apply_config_updates
-from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_THOUGHT_OUT
+from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
 
 from .base import (
     RECENTLY_ACTIVE_THRESHOLD,
@@ -261,8 +261,8 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             clean_thought = ""
 
         if clean_thought:
-            thought_payload = {"thought": clean_thought, "turn_id": turn_id}
-            await ctx.nc.publish(EARS_THOUGHT_OUT, json.dumps(thought_payload).encode())
+            thought_payload = {"text": clean_thought, "turn_id": turn_id}
+            await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
             log.info("Thought published", extra={"turn_id": turn_id})
 
             state_summary = ctx.format_system_state(system_state)

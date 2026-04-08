@@ -14,10 +14,8 @@ import discord
 from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
-    EARS_MESSAGE_IN,
-    EARS_MESSAGE_OUT,
-    EARS_REMINDER_OUT,
-    EARS_THOUGHT_OUT,
+    EARS_IN,
+    EARS_OUT,
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
@@ -31,9 +29,7 @@ NATS_TOKEN = os.environ.get("NATS_TOKEN")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
-THOUGHTS_CHANNEL_NAME = os.environ.get("THOUGHTS_CHANNEL_NAME", "maki-general")
 VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-general")
-REMINDERS_CHANNEL_NAME = os.environ.get("REMINDERS_CHANNEL_NAME", "maki-general")
 IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
 
 # Timeout (seconds) after receiving the last chunk before assuming done.
@@ -53,9 +49,7 @@ LEADER_KEY = "ears.leader"
 LEADER_TTL = 15  # seconds — must renew before this expires
 INSTANCE_ID = f"ears-{uuid.uuid4().hex[:8]}"
 _general_channel_ids: set[int] = set()
-_thoughts_channel_ids: set[int] = set()
 _vitals_channel_ids: set[int] = set()
-_reminders_channel_ids: set[int] = set()
 _immune_channel_ids: set[int] = set()
 
 _bot = None
@@ -84,9 +78,7 @@ class MakiDiscordClient(discord.Client):
 
         for guild in self.guilds:
             _discover_channel(guild, GENERAL_CHANNEL_NAME, _general_channel_ids, "General")
-            _discover_channel(guild, THOUGHTS_CHANNEL_NAME, _thoughts_channel_ids, "Thoughts")
             _discover_channel(guild, VITALS_CHANNEL_NAME, _vitals_channel_ids, "Vitals")
-            _discover_channel(guild, REMINDERS_CHANNEL_NAME, _reminders_channel_ids, "Reminders")
             _discover_channel(guild, IMMUNE_CHANNEL_NAME, _immune_channel_ids, "Immune")
 
         if not _general_channel_ids:
@@ -144,8 +136,8 @@ class MakiDiscordClient(discord.Client):
         }
 
         try:
-            await _nc.publish(EARS_MESSAGE_IN, json.dumps(payload).encode())
-            log.info("Published to NATS", extra={"subject": EARS_MESSAGE_IN})
+            await _nc.publish(EARS_IN, json.dumps(payload).encode())
+            log.info("Published to NATS", extra={"subject": EARS_IN})
         except Exception:
             log.exception("Failed to publish message to NATS")
             await message.channel.send("Sorry, I couldn't process that right now.")
@@ -246,24 +238,46 @@ async def _handle_immune_command(message: discord.Message, content: str):
             pass
 
 
-async def _response_listener():
-    """Subscribe to NATS for outgoing responses and push chunks into queues."""
-    sub = await _nc.subscribe(EARS_MESSAGE_OUT)
-    log.info("Subscribed", extra={"subject": EARS_MESSAGE_OUT})
+async def _out_listener():
+    """Unified listener for all EARS_OUT messages.
+
+    Payload with ``message_id`` → push to pending queue (chat request/reply).
+    Payload with ``text`` → fire-and-forget post to #maki-general (loop output).
+    """
+    sub = await _nc.subscribe(EARS_OUT)
+    log.info("Subscribed", extra={"subject": EARS_OUT})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
-            message_id = data.get("message_id", "")
 
-            if _pending.push(message_id, data):
-                log.info(
-                    "Response chunk pushed",
-                    extra={"message_id": message_id, "done": data.get("done", False)},
-                )
-            else:
-                log.warning("Response for unknown message", extra={"message_id": message_id})
+            # Chat response (request/reply via pending queue)
+            message_id = data.get("message_id")
+            if message_id:
+                if _pending.push(message_id, data):
+                    log.info(
+                        "Response chunk pushed",
+                        extra={"message_id": message_id, "done": data.get("done", False)},
+                    )
+                else:
+                    log.warning("Response for unknown message", extra={"message_id": message_id})
+                continue
+
+            # Loop output (fire-and-forget → general channel)
+            text = data.get("text", "")
+            if not text:
+                continue
+
+            turn_id = data.get("turn_id", "unknown")
+            log.info("Loop output received", extra={"turn_id": turn_id, "text_len": len(text)})
+
+            for channel_id in _general_channel_ids:
+                channel = _bot.get_channel(channel_id)
+                if channel:
+                    await _send_response(channel, text)
+                    log.info("Loop output posted", extra={"channel_id": channel_id})
+
         except Exception:
-            log.exception("Error processing NATS response")
+            log.exception("Error processing EARS_OUT message")
 
 
 async def _immune_response_listener():
@@ -281,34 +295,6 @@ async def _immune_response_listener():
                 log.warning("Immune response for unknown message", extra={"message_id": message_id})
         except Exception:
             log.exception("Error processing immune response")
-
-
-async def _thought_listener():
-    """Subscribe to NATS for proactive thoughts and post to #maki-general."""
-    sub = await _nc.subscribe(EARS_THOUGHT_OUT, queue="maki-ears")
-    log.info("Subscribed", extra={"subject": EARS_THOUGHT_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            thought = data.get("thought", "")
-            turn_id = data.get("turn_id", "unknown")
-
-            if not thought:
-                continue
-
-            log.info("Thought received", extra={"turn_id": turn_id, "thought_len": len(thought)})
-
-            for channel_id in _thoughts_channel_ids:
-                channel = _bot.get_channel(channel_id)
-                if channel:
-                    await _send_response(channel, thought)
-                    log.info("Thought posted", extra={"channel": THOUGHTS_CHANNEL_NAME, "channel_id": channel_id})
-
-            if not _thoughts_channel_ids:
-                log.warning("No thoughts channel available, thought dropped", extra={"turn_id": turn_id})
-
-        except Exception:
-            log.exception("Error processing thought")
 
 
 async def _vitals_listener():
@@ -362,37 +348,6 @@ async def _alert_listener():
             await msg.ack()
         except Exception:
             log.exception("Error processing alert")
-
-
-async def _reminder_listener():
-    """Subscribe to NATS for care reminders and post to #maki-general."""
-    sub = await _nc.subscribe(EARS_REMINDER_OUT, queue="maki-ears")
-    log.info("Subscribed", extra={"subject": EARS_REMINDER_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            reminder = data.get("reminder", "")
-            turn_id = data.get("turn_id", "unknown")
-
-            if not reminder:
-                continue
-
-            log.info("Reminder received", extra={"turn_id": turn_id, "reminder_len": len(reminder)})
-
-            for channel_id in _reminders_channel_ids:
-                channel = _bot.get_channel(channel_id)
-                if channel:
-                    await _send_response(channel, reminder)
-                    log.info(
-                        "Reminder posted",
-                        extra={"channel": REMINDERS_CHANNEL_NAME, "channel_id": channel_id},
-                    )
-
-            if not _reminders_channel_ids:
-                log.warning("No reminders channel available, reminder dropped", extra={"turn_id": turn_id})
-
-        except Exception:
-            log.exception("Error processing reminder")
 
 
 async def _send_response(channel, text: str):
@@ -478,12 +433,10 @@ async def main():
     # NATS listeners run always — harmless when not leader
     # (response listeners silently drop unmatched messages,
     #  outbound listeners have no channels to post to without Discord)
-    asyncio.create_task(_response_listener())
+    asyncio.create_task(_out_listener())
     asyncio.create_task(_immune_response_listener())
-    asyncio.create_task(_thought_listener())
     asyncio.create_task(_vitals_listener())
     asyncio.create_task(_alert_listener())
-    asyncio.create_task(_reminder_listener())
 
     # Leader election loop — only the leader connects to Discord
     while True:
@@ -494,9 +447,7 @@ async def main():
             # bot.close(), making the old instance unusable.
             _bot = _create_bot()
             _general_channel_ids.clear()
-            _thoughts_channel_ids.clear()
             _vitals_channel_ids.clear()
-            _reminders_channel_ids.clear()
             _immune_channel_ids.clear()
 
             asyncio.create_task(_leader_renewal_loop())
