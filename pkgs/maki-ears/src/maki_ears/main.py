@@ -13,7 +13,6 @@ import uuid
 import discord
 from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
 from maki_common.subjects import (
-    EARS_IMMUNE_OUT,
     EARS_IN,
     EARS_OUT,
     EARS_VITALS_OUT,
@@ -239,19 +238,30 @@ async def _handle_immune_command(message: discord.Message, content: str):
 
 
 async def _out_listener():
-    """Unified listener for all EARS_OUT messages.
+    """Single pub/sub listener for all EARS_OUT messages.
 
-    Payload with ``message_id`` → push to pending queue (chat request/reply).
-    Payload with ``text`` → fire-and-forget post to #maki-general (loop output).
+    Routing by payload shape:
+    - ``source == "immune"`` + ``message_id`` → immune command response → _immune_pending
+    - ``message_id`` (no source)              → chat response chunk    → _pending
+    - ``text``                                → loop output            → post to #maki-general
     """
     sub = await _nc.subscribe(EARS_OUT)
     log.info("Subscribed", extra={"subject": EARS_OUT})
     async for msg in sub.messages:
         try:
             data = json.loads(msg.data.decode())
+            message_id = data.get("message_id")
+            source = data.get("source", "")
+
+            # Immune command response
+            if message_id and source == "immune":
+                if _immune_pending.push(message_id, data):
+                    log.info("Immune response pushed", extra={"message_id": message_id})
+                else:
+                    log.warning("Immune response for unknown message", extra={"message_id": message_id})
+                continue
 
             # Chat response (request/reply via pending queue)
-            message_id = data.get("message_id")
             if message_id:
                 if _pending.push(message_id, data):
                     log.info(
@@ -278,23 +288,6 @@ async def _out_listener():
 
         except Exception:
             log.exception("Error processing EARS_OUT message")
-
-
-async def _immune_response_listener():
-    """Subscribe to NATS for immune command responses."""
-    sub = await _nc.subscribe(EARS_IMMUNE_OUT)
-    log.info("Subscribed", extra={"subject": EARS_IMMUNE_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            message_id = data.get("message_id", "")
-
-            if _immune_pending.push(message_id, data):
-                log.info("Immune response pushed", extra={"message_id": message_id})
-            else:
-                log.warning("Immune response for unknown message", extra={"message_id": message_id})
-        except Exception:
-            log.exception("Error processing immune response")
 
 
 async def _vitals_listener():
@@ -434,7 +427,6 @@ async def main():
     # (response listeners silently drop unmatched messages,
     #  outbound listeners have no channels to post to without Discord)
     asyncio.create_task(_out_listener())
-    asyncio.create_task(_immune_response_listener())
     asyncio.create_task(_vitals_listener())
     asyncio.create_task(_alert_listener())
 
