@@ -6,4 +6,6 @@ RUN apt-get update && \
     /opt/patroni/bin/pip install --no-cache-dir 'patroni[raft]' psycopg2-binary && \
     rm -rf /var/lib/apt/lists/*
 
+COPY migrations/vault/ /migrations/
+
 ENV PATH="/opt/patroni/bin:$PATH"

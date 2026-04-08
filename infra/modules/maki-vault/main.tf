@@ -76,6 +76,7 @@ resource "kubernetes_config_map" "patroni" {
       psql -U maki -d postgres -c "CREATE DATABASE maki OWNER maki;"
       psql -U maki -d maki -c "CREATE EXTENSION IF NOT EXISTS vector;"
       psql -U maki -d maki -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '$PATRONI_REPLICATION_PASSWORD';"
+      sh /migrations/run.sh maki
     EOT
   }
 }
