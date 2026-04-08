@@ -30,8 +30,8 @@ log = logging.getLogger(__name__)
 IDLE_CHECK_INTERVAL = int(os.environ.get("IDLE_CHECK_INTERVAL", "60"))
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
-# Idle fires every 3 hours, every day
-IDLE_CRON = "0 */3 * * *"
+# Idle fires every 15 minutes, every day
+IDLE_CRON = "*/15 * * * *"
 
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
@@ -284,7 +284,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 IDLE_LOOP_SPEC = LoopSpec(
     name="idle",
     check_interval_getter=lambda: IDLE_CHECK_INTERVAL,
-    execution_interval_getter=lambda config: 10800,  # 3h TTL — matches cron, prevents double-fire
+    execution_interval_getter=lambda config: 900,  # 15min TTL — matches cron, prevents double-fire
     should_run=_idle_should_run,
     body=_idle_body,
 )
