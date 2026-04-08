@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
+SITE_NAME = os.environ.get("SITE_NAME", "unknown")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
@@ -98,7 +99,7 @@ async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
             "session_id": SESSION_ID,
             **usage.to_log_dict(),
         }
-        await nc.publish(CORTEX_TOKEN_USAGE, json.dumps(payload).encode())
+        await nc.publish(f"{CORTEX_TOKEN_USAGE}.{SITE_NAME}", json.dumps(payload).encode())
         log.info(
             "Token usage published",
             extra={

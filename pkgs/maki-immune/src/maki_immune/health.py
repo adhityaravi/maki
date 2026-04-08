@@ -346,8 +346,9 @@ async def cortex_heartbeat_listener():
 
 async def token_usage_listener():
     """Subscribe to cortex token usage and accumulate daily stats."""
-    sub = await _nc.subscribe(CORTEX_TOKEN_USAGE)
-    log.info("Subscribed", extra={"subject": CORTEX_TOKEN_USAGE})
+    subject = f"{CORTEX_TOKEN_USAGE}.{_site_name}"
+    sub = await _nc.subscribe(subject)
+    log.info("Subscribed", extra={"subject": subject})
     async for msg in sub.messages:
         try:
             payload = json.loads(msg.data.decode())
