@@ -135,7 +135,7 @@ graph LR
     synapse -.->|"used by recall"| cortex
 ```
 
-**stem** — The coordinator. Assembles context for each turn: retrieves relevant memories, gathers system state, builds conversation history, publishes the full package to cortex. Runs the idle/care/work loops. Relays Discord messages. Feeds completed turns back into memory.
+**stem** — The coordinator. Assembles context for each turn: retrieves relevant memories, gathers system state, builds conversation history, publishes the full package to cortex. Runs background loops on schedule. Relays Discord messages. Feeds completed turns back into memory.
 
 **cortex** — The thinker. Claude Code backed reasoning engine. Subscribes to turn requests on NATS, invokes Claude with the full assembled context (identity + memories + graph relationships + conversation history + system state), streams responses back chunk by chunk. Processes one turn at a time. Has a heartbeat so stem can detect restarts mid-turn and cancel pending work immediately instead of timing out.
 
@@ -195,14 +195,6 @@ Background loops run on cron schedule inside stem. Each loop uses the same corte
 3. The loop-specific prompt is assembled (with full context, memories, and system state, same as any turn) and dispatched to cortex.
 4. The response routes to Discord. The interaction feeds back into memory.
 
-**The three loops:**
-
-**care** — Runs on a daily schedule. Surfaces things said and not followed up on, patterns worth noting, approaching deadlines. Has access to memory retrieval and conversation history. If there's genuinely nothing worth saying, it stays silent. No write tools — observe only.
-
-**idle** — Runs multiple times a day. Reads its own source code, files GitHub issues for things it notices, cleans up stale ones, stores learnings, improves its own prompts and identity. Observe-only — no commits, no deploys. Think of it as a low-stakes self-reflection pass that happens to produce actionable output.
-
-**work** — Runs once daily. Picks up GitHub issues (from a private loops repo as well as the main repo), implements them, runs quality checks, commits, pushes, opens a PR, and assigns it for review. If it hits something that needs a judgment call it can't make, it adds a `human` label and stops cleanly. The output is always a PR, never a direct push to main.
-
 Each loop is defined as a `LoopSpec` — a plain data structure with a cron expression, a prompt builder, a tool set, and a lock TTL. Adding a new loop is adding a new spec. The framework handles the rest.
 
 ---
@@ -227,7 +219,7 @@ Each deploy goes through one canary immune instance. It holds the global lock, a
 
 ## self-evolution
 
-The work loop runs against this repo. It reads its own code, finds its own bugs, files issues for what it notices, implements fixes, runs quality checks, pushes, and opens a PR — without being asked. Immune monitors the rollout and rolls back if something breaks.
+Background loops run against this repo. They read their own code, find their own bugs, file issues for what they notice, implement fixes, run quality checks, push, and open a PR — without being asked. Immune monitors the rollout and rolls back if something breaks.
 
 Most of the code in this codebase was ideated and written this way.
 
