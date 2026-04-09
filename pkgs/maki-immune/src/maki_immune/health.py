@@ -280,9 +280,12 @@ async def _check_pod_metrics():
 
 
 def _hive_cortex_status() -> tuple[int, int]:
-    """Count how many hive peers have healthy cortex."""
-    total = 0
-    healthy = 0
+    """Count how many hive sites (local + remote peers) have healthy cortex."""
+    # Include local site
+    total = 1
+    local_last = _cortex_state["last_heartbeat"]
+    healthy = 1 if local_last and (time.time() - local_last) < 60 else 0
+    # Include remote peers from hive gossip
     for _site, state in _hive_state.items():
         total += 1
         cortex_info = state.get("cortex", {})
