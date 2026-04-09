@@ -16,6 +16,9 @@ RUN find /build/pkgs -name pyproject.toml -exec sed -i '/\[tool\.uv\.sources\]/,
     && uv pip install --system "/build/pkgs/maki-common[codegraph,claude,github]" /build/pkgs/maki-cortex \
     && rm -rf /build
 
+RUN git config --system user.name "makiself[bot]" \
+    && git config --system user.email "makiself[bot]@users.noreply.github.com"
+
 RUN useradd -m -s /bin/bash cortex
 USER cortex
 
