@@ -452,7 +452,12 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         history.append(now)
         _restart_history[component] = history
 
-        await asyncio.to_thread(_k8s_v1.delete_namespaced_pod, name=pod_name, namespace=_namespace, grace_period_seconds=10)
+        await asyncio.to_thread(
+            _k8s_v1.delete_namespaced_pod,
+            name=pod_name,
+            namespace=_namespace,
+            grace_period_seconds=10,
+        )
 
         action = {
             "type": "reflex_restart",
