@@ -119,10 +119,20 @@ class MakiDiscordClient(discord.Client):
         route = Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild_id)
 
         data: dict = {}
+        _channel_fallback_done = False
         for attempt in range(5):
             try:
                 data = await self.http.request(route, params=params)
             except discord.HTTPException as exc:
+                # 403 with a channel scope → Discord doesn't allow per-channel search
+                # scoping via this bot token. Fall back to guild-wide once, silently.
+                if exc.status == 403 and "channel_id" in params and not _channel_fallback_done:
+                    log.warning(
+                        "Channel-scoped search returned 403, falling back to guild-wide",
+                        extra={"channel_id": params.pop("channel_id")},
+                    )
+                    _channel_fallback_done = True
+                    continue
                 return {"ok": False, "error": f"Discord API error {exc.status}: {exc.text}"}
 
             if "messages" in data:
