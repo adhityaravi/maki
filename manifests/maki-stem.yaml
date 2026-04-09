@@ -72,6 +72,16 @@ spec:
               value: "adhityaravi"
             - name: REPO_NAME
               value: "maki"
+            - name: TWELVE_DATA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: maki-trading-keys
+                  key: twelve-data-api-key
+            - name: FINNHUB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: maki-trading-keys
+                  key: finnhub-api-key
           readinessProbe:
             httpGet:
               path: /health
