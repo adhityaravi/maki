@@ -184,7 +184,7 @@ async def _check_k8s_pods():
     if not _k8s_v1:
         return
     try:
-        pods = _k8s_v1.list_namespaced_pod(namespace=_namespace)
+        pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=_namespace)
 
         app_pods: dict[str, list[dict]] = {}
         for pod in pods.items:
@@ -452,7 +452,7 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         history.append(now)
         _restart_history[component] = history
 
-        _k8s_v1.delete_namespaced_pod(name=pod_name, namespace=_namespace, grace_period_seconds=10)
+        await asyncio.to_thread(_k8s_v1.delete_namespaced_pod, name=pod_name, namespace=_namespace, grace_period_seconds=10)
 
         action = {
             "type": "reflex_restart",
