@@ -16,6 +16,7 @@ from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
     EARS_OUT,
+    EARS_SEARCH,
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
@@ -85,6 +86,76 @@ class MakiDiscordClient(discord.Client):
             log.warning("No general channel found", extra={"channel_name": GENERAL_CHANNEL_NAME})
         if not _immune_channel_ids:
             log.warning("No immune channel found", extra={"channel_name": IMMUNE_CHANNEL_NAME})
+
+    async def search_channel(
+        self,
+        query: str,
+        channel_id: int | None = None,
+        limit: int = 25,
+    ) -> dict:
+        """Search guild message history via Discord's indexed search API.
+
+        Discord returns 202 with ``retry_after`` when the index isn't ready yet.
+        We detect this by the absence of the ``messages`` key and retry up to 5
+        times, honouring the back-off value Discord provides.
+
+        Returns a dict with shape::
+
+            {"ok": True, "messages": [...], "total_results": int}
+            {"ok": False, "error": str}
+        """
+        if not self.guilds:
+            return {"ok": False, "error": "Bot not in any guild"}
+
+        guild_id = self.guilds[0].id
+        limit = max(1, min(limit, 25))
+
+        params: dict = {"content": query, "limit": limit, "sort_by": "relevance", "sort_order": "desc"}
+        if channel_id:
+            params["channel_id"] = str(channel_id)
+
+        from discord.http import Route
+
+        route = Route("GET", "/guilds/{guild_id}/messages/search", guild_id=guild_id)
+
+        data: dict = {}
+        for attempt in range(5):
+            try:
+                data = await self.http.request(route, params=params)
+            except discord.HTTPException as exc:
+                return {"ok": False, "error": f"Discord API error {exc.status}: {exc.text}"}
+
+            if "messages" in data:
+                break  # 200 — results ready
+
+            # 202 — index not ready, Discord says how long to wait
+            retry_after = float(data.get("retry_after", 5.0))
+            log.info(
+                "Discord search index not ready, retrying",
+                extra={"attempt": attempt + 1, "retry_after": retry_after},
+            )
+            await asyncio.sleep(retry_after)
+        else:
+            return {"ok": False, "error": "Discord search index not ready after retries"}
+
+        # Each element of data["messages"] is a list: first item is the matched
+        # message, remaining items are context. We only need the matched message.
+        hits = []
+        for group in data.get("messages", []):
+            if not group:
+                continue
+            m = group[0]
+            hits.append(
+                {
+                    "id": m.get("id"),
+                    "content": m.get("content", ""),
+                    "author": (m.get("author") or {}).get("username", "unknown"),
+                    "timestamp": m.get("timestamp"),
+                    "channel_id": m.get("channel_id"),
+                }
+            )
+
+        return {"ok": True, "messages": hits, "total_results": data.get("total_results", len(hits))}
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user:
@@ -236,6 +307,57 @@ async def _handle_immune_command(message: discord.Message, content: str):
             await message.remove_reaction(thinking_emoji, _bot.user)
         except Exception:
             pass
+
+
+async def _handle_search_request(msg) -> None:
+    """Process one Discord history search request and reply via NATS."""
+    try:
+        data = json.loads(msg.data.decode())
+        query = data.get("query", "").strip()
+        channel_id = data.get("channel_id")
+        limit = int(data.get("limit", 25))
+
+        if not query:
+            result: dict = {"ok": False, "error": "query is required"}
+        elif _bot is None or _bot.is_closed():
+            result = {"ok": False, "error": "Discord not connected on this instance"}
+        else:
+            result = await _bot.search_channel(query=query, channel_id=channel_id, limit=limit)
+
+        if msg.reply:
+            await _nc.publish(msg.reply, json.dumps(result).encode())
+
+        log.info(
+            "Search request handled",
+            extra={"query": query[:60], "ok": result.get("ok"), "hits": len(result.get("messages", []))},
+        )
+    except Exception:
+        log.exception("Error handling search request")
+        if msg.reply:
+            await _nc.publish(msg.reply, json.dumps({"ok": False, "error": "Internal search error"}).encode())
+
+
+async def _search_listener() -> None:
+    """Subscribe to maki.ears.search — active only while this instance is leader.
+
+    Started as a task when leadership is acquired and cancelled (with automatic
+    unsubscription) when the Discord bot disconnects or leadership is lost.
+    Each incoming message is handled in its own task so a slow Discord API call
+    never blocks the subscription loop.
+    """
+    sub = await _nc.subscribe(EARS_SEARCH)
+    log.info("Subscribed to search requests", extra={"subject": EARS_SEARCH})
+    try:
+        async for msg in sub.messages:
+            asyncio.create_task(_handle_search_request(msg))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            await sub.unsubscribe()
+        except Exception:
+            pass
+        log.info("Search listener stopped")
 
 
 async def _out_listener():
@@ -451,12 +573,14 @@ async def main():
             _immune_channel_ids.clear()
 
             asyncio.create_task(_leader_renewal_loop())
+            search_task = asyncio.create_task(_search_listener())
 
             try:
                 await _bot.start(DISCORD_TOKEN)
             except Exception:
                 log.exception("Discord bot disconnected")
             finally:
+                search_task.cancel()
                 log.info("Discord bot stopped, returning to standby")
         else:
             log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
