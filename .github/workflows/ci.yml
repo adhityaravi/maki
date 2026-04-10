@@ -82,6 +82,7 @@ jobs:
               - 'images/maki-vault/**'
             finbert:
               - 'images/maki-finbert/**'
+              - 'pkgs/maki-finbert/**'
             any:
               - '**/*.py'
               - 'pyproject.toml'

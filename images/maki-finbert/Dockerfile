@@ -22,23 +22,20 @@ RUN python3 /tmp/quantize.py
 FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
 
-RUN uv pip install --system \
-        "fastapi>=0.115" \
-        "uvicorn[standard]>=0.32" \
-        "transformers>=4.47" \
-        "optimum[onnxruntime]>=1.24"
+COPY pkgs/maki-finbert /build/pkgs/maki-finbert
+RUN uv pip install --system /build/pkgs/maki-finbert \
+    && rm -rf /build
 
 WORKDIR /app
 
 # Bake the INT8 model in — no network calls at startup
 COPY --from=exporter /app/model /app/model
 
-COPY images/maki-finbert/app.py .
-
 RUN useradd -m -s /bin/bash finbert
 USER finbert
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["maki-finbert"]

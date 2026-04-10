@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from optimum.onnxruntime import ORTModelForSequenceClassification
 from pydantic import BaseModel
@@ -81,3 +82,7 @@ def score(request: ScoreRequest) -> ScoreResponse:
             )
         )
     return ScoreResponse(results=results)
+
+
+def cli() -> None:
+    uvicorn.run("maki_finbert.main:app", host="0.0.0.0", port=8080)
