@@ -41,3 +41,5 @@ CONVERSATION_STREAM = "maki.conversation"
 
 # Trading
 TRADING_MANUAL_TRADE = "maki.trading.manual_trade"
+TRADING_CLOSE = "maki.trading.close"
+TRADING_OUTCOME = "maki.trading.outcome"

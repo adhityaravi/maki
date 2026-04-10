@@ -21,6 +21,7 @@ from maki_common.subjects import (
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
+    TRADING_CLOSE,
     TRADING_MANUAL_TRADE,
 )
 
@@ -364,15 +365,60 @@ async def _handle_immune_command(message: discord.Message, content: str):
             pass
 
 
-async def _handle_trade_command(message: discord.Message, content: str) -> None:
-    """Handle a ``!trade`` command — validate, dedup, and forward to the trading loop.
+async def _handle_trade_close(message: discord.Message, content: str) -> None:
+    """Handle ``!trade CLOSE SYMBOL @ PRICE`` — forward close request to the trading loop.
 
     Format::
 
+        !trade CLOSE {SYMBOL} @ {PRICE}
+
+    Ears validates the shape and publishes to ``maki.trading.close``.  The
+    orchestrator loop handles the actual P&L computation and Discord reply.
+    """
+    _USAGE = "Usage: `!trade CLOSE {SYMBOL} @ {PRICE}`\nExample: `!trade CLOSE BTC/EUR @ 86200`"
+
+    tokens = content.strip().split()
+    # minimum: !trade CLOSE SYMBOL @ PRICE = 5 tokens
+    if len(tokens) < 5 or tokens[3] != "@":
+        await message.channel.send(f"❌ Invalid close format.\n{_USAGE}")
+        return
+
+    symbol = tokens[2].upper()
+    try:
+        exit_price = float(tokens[4])
+        if exit_price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.channel.send(f"❌ Price must be a positive number, got `{tokens[4]}`.\n{_USAGE}")
+        return
+
+    payload = {
+        "symbol": symbol,
+        "exit_price": exit_price,
+        "message_id": str(message.id),
+        "username": message.author.name,
+    }
+    try:
+        await _nc.publish(TRADING_CLOSE, json.dumps(payload).encode())
+        log.info("Trade close published", extra={"symbol": symbol, "exit_price": exit_price})
+    except Exception:
+        log.exception("Failed to publish trade close command")
+        await message.channel.send("❌ Failed to record close — NATS unavailable.")
+        return
+
+    await message.channel.send(f"⏳ Closing **{symbol}** @ {exit_price} — processing...")
+
+
+async def _handle_trade_command(message: discord.Message, content: str) -> None:
+    """Handle a ``!trade`` command — validate, dedup, and forward to the trading loop.
+
+    Formats::
+
         !trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE...]
+        !trade CLOSE {SYMBOL} @ {PRICE}
 
     Ears does minimal inline validation to give immediate Discord feedback.
-    Full canonical parsing lives in maki-loops ``manual.parse_trade_command``.
+    Full canonical parsing lives in maki-loops ``manual`` and ``outcome`` modules.
     """
     msg_key = f"msg.{message.id}"
     try:
@@ -381,17 +427,29 @@ async def _handle_trade_command(message: discord.Message, content: str) -> None:
         log.info("Dedup: trade command already claimed", extra={"message_id": str(message.id)})
         return
 
-    _USAGE = "Usage: `!trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE]`\nExample: `!trade BUY BTC/EUR 50 @42000`"
+    _USAGE = (
+        "Usage: `!trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE]`\n       `!trade CLOSE {SYMBOL} @ {PRICE}`"
+    )
 
     tokens = content.strip().split()
-    # minimum: !trade, direction, symbol, amount = 4 tokens
-    if len(tokens) < 4:
+    if len(tokens) < 3:
         await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
         return
 
     direction = tokens[1].upper()
+
+    # Route CLOSE to its own handler
+    if direction == "CLOSE":
+        await _handle_trade_close(message, content)
+        return
+
+    # BUY / SELL path requires at least 4 tokens (!trade direction symbol amount)
+    if len(tokens) < 4:
+        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
+        return
+
     if direction not in ("BUY", "SELL"):
-        await message.channel.send(f"❌ Direction must be `BUY` or `SELL`, got `{tokens[1]}`.\n{_USAGE}")
+        await message.channel.send(f"❌ Direction must be `BUY`, `SELL`, or `CLOSE`, got `{tokens[1]}`.\n{_USAGE}")
         return
 
     try:
