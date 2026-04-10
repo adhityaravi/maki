@@ -48,7 +48,7 @@ class ScoreRequest(BaseModel):
 
 
 class SentimentResult(BaseModel):
-    label: str   # positive | negative | neutral
+    label: str  # positive | negative | neutral
     score: float  # confidence for the predicted label (0–1)
 
 

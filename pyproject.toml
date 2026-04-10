@@ -25,6 +25,7 @@ root = [
     "pkgs/maki-ears/src",
     "pkgs/maki-recall/src",
     "pkgs/maki-synapse/src",
+    "pkgs/maki-finbert/src",
 ]
 python-version = "3.12"
 
@@ -69,6 +70,10 @@ allowed-unresolved-imports = [
     "discord.**",
     "croniter",
     "croniter.**",
+    "optimum",
+    "optimum.**",
+    "transformers",
+    "transformers.**",
 ]
 
 [tool.pytest.ini_options]
