@@ -13,6 +13,7 @@ EARS_OUT = "maki.ears.out"
 EARS_VITALS_OUT = "maki.ears.vitals.out"
 EARS_IMMUNE_OUT = "maki.ears.immune.out"
 EARS_SEARCH = "maki.ears.search"
+EARS_INTERACTION = "maki.ears.interaction"  # base — append .{proposal_id} at runtime
 
 # Immune (ops intelligence)
 IMMUNE_HEALTH = "maki.immune.health"

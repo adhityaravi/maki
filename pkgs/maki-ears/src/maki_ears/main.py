@@ -15,6 +15,7 @@ from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
+    EARS_INTERACTION,
     EARS_OUT,
     EARS_SEARCH,
     EARS_VITALS_OUT,
@@ -269,6 +270,44 @@ class MakiDiscordClient(discord.Client):
                 pass
 
 
+class _TradeButton(discord.ui.Button):
+    """A single Accept or Skip button for a trade proposal."""
+
+    def __init__(self, label: str, custom_id: str, style: discord.ButtonStyle) -> None:
+        super().__init__(label=label, custom_id=custom_id, style=style)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        # custom_id format: "trade:{proposal_id}:{action}"
+        parts = self.custom_id.split(":")
+        proposal_id, action = parts[1], parts[2]
+
+        await interaction.response.defer()
+
+        outcome_label = "✅ Accepted" if action == "accept" else "⏭️ Skipped"
+        try:
+            await interaction.message.edit(
+                content=interaction.message.content + f"\n\n_{outcome_label} by {interaction.user.name}_",
+                view=None,
+            )
+        except Exception:
+            log.warning("Failed to edit proposal message after interaction", exc_info=True)
+
+        if _nc:
+            subject = f"{EARS_INTERACTION}.{proposal_id}"
+            payload = {"proposal_id": proposal_id, "action": action, "user": str(interaction.user.name)}
+            await _nc.publish(subject, json.dumps(payload).encode())
+            log.info("Trade interaction published", extra={"proposal_id": proposal_id, "action": action})
+
+
+class _TradeProposalView(discord.ui.View):
+    """Discord button view attached to an outgoing trade proposal message."""
+
+    def __init__(self, proposal_id: str) -> None:
+        super().__init__(timeout=300)  # buttons expire after 5 minutes
+        self.add_item(_TradeButton("✅ Accept", f"trade:{proposal_id}:accept", discord.ButtonStyle.success))
+        self.add_item(_TradeButton("⏭️ Skip", f"trade:{proposal_id}:skip", discord.ButtonStyle.secondary))
+
+
 async def _handle_immune_command(message: discord.Message, content: str):
     """Handle messages in #maki-immune — forward to immune as direct commands."""
     # Dedup: if another ears instance already published this command, skip
@@ -394,8 +433,22 @@ async def _out_listener():
                     log.warning("Response for unknown message", extra={"message_id": message_id})
                 continue
 
-            # Loop output (fire-and-forget → general channel)
+            # Trade proposal with Accept / Skip buttons
+            proposal_id = data.get("proposal_id")
             text = data.get("text", "")
+            if proposal_id and data.get("components") and text:
+                if _bot and not _bot.is_closed():
+                    view = _TradeProposalView(proposal_id)
+                    for channel_id in _general_channel_ids:
+                        channel = _bot.get_channel(channel_id)
+                        if channel:
+                            await channel.send(text, view=view)
+                            log.info("Trade proposal posted", extra={"proposal_id": proposal_id, "channel_id": channel_id})
+                else:
+                    log.warning("Trade proposal dropped — Discord not connected", extra={"proposal_id": proposal_id})
+                continue
+
+            # Loop output (fire-and-forget → general channel)
             if not text:
                 continue
 
