@@ -2,15 +2,15 @@
 FROM python:3.12-slim AS exporter
 
 # Install torch (CPU-only) first so pip resolves it from the PyTorch index,
-# then install optimum exporters + transformers on top.
+# then install optimum with both exporters and onnxruntime extras + transformers.
 RUN pip install --no-cache-dir \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         "torch>=2.5" && \
     pip install --no-cache-dir \
-        "optimum[exporters]>=1.24" \
+        "optimum[exporters,onnxruntime]>=1.24" \
         "transformers>=4.47"
 
-# Export to FP32 ONNX via Python API (avoids optimum-cli argument parsing issues)
+# Export to ONNX via the stable high-level ORT API
 COPY images/maki-finbert/export.py /tmp/export.py
 RUN python3 /tmp/export.py
 

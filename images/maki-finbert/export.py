@@ -1,12 +1,19 @@
-"""Build-time script: export ProsusAI/finbert to FP32 ONNX.
+"""Build-time script: export ProsusAI/finbert to ONNX.
 
-Uses the programmatic API instead of optimum-cli to avoid CLI
-argument parsing issues across optimum versions.
+Uses the stable high-level ORT API (same class used at runtime)
+instead of the internal optimum-cli / main_export path.
 """
-from optimum.exporters.onnx import main_export
 
-main_export(
-    model_name_or_path="ProsusAI/finbert",
-    output="/tmp/finbert-fp32",
-    task="text-classification",
+from optimum.onnxruntime import ORTModelForSequenceClassification
+from transformers import AutoTokenizer
+
+print("Exporting ProsusAI/finbert to ONNX...")
+model = ORTModelForSequenceClassification.from_pretrained(
+    "ProsusAI/finbert",
+    export=True,
 )
+model.save_pretrained("/tmp/finbert-fp32")
+
+tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+tokenizer.save_pretrained("/tmp/finbert-fp32")
+print("Done → /tmp/finbert-fp32")
