@@ -128,6 +128,8 @@ _sub_response = None  # NATS subscription: CORTEX_TURN_RESPONSE
 _sub_cortex_health = None  # NATS subscription: CORTEX_HEALTH
 _sub_memory_store = None  # NATS subscription: MEMORY_STORE
 _sub_ears = None  # NATS subscription: EARS_IN
+_loop_specs: list = []  # discovered LoopSpecs, populated in lifespan
+_stem_ctx = None  # StemContext, populated in lifespan
 
 
 def _init_github_client():
@@ -697,7 +699,10 @@ async def lifespan(app: FastAPI):
     )
 
     # Discover and start all loops (builtin + external via entry points)
+    global _loop_specs, _stem_ctx
     loops = _discover_loops()
+    _loop_specs = loops
+    _stem_ctx = ctx
     for spec in loops:
         asyncio.create_task(_run_loop(spec, ctx))
 
@@ -875,12 +880,37 @@ async def _memory_store_listener():
             log.exception("Error in memory store listener")
 
 
+async def _trigger_loop(loop_name: str, forward_to: dict) -> None:
+    """Manually trigger a named loop, bypassing cron/guards."""
+    spec = next((s for s in _loop_specs if s.name == loop_name), None)
+    if spec is None:
+        names = ", ".join(s.name for s in _loop_specs)
+        reply = {"response": f"Unknown loop '{loop_name}'. Available: {names}", "done": True, **forward_to}
+        await _nc.publish(EARS_OUT, json.dumps(reply).encode())
+        return
+    reply = {"response": f"Triggering loop: {loop_name}", "done": True, **forward_to}
+    await _nc.publish(EARS_OUT, json.dumps(reply).encode())
+    try:
+        config = await load_kv_config(_stem_ctx.config_kv, _stem_ctx.default_config)
+        await spec.body(spec, config, _stem_ctx)
+    except Exception:
+        log.exception("Manual loop trigger failed", extra={"loop": loop_name})
+        err = {"response": f"Loop '{loop_name}' failed — check logs", "done": True, **forward_to}
+        await _nc.publish(EARS_OUT, json.dumps(err).encode())
+
+
 async def _handle_discord_message(data: dict):
     """Handle a single Discord message (runs as independent task)."""
     channel_id = data.get("channel_id", "")
     message_id = data.get("message_id", "")
     content = data.get("content", "")
     forward_to = {"message_id": message_id, "channel_id": channel_id}
+
+    # !loop <name> — manually trigger a named loop
+    if content.strip().startswith("!loop "):
+        loop_name = content.strip().removeprefix("!loop ").strip()
+        await _trigger_loop(loop_name, forward_to)
+        return
 
     async with _turn_semaphore:
         try:

@@ -67,7 +67,8 @@ resource "kubernetes_deployment" "stem" {
             <<-EOT
               set -e
               apt-get update && apt-get install -y git
-              pip install --target=/maki-loops "git+https://$GITHUB_PAT@github.com/adhityaravi/maki-loops.git"
+              pip install --no-deps --target=/maki-loops "git+https://$GITHUB_PAT@github.com/adhityaravi/maki-loops.git"
+              pip install --target=/maki-loops pandas
               echo "maki-loops installed successfully"
             EOT
           ]
@@ -122,6 +123,24 @@ resource "kubernetes_deployment" "stem" {
           env {
             name  = "TURN_TIMEOUT"
             value = "1800"
+          }
+          env {
+            name = "TWELVE_DATA_API_KEY"
+            value_from {
+              secret_key_ref {
+                name = "maki-trading-keys"
+                key  = "twelve-data-api-key"
+              }
+            }
+          }
+          env {
+            name = "FINNHUB_API_TOKEN"
+            value_from {
+              secret_key_ref {
+                name = "maki-trading-keys"
+                key  = "finnhub-api-key"
+              }
+            }
           }
           env {
             name = "GITHUB_APP_ID"
