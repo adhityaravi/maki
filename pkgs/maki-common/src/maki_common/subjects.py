@@ -38,3 +38,6 @@ MEMORY_STORE = "maki.memory.store"
 
 # Conversation stream
 CONVERSATION_STREAM = "maki.conversation"
+
+# Trading
+TRADING_MANUAL_TRADE = "maki.trading.manual_trade"

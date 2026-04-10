@@ -21,6 +21,7 @@ from maki_common.subjects import (
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
+    TRADING_MANUAL_TRADE,
 )
 
 configure_logging()
@@ -202,6 +203,11 @@ class MakiDiscordClient(discord.Client):
             await _handle_immune_command(message, content)
             return
 
+        # !trade command — manual trade log, bypass cortex
+        if content.lower().startswith("!trade"):
+            await _handle_trade_command(message, content)
+            return
+
         # Dedup: if another ears instance already published this message, skip
         msg_key = f"msg.{message.id}"
         try:
@@ -356,6 +362,66 @@ async def _handle_immune_command(message: discord.Message, content: str):
             await message.remove_reaction(thinking_emoji, _bot.user)
         except Exception:
             pass
+
+
+async def _handle_trade_command(message: discord.Message, content: str) -> None:
+    """Handle a ``!trade`` command — validate, dedup, and forward to the trading loop.
+
+    Format::
+
+        !trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE...]
+
+    Ears does minimal inline validation to give immediate Discord feedback.
+    Full canonical parsing lives in maki-loops ``manual.parse_trade_command``.
+    """
+    msg_key = f"msg.{message.id}"
+    try:
+        await _dedup_kv.create(msg_key, b"1")
+    except Exception:
+        log.info("Dedup: trade command already claimed", extra={"message_id": str(message.id)})
+        return
+
+    _USAGE = "Usage: `!trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE]`\nExample: `!trade BUY BTC/EUR 50 @42000`"
+
+    tokens = content.strip().split()
+    # minimum: !trade, direction, symbol, amount = 4 tokens
+    if len(tokens) < 4:
+        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
+        return
+
+    direction = tokens[1].upper()
+    if direction not in ("BUY", "SELL"):
+        await message.channel.send(f"❌ Direction must be `BUY` or `SELL`, got `{tokens[1]}`.\n{_USAGE}")
+        return
+
+    try:
+        amount_eur = float(tokens[3])
+        if amount_eur <= 0:
+            raise ValueError
+    except ValueError:
+        await message.channel.send(f"❌ Amount must be a positive number, got `{tokens[3]}`.\n{_USAGE}")
+        return
+
+    symbol = tokens[2].upper()
+    payload = {
+        "command": content,
+        "username": message.author.name,
+        "message_id": str(message.id),
+    }
+
+    try:
+        await _nc.publish(TRADING_MANUAL_TRADE, json.dumps(payload).encode())
+        log.info(
+            "Trade command published",
+            extra={"symbol": symbol, "direction": direction, "amount_eur": amount_eur},
+        )
+    except Exception:
+        log.exception("Failed to publish trade command")
+        await message.channel.send("❌ Failed to record trade — NATS unavailable.")
+        return
+
+    direction_emoji = "🟢" if direction == "BUY" else "🔴"
+    await message.channel.send(f"{direction_emoji} **{direction}** {symbol} €{amount_eur:.2f} — logged")
 
 
 async def _handle_search_request(msg) -> None:
