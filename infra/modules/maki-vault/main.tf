@@ -81,6 +81,20 @@ resource "kubernetes_config_map" "patroni" {
   }
 }
 
+# --- Migrations ConfigMap ---
+
+resource "kubernetes_config_map" "migrations" {
+  metadata {
+    name      = "maki-vault-migrations"
+    namespace = var.namespace
+  }
+  data = {
+    "run.sh"                 = file("${path.module}/run.sh")
+    "001_error_patterns.sql" = file("${path.module}/001_error_patterns.sql")
+    "002_trade_tables.sql"   = file("${path.module}/002_trade_tables.sql")
+  }
+}
+
 # --- Headless service ---
 
 resource "kubernetes_service" "vault" {
@@ -210,6 +224,10 @@ resource "kubernetes_stateful_set" "vault" {
             name       = "raft-data"
             mount_path = "/var/lib/raft"
           }
+          volume_mount {
+            name       = "migrations"
+            mount_path = "/migrations"
+          }
 
           readiness_probe {
             http_get {
@@ -236,6 +254,13 @@ resource "kubernetes_stateful_set" "vault" {
           name = "patroni-config"
           config_map {
             name         = kubernetes_config_map.patroni.metadata[0].name
+            default_mode = "0755"
+          }
+        }
+        volume {
+          name = "migrations"
+          config_map {
+            name         = kubernetes_config_map.migrations.metadata[0].name
             default_mode = "0755"
           }
         }
