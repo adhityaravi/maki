@@ -10,11 +10,9 @@ RUN pip install --no-cache-dir \
         "optimum[exporters]>=1.24" \
         "transformers>=4.47"
 
-# Export to FP32 ONNX
-RUN optimum-cli export onnx \
-        --model ProsusAI/finbert \
-        --task text-classification \
-        /tmp/finbert-fp32
+# Export to FP32 ONNX via Python API (avoids optimum-cli argument parsing issues)
+COPY images/maki-finbert/export.py /tmp/export.py
+RUN python3 /tmp/export.py
 
 # Quantize to INT8 (dynamic, AVX2-optimised for x86_64)
 COPY images/maki-finbert/quantize.py /tmp/quantize.py
