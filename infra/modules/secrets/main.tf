@@ -78,6 +78,17 @@ resource "kubernetes_secret" "github_app" {
   }
 }
 
+resource "kubernetes_secret" "trading_keys" {
+  metadata {
+    name      = "maki-trading-keys"
+    namespace = var.namespace
+  }
+  data = {
+    twelve-data-api-key = data.sops_file.secrets.data["twelve_data_api_key"]
+    finnhub-api-key     = data.sops_file.secrets.data["finnhub_api_key"]
+  }
+}
+
 resource "kubernetes_secret" "github_pat" {
   metadata {
     name      = "maki-github-pat"
