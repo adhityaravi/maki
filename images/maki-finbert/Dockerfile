@@ -17,7 +17,7 @@ RUN optimum-cli export onnx \
         /tmp/finbert-fp32
 
 # Quantize to INT8 (dynamic, AVX2-optimised for x86_64)
-COPY quantize.py /tmp/quantize.py
+COPY images/maki-finbert/quantize.py /tmp/quantize.py
 RUN python3 /tmp/quantize.py
 
 # ── Stage 2: Lean runtime — no torch ──────────────────────────────────────────
@@ -36,7 +36,7 @@ WORKDIR /app
 # Bake the INT8 model in — no network calls at startup
 COPY --from=exporter /app/model /app/model
 
-COPY app.py .
+COPY images/maki-finbert/app.py .
 
 RUN useradd -m -s /bin/bash finbert
 USER finbert
