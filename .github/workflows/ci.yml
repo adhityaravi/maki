@@ -30,6 +30,7 @@ jobs:
       recall: ${{ steps.filter.outputs.recall }}
       synapse: ${{ steps.filter.outputs.synapse }}
       vault: ${{ steps.filter.outputs.vault }}
+      finbert: ${{ steps.filter.outputs.finbert }}
       any: ${{ steps.filter.outputs.any }}
     steps:
       - uses: actions/checkout@v6
@@ -79,6 +80,8 @@ jobs:
               - 'uv.lock'
             vault:
               - 'images/maki-vault/**'
+            finbert:
+              - 'images/maki-finbert/**'
             any:
               - '**/*.py'
               - 'pyproject.toml'
@@ -108,7 +111,7 @@ jobs:
       github.event_name == 'push'
     strategy:
       matrix:
-        service: [cortex, ears, stem, immune, recall, synapse, vault]
+        service: [cortex, ears, stem, immune, recall, synapse, vault, finbert]
     steps:
       - name: Check if should build
         id: should-build

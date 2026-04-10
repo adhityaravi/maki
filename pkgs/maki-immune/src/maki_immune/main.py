@@ -52,6 +52,7 @@ HEALTH_ENDPOINTS = {
     "maki-cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
     "maki-recall": os.environ.get("RECALL_URL", "http://maki-recall:8000"),
     "maki-synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
+    "maki-finbert": os.environ.get("FINBERT_URL", "http://maki-finbert:8080"),
 }
 
 VITALS_STREAM = "maki-vitals"
