@@ -46,7 +46,7 @@ resource "kubernetes_deployment" "finbert" {
       spec {
         container {
           name             = "finbert"
-          image            = "${var.image_registry}/maki-finbert:latest"
+          image            = "${var.image_registry}/maki-finbert:sha-0a5e7ca"
           image_pull_policy = "Always"
           port {
             container_port = 8080
