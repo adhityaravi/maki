@@ -443,7 +443,10 @@ async def _out_listener():
                         channel = _bot.get_channel(channel_id)
                         if channel:
                             await channel.send(text, view=view)
-                            log.info("Trade proposal posted", extra={"proposal_id": proposal_id, "channel_id": channel_id})
+                            log.info(
+                                "Trade proposal posted",
+                                extra={"proposal_id": proposal_id, "channel_id": channel_id},
+                            )
                 else:
                     log.warning("Trade proposal dropped — Discord not connected", extra={"proposal_id": proposal_id})
                 continue
