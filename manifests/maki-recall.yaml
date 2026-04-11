@@ -1,4 +1,15 @@
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maki-recall-data
+  namespace: maki
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: maki-recall
@@ -105,7 +116,8 @@ spec:
               mountPath: /data
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: maki-recall-data
         - name: tailscale-socket
           hostPath:
             path: /var/run/tailscale
