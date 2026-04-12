@@ -74,6 +74,8 @@ allowed-unresolved-imports = [
     "optimum.**",
     "transformers",
     "transformers.**",
+    "pytest",
+    "pytest.**",
 ]
 
 [tool.pytest.ini_options]

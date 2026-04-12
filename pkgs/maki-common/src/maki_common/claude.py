@@ -9,6 +9,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from maki_common.middleware import MiddlewareContext
+from maki_common.middleware.pipeline import get_default_pipeline
+
 log = logging.getLogger(__name__)
 
 
@@ -72,6 +75,24 @@ def _parse_usage(result_message: Any, model: str, mode: str, duration_ms: float)
     )
 
 
+async def _run_middleware(
+    prompt: str,
+    system_prompt: str | None,
+    model: str,
+    mode: str,
+) -> tuple[str, str | None]:
+    """Run the default middleware pipeline. Returns (prompt, system_prompt)."""
+    ctx = MiddlewareContext(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        model=model,
+        mode=mode,
+    )
+    pipeline = get_default_pipeline()
+    ctx = await pipeline.run(ctx)
+    return ctx.prompt, ctx.system_prompt
+
+
 async def invoke_claude(
     prompt: str,
     model: str = "claude-sonnet-4-20250514",
@@ -80,6 +101,7 @@ async def invoke_claude(
     mcp_servers: dict[str, Any] | None = None,
     mode: str = "",
     system_prompt: str | None = None,
+    middleware: bool = False,
 ) -> tuple[str, TokenUsage]:
     """Claude invocation via Agent SDK.
 
@@ -93,10 +115,17 @@ async def invoke_claude(
         system_prompt: Static system context (identity, memories, graph). Kept
             separate from the human prompt so conversation history cannot bleed
             into the system context and vice versa.
+        middleware: If True, run the middleware pipeline before dispatching.
 
     Returns:
         Tuple of (response_text, token_usage).
+
+    Raises:
+        maki_common.middleware.MiddlewareRejection: If middleware rejects the request.
     """
+    if middleware:
+        prompt, system_prompt = await _run_middleware(prompt, system_prompt, model, mode)
+
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
 
     options_kwargs: dict[str, Any] = dict(
@@ -161,6 +190,7 @@ async def stream_claude(
     mode: str = "",
     usage_out: list[TokenUsage] | None = None,
     system_prompt: str | None = None,
+    middleware: bool = False,
 ) -> AsyncIterator[str]:
     """Stream Claude responses, yielding each assistant text block as it arrives.
 
@@ -173,7 +203,14 @@ async def stream_claude(
         system_prompt: Static system context (identity, memories, graph). Kept
             separate from the human prompt so conversation history cannot bleed
             into the system context and vice versa.
+        middleware: If True, run the middleware pipeline before dispatching.
+
+    Raises:
+        maki_common.middleware.MiddlewareRejection: If middleware rejects the request.
     """
+    if middleware:
+        prompt, system_prompt = await _run_middleware(prompt, system_prompt, model, mode)
+
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
 
     options_kwargs: dict[str, Any] = dict(
