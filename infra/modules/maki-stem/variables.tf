@@ -13,3 +13,9 @@ variable "nats_url" {
   type        = string
   default     = "nats://maki-nerve-nats:4222"
 }
+
+variable "postgres_host" {
+  description = "PostgreSQL host (comma-separated for HA failover)"
+  type        = string
+  default     = "maki-vault"
+}

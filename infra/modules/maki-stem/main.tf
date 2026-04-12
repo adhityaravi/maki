@@ -172,6 +172,31 @@ resource "kubernetes_deployment" "stem" {
             name  = "REPO_NAME"
             value = "maki"
           }
+          env {
+            name  = "POSTGRES_HOST"
+            value = var.postgres_host
+          }
+          env {
+            name  = "POSTGRES_PORT"
+            value = "5432"
+          }
+          env {
+            name  = "POSTGRES_DB"
+            value = "maki"
+          }
+          env {
+            name  = "POSTGRES_USER"
+            value = "maki"
+          }
+          env {
+            name = "POSTGRES_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = "maki-vault-secret"
+                key  = "password"
+              }
+            }
+          }
           startup_probe {
             http_get {
               path = "/health"

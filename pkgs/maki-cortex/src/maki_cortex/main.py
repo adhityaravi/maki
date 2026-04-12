@@ -59,7 +59,7 @@ _active_turn_mode: str | None = None
 _active_turn_started: float | None = None
 _active_task: asyncio.Task | None = None  # for preemption: cancel background turns
 
-_BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care"})
+_BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care", "trading_analyst"})
 
 # Error patterns that should be silent (not forwarded to Discord).
 # Stored as a frozenset of lowercase strings for O(1) substring scanning.

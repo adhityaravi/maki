@@ -25,4 +25,5 @@ inputs = {
   namespace      = dependency.namespace.outputs.name
   image_registry = local.env.locals.image_registry
   nats_url       = local.env.locals.nats_url
+  postgres_host  = local.env.locals.postgres_host
 }

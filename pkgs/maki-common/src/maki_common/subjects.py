@@ -43,3 +43,8 @@ CONVERSATION_STREAM = "maki.conversation"
 TRADING_MANUAL_TRADE = "maki.trading.manual_trade"
 TRADING_CLOSE = "maki.trading.close"
 TRADING_OUTCOME = "maki.trading.outcome"
+TRADING_SIGNAL = "maki.trading.signal"
+TRADING_TOOL_REQUEST = "maki.trading.tool"
+
+# Generic DB query
+DB_QUERY = "maki.db.query"

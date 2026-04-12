@@ -68,6 +68,8 @@ allowed-unresolved-imports = [
     "mem0.**",
     "discord",
     "discord.**",
+    "asyncpg",
+    "asyncpg.**",
     "croniter",
     "croniter.**",
     "optimum",

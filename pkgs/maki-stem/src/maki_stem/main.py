@@ -14,7 +14,9 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from importlib.metadata import entry_points
+from urllib.parse import quote_plus
 
+import asyncpg
 import httpx
 import nats.js.api
 from fastapi import FastAPI, HTTPException
@@ -37,10 +39,14 @@ from maki_common.subjects import (
     CORTEX_STUCK,
     CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
+    DB_QUERY,
     EARS_IN,
     EARS_OUT,
     IMMUNE_STATE_REQUEST,
     MEMORY_STORE,
+    TRADING_OUTCOME,
+    TRADING_SIGNAL,
+    TRADING_TOOL_REQUEST,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
@@ -64,6 +70,12 @@ CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "15"))
 MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
 MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
+
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "maki-vault")
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.environ.get("POSTGRES_DB", "maki")
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "maki")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
 
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
@@ -130,6 +142,14 @@ _sub_memory_store = None  # NATS subscription: MEMORY_STORE
 _sub_ears = None  # NATS subscription: EARS_IN
 _loop_specs: list = []  # discovered LoopSpecs, populated in lifespan
 _stem_ctx = None  # StemContext, populated in lifespan
+_trading_tool_registry: dict = {}  # name → async handler, populated per trading run
+_db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in lifespan
+
+
+def _build_pg_dsn() -> str:
+    """Build PostgreSQL DSN from environment variables."""
+    pw = quote_plus(POSTGRES_PASSWORD) if POSTGRES_PASSWORD else ""
+    return f"postgresql://{POSTGRES_USER}:{pw}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
 
 def _init_github_client():
@@ -659,7 +679,7 @@ def _discover_loops() -> list[LoopSpec]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _nc, _js, _config_kv, _lock_kv, _github
+    global _nc, _js, _config_kv, _lock_kv, _github, _db_pool
     log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
@@ -671,6 +691,9 @@ async def lifespan(app: FastAPI):
     _config_kv = await init_kv(_js, CONFIG_BUCKET)
     _lock_kv = await init_kv(_js, LOCK_BUCKET)
 
+    _db_pool = await asyncpg.create_pool(dsn=_build_pg_dsn(), min_size=1, max_size=3)
+    log.info("PostgreSQL pool created", extra={"host": POSTGRES_HOST, "db": POSTGRES_DB})
+
     _github = _init_github_client()
 
     asyncio.create_task(_response_listener())
@@ -679,6 +702,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_ears_listener())
     asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_config_sync_listener())
+    asyncio.create_task(_db_query_listener())
+    asyncio.create_task(_trading_signal_listener())
+    asyncio.create_task(_trading_outcome_listener())
+    asyncio.create_task(_trading_tool_listener())
     ctx = StemContext(
         nc=_nc,
         js=_js,
@@ -708,6 +735,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if _db_pool:
+        await _db_pool.close()
     await _nc.close()
 
 
@@ -880,6 +909,15 @@ async def _memory_store_listener():
             log.exception("Error in memory store listener")
 
 
+async def _run_manual_loop(spec: LoopSpec, loop_name: str) -> None:
+    """Run a loop body in the background (fire-and-forget from !loop command)."""
+    try:
+        config = await load_kv_config(_stem_ctx.config_kv, _stem_ctx.default_config)
+        await spec.body(spec, config, _stem_ctx)
+    except Exception:
+        log.exception("Manual loop trigger failed", extra={"loop": loop_name})
+
+
 async def _trigger_loop(loop_name: str, forward_to: dict) -> None:
     """Manually trigger a named loop, bypassing cron/guards."""
     spec = next((s for s in _loop_specs if s.name == loop_name), None)
@@ -890,13 +928,7 @@ async def _trigger_loop(loop_name: str, forward_to: dict) -> None:
         return
     reply = {"response": f"Triggering loop: {loop_name}", "done": True, **forward_to}
     await _nc.publish(EARS_OUT, json.dumps(reply).encode())
-    try:
-        config = await load_kv_config(_stem_ctx.config_kv, _stem_ctx.default_config)
-        await spec.body(spec, config, _stem_ctx)
-    except Exception:
-        log.exception("Manual loop trigger failed", extra={"loop": loop_name})
-        err = {"response": f"Loop '{loop_name}' failed — check logs", "done": True, **forward_to}
-        await _nc.publish(EARS_OUT, json.dumps(err).encode())
+    asyncio.create_task(_run_manual_loop(spec, loop_name))
 
 
 async def _handle_discord_message(data: dict):
@@ -982,6 +1014,191 @@ async def _config_sync_listener():
                 log.info("Config synced from peer", extra={"key": key, "value": value})
         except Exception:
             log.exception("Config sync error")
+
+
+async def _db_query_listener():
+    """Handle generic DB query requests from cortex via NATS request/reply.
+
+    Safety: only SELECT/WITH queries are allowed, LIMIT 50 is injected if missing,
+    and a 10s query timeout is enforced.
+    """
+    from maki_common.tools.utils import mcp_result
+
+    sub = await _nc.subscribe(DB_QUERY)
+    log.info("Subscribed", extra={"subject": DB_QUERY})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            sql = data.get("sql", "").strip()
+
+            # Validate: SELECT or WITH only
+            first_word = sql.split()[0].upper() if sql.split() else ""
+            if first_word not in ("SELECT", "WITH"):
+                await msg.respond(json.dumps(mcp_result("Only SELECT/WITH queries are allowed.")).encode())
+                continue
+
+            # Reject multi-statement queries
+            if ";" in sql.rstrip(";"):
+                await msg.respond(json.dumps(mcp_result("Multi-statement queries are not allowed.")).encode())
+                continue
+
+            sql = sql.rstrip(";")
+
+            # Inject LIMIT if missing
+            if "limit" not in sql.lower():
+                sql += " LIMIT 50"
+
+            log.info("Executing DB query", extra={"sql": sql[:200]})
+
+            async with _db_pool.acquire() as conn:
+                rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
+
+            if not rows:
+                await msg.respond(json.dumps(mcp_result("Query returned 0 rows.")).encode())
+                continue
+
+            # Format as text table
+            columns = list(rows[0].keys())
+            lines = [" | ".join(columns)]
+            lines.append("-" * len(lines[0]))
+            for row in rows:
+                lines.append(" | ".join(str(row[c]) for c in columns))
+            lines.append(f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})")
+
+            await msg.respond(json.dumps(mcp_result("\n".join(lines))).encode())
+
+        except TimeoutError:
+            log.warning("DB query timed out")
+            try:
+                await msg.respond(json.dumps(mcp_result("Query timed out (10s limit).")).encode())
+            except Exception:
+                pass
+        except Exception:
+            log.exception("DB query error")
+            try:
+                await msg.respond(json.dumps(mcp_result("DB query failed — check logs.")).encode())
+            except Exception:
+                pass
+
+
+async def _trading_signal_listener():
+    """Persist accepted trade signals to maki-vault (PostgreSQL).
+
+    Subscribes to TRADING_SIGNAL, published by the trading loop after a
+    proposal is accepted. Inserts into the trade_signals table.
+    """
+    sub = await _nc.subscribe(TRADING_SIGNAL)
+    log.info("Subscribed", extra={"subject": TRADING_SIGNAL})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+
+            # Map direction: buy→long, sell→short
+            direction = data.get("direction", "")
+            db_direction = "long" if direction == "buy" else "short"
+
+            async with _db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO trade_signals (
+                        trade_id, asset, asset_type, direction, entry_price,
+                        position_size_pct, composite_score,
+                        sentiment_score, indicator_snapshot,
+                        paper, status, accepted_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'accepted', now())
+                    """,
+                    data.get("trade_id"),
+                    data.get("asset"),
+                    data.get("asset_type", "crypto"),
+                    db_direction,
+                    float(data.get("entry_price", 0)),
+                    float(data.get("position_size_pct", 0)),
+                    float(data.get("composite_score", 0)),
+                    float(data.get("sentiment_score", 0)) if data.get("sentiment_score") is not None else None,
+                    json.dumps(data.get("indicator_snapshot")) if data.get("indicator_snapshot") else None,
+                    data.get("paper", True),
+                )
+            log.info(
+                "Trade signal persisted",
+                extra={"trade_id": data.get("trade_id"), "asset": data.get("asset")},
+            )
+        except Exception:
+            log.exception("Failed to persist trade signal")
+
+
+async def _trading_outcome_listener():
+    """Persist trade outcomes to maki-vault (PostgreSQL).
+
+    Subscribes to TRADING_OUTCOME, published by the close_trade function.
+    Looks up the corresponding trade_signals row by trade_id and inserts
+    into trade_outcomes.
+    """
+    sub = await _nc.subscribe(TRADING_OUTCOME)
+    log.info("Subscribed", extra={"subject": TRADING_OUTCOME})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            trade_id = data.get("trade_id", "")
+
+            async with _db_pool.acquire() as conn:
+                # Find the signal UUID from trade_id
+                row = await conn.fetchrow(
+                    "SELECT id FROM trade_signals WHERE trade_id = $1",
+                    trade_id,
+                )
+                if row is None:
+                    log.warning(
+                        "No trade_signals row for outcome — inserting orphan-safe",
+                        extra={"trade_id": trade_id},
+                    )
+                    continue
+
+                signal_id = row["id"]
+                await conn.execute(
+                    """
+                    INSERT INTO trade_outcomes (signal_id, outcome, exit_price, pnl_pct, pnl_eur)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    signal_id,
+                    data.get("outcome", "manual"),
+                    float(data.get("exit_price", 0)),
+                    float(data.get("pnl_pct", 0)) if data.get("pnl_pct") is not None else None,
+                    float(data.get("pnl_eur", 0)) if data.get("pnl_eur") is not None else None,
+                )
+            log.info(
+                "Trade outcome persisted",
+                extra={"trade_id": trade_id, "outcome": data.get("outcome")},
+            )
+        except Exception:
+            log.exception("Failed to persist trade outcome")
+
+
+async def _trading_tool_listener():
+    """Handle trading tool requests from cortex via NATS request/reply."""
+    sub = await _nc.subscribe(TRADING_TOOL_REQUEST)
+    log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            tool_name = data.get("tool_name", "")
+            tool_args = data.get("tool_args", {})
+            handler = _trading_tool_registry.get(tool_name)
+            if handler:
+                result = await handler(tool_args)
+            else:
+                from maki_common.tools.utils import mcp_result
+
+                available = ", ".join(_trading_tool_registry.keys()) or "none"
+                result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
+            await msg.respond(json.dumps(result).encode())
+        except Exception:
+            log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
+            try:
+                from maki_common.tools.utils import mcp_result
+
+                await msg.respond(json.dumps(mcp_result("Internal tool error")).encode())
+            except Exception:
+                pass
 
 
 @app.get("/health")
