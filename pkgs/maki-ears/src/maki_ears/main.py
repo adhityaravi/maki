@@ -209,6 +209,11 @@ class MakiDiscordClient(discord.Client):
             await _handle_trade_command(message, content)
             return
 
+        # !loop command — trigger loop, immediate ack, no typing indicator
+        if content.lower().startswith("!loop"):
+            await _handle_loop_command(message, content)
+            return
+
         # Dedup: if another ears instance already published this message, skip
         msg_key = f"msg.{message.id}"
         try:
@@ -363,6 +368,40 @@ async def _handle_immune_command(message: discord.Message, content: str):
             await message.remove_reaction(thinking_emoji, _bot.user)
         except Exception:
             pass
+
+
+async def _handle_loop_command(message: discord.Message, content: str) -> None:
+    """Handle ``!loop <name>`` — forward to stem via EARS_IN, immediate ack, no typing."""
+    msg_key = f"msg.{message.id}"
+    try:
+        await _dedup_kv.create(msg_key, b"1")
+    except Exception:
+        log.info("Dedup: loop command already claimed", extra={"message_id": str(message.id)})
+        return
+
+    tokens = content.strip().split()
+    if len(tokens) < 2:
+        await message.channel.send("Usage: `!loop <name>`")
+        return
+
+    loop_name = tokens[1]
+
+    payload = {
+        "message_id": str(message.id),
+        "channel_id": str(message.channel.id),
+        "username": message.author.name,
+        "content": content,
+    }
+
+    try:
+        await _nc.publish(EARS_IN, json.dumps(payload).encode())
+        log.info("Loop command published", extra={"subject": EARS_IN, "loop": loop_name})
+    except Exception:
+        log.exception("Failed to publish loop command")
+        await message.channel.send("Failed to trigger loop — NATS unavailable.")
+        return
+
+    await message.channel.send(f"⏳ Triggering **{loop_name}** loop...")
 
 
 async def _handle_trade_close(message: discord.Message, content: str) -> None:

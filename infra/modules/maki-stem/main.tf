@@ -68,7 +68,7 @@ resource "kubernetes_deployment" "stem" {
               set -e
               apt-get update && apt-get install -y git
               pip install --no-deps --target=/maki-loops "git+https://$GITHUB_PAT@github.com/adhityaravi/maki-loops.git"
-              pip install --target=/maki-loops pandas
+              pip install --target=/maki-loops pandas tenacity
               echo "maki-loops installed successfully"
             EOT
           ]

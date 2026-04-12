@@ -1185,12 +1185,15 @@ async def _trading_tool_listener():
             handler = _trading_tool_registry.get(tool_name)
             if handler:
                 result = await handler(tool_args)
-            else:
+                await msg.respond(json.dumps(result).encode())
+            elif _trading_tool_registry:
+                # Tools registered but this name not found — real error
                 from maki_common.tools.utils import mcp_result
 
-                available = ", ".join(_trading_tool_registry.keys()) or "none"
+                available = ", ".join(_trading_tool_registry.keys())
                 result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
-            await msg.respond(json.dumps(result).encode())
+                await msg.respond(json.dumps(result).encode())
+            # else: no tools on this instance — stay silent, let the right stem handle it
         except Exception:
             log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
             try:
