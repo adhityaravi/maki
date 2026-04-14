@@ -44,6 +44,7 @@ from maki_common.subjects import (
     EARS_OUT,
     IMMUNE_STATE_REQUEST,
     MEMORY_STORE,
+    TRADING_CLOSE,
     TRADING_OUTCOME,
     TRADING_SIGNAL,
     TRADING_TOOL_REQUEST,
@@ -711,6 +712,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_db_query_listener())
     asyncio.create_task(_trading_signal_listener())
     asyncio.create_task(_trading_outcome_listener())
+    asyncio.create_task(_trading_close_listener())
     asyncio.create_task(_trading_tool_listener())
     ctx = StemContext(
         nc=_nc,
@@ -1118,7 +1120,7 @@ async def _trading_signal_listener():
                     data.get("asset_type", "crypto"),
                     db_direction,
                     float(data.get("entry_price", 0)),
-                    float(data.get("position_size_pct", 0)),
+                    float(data.get("position_size_eur", 0) or data.get("position_size_pct", 0)),
                     float(data.get("composite_score", 0)),
                     float(data.get("sentiment_score", 0)) if data.get("sentiment_score") is not None else None,
                     json.dumps(data.get("indicator_snapshot")) if data.get("indicator_snapshot") else None,
@@ -1177,6 +1179,36 @@ async def _trading_outcome_listener():
             )
         except Exception:
             log.exception("Failed to persist trade outcome")
+
+
+async def _trading_close_listener():
+    """Handle trade close commands from ears (Discord close button/modal).
+
+    Subscribes to TRADING_CLOSE, calls close_trade from the trading loop
+    outcome module to compute P&L, update stats, and publish results.
+    """
+    from maki_loops.trading.outcome import close_trade
+
+    sub = await _nc.subscribe(TRADING_CLOSE, queue="stem")
+    log.info("Subscribed", extra={"subject": TRADING_CLOSE})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            symbol = data.get("symbol", "")
+            exit_price = float(data.get("exit_price", 0))
+            if not symbol or not exit_price:
+                log.warning("Invalid close payload: %s", data)
+                continue
+            result = await close_trade(_lock_kv, _nc, symbol, exit_price)
+            if result is None:
+                log.warning("No open trade found for %s", symbol)
+            else:
+                log.info(
+                    "Trade closed via Discord",
+                    extra={"trade_id": result.trade_id, "symbol": symbol, "pnl_eur": result.pnl_eur},
+                )
+        except Exception:
+            log.exception("Failed to process trade close")
 
 
 async def _trading_tool_listener():

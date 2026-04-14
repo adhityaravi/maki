@@ -72,6 +72,8 @@ allowed-unresolved-imports = [
     "asyncpg.**",
     "croniter",
     "croniter.**",
+    "maki_loops",
+    "maki_loops.**",
     "optimum",
     "optimum.**",
     "transformers",

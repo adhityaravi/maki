@@ -433,6 +433,15 @@ class _TradeCloseModal(discord.ui.Modal):
 
         await interaction.response.send_message(f"⏳ Closing **{self.symbol}** @ {price}...", ephemeral=True)
 
+        # Disable the close button so it can't be clicked again
+        try:
+            await interaction.message.edit(
+                content=interaction.message.content + f"\n\n_📊 Closed by {interaction.user.name} @ {price}_",
+                view=None,
+            )
+        except Exception:
+            log.warning("Failed to disable close button", exc_info=True)
+
 
 async def _handle_immune_command(message: discord.Message, content: str):
     """Handle messages in #maki-immune — forward to immune as direct commands."""
