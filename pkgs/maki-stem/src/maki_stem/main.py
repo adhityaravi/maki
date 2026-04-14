@@ -143,6 +143,7 @@ _sub_ears = None  # NATS subscription: EARS_IN
 _loop_specs: list = []  # discovered LoopSpecs, populated in lifespan
 _stem_ctx = None  # StemContext, populated in lifespan
 _trading_tool_registry: dict = {}  # name → async handler, populated per trading run
+_permanent_trading_tools: dict = {}  # name → async handler, always-on read-only KV
 _db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in lifespan
 
 
@@ -694,6 +695,11 @@ async def lifespan(app: FastAPI):
     _db_pool = await asyncpg.create_pool(dsn=_build_pg_dsn(), min_size=1, max_size=3)
     log.info("PostgreSQL pool created", extra={"host": POSTGRES_HOST, "db": POSTGRES_DB})
 
+    from maki_common.tools.trading_portfolio import make_trading_portfolio_tools
+
+    _permanent_trading_tools.update(make_trading_portfolio_tools(_lock_kv))
+    log.info("Permanent trading tools registered", extra={"tools": list(_permanent_trading_tools)})
+
     _github = _init_github_client()
 
     asyncio.create_task(_response_listener())
@@ -1174,7 +1180,10 @@ async def _trading_outcome_listener():
 
 
 async def _trading_tool_listener():
-    """Handle trading tool requests from cortex via NATS request/reply."""
+    """Handle trading tool requests from cortex via NATS request/reply.
+
+    Priority: loop-specific registry (live market context) > permanent tools (KV reads).
+    """
     sub = await _nc.subscribe(TRADING_TOOL_REQUEST)
     log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
     async for msg in sub.messages:
@@ -1182,18 +1191,19 @@ async def _trading_tool_listener():
             data = json.loads(msg.data.decode())
             tool_name = data.get("tool_name", "")
             tool_args = data.get("tool_args", {})
-            handler = _trading_tool_registry.get(tool_name)
+            handler = _trading_tool_registry.get(tool_name) or _permanent_trading_tools.get(tool_name)
             if handler:
                 result = await handler(tool_args)
                 await msg.respond(json.dumps(result).encode())
-            elif _trading_tool_registry:
-                # Tools registered but this name not found — real error
+            else:
                 from maki_common.tools.utils import mcp_result
 
-                available = ", ".join(_trading_tool_registry.keys())
-                result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
-                await msg.respond(json.dumps(result).encode())
-            # else: no tools on this instance — stay silent, let the right stem handle it
+                all_tools = set(_trading_tool_registry) | set(_permanent_trading_tools)
+                if all_tools:
+                    available = ", ".join(sorted(all_tools))
+                    result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
+                    await msg.respond(json.dumps(result).encode())
+                # else: no tools on this instance — stay silent
         except Exception:
             log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
             try:

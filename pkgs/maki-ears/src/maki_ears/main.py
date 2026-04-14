@@ -35,6 +35,7 @@ GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
 VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-general")
 IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
+TRADING_CHANNEL_NAME = os.environ.get("TRADING_CHANNEL_NAME", "maki-trading")
 
 # Timeout (seconds) after receiving the last chunk before assuming done.
 # Safety net in case the done signal is lost in transit.
@@ -55,6 +56,7 @@ INSTANCE_ID = f"ears-{uuid.uuid4().hex[:8]}"
 _general_channel_ids: set[int] = set()
 _vitals_channel_ids: set[int] = set()
 _immune_channel_ids: set[int] = set()
+_trading_channel_ids: set[int] = set()
 
 _bot = None
 
@@ -84,11 +86,17 @@ class MakiDiscordClient(discord.Client):
             _discover_channel(guild, GENERAL_CHANNEL_NAME, _general_channel_ids, "General")
             _discover_channel(guild, VITALS_CHANNEL_NAME, _vitals_channel_ids, "Vitals")
             _discover_channel(guild, IMMUNE_CHANNEL_NAME, _immune_channel_ids, "Immune")
+            _discover_channel(guild, TRADING_CHANNEL_NAME, _trading_channel_ids, "Trading")
 
         if not _general_channel_ids:
             log.warning("No general channel found", extra={"channel_name": GENERAL_CHANNEL_NAME})
         if not _immune_channel_ids:
             log.warning("No immune channel found", extra={"channel_name": IMMUNE_CHANNEL_NAME})
+        if not _trading_channel_ids:
+            log.info(
+                "No trading channel — output goes to general",
+                extra={"channel_name": TRADING_CHANNEL_NAME},
+            )
 
     async def search_channel(
         self,
@@ -602,7 +610,8 @@ async def _out_listener():
             if proposal_id and data.get("components") and text:
                 if _bot and not _bot.is_closed():
                     view = _TradeProposalView(proposal_id)
-                    for channel_id in _general_channel_ids:
+                    target_ids = _trading_channel_ids or _general_channel_ids
+                    for channel_id in target_ids:
                         channel = _bot.get_channel(channel_id)
                         if channel:
                             await channel.send(text, view=view)
@@ -614,14 +623,17 @@ async def _out_listener():
                     log.warning("Trade proposal dropped — Discord not connected", extra={"proposal_id": proposal_id})
                 continue
 
-            # Loop output (fire-and-forget → general channel)
+            # Loop output (fire-and-forget)
             if not text:
                 continue
 
             turn_id = data.get("turn_id", "unknown")
             log.info("Loop output received", extra={"turn_id": turn_id, "text_len": len(text)})
 
-            for channel_id in _general_channel_ids:
+            # Route trading output to #maki-trading, everything else to #maki-general
+            is_trading = turn_id in ("discovery", "trading-summary")
+            target_ids = (_trading_channel_ids or _general_channel_ids) if is_trading else _general_channel_ids
+            for channel_id in target_ids:
                 channel = _bot.get_channel(channel_id)
                 if channel:
                     await _send_response(channel, text)
@@ -800,6 +812,7 @@ async def main():
             _general_channel_ids.clear()
             _vitals_channel_ids.clear()
             _immune_channel_ids.clear()
+            _trading_channel_ids.clear()
 
             asyncio.create_task(_leader_renewal_loop())
             search_task = asyncio.create_task(_search_listener())
