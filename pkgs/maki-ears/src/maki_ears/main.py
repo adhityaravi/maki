@@ -178,6 +178,68 @@ class MakiDiscordClient(discord.Client):
 
         return {"ok": True, "messages": hits, "total_results": data.get("total_results", len(hits))}
 
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Handle trade button clicks and close modals.
+
+        Uses on_interaction (not view callbacks) so buttons survive ears
+        restarts — Discord resends the interaction regardless of in-memory
+        view state.
+        """
+        if interaction.type not in (
+            discord.InteractionType.component,
+            discord.InteractionType.modal_submit,
+        ):
+            return
+
+        custom_id = (interaction.data or {}).get("custom_id", "")
+
+        # Close button → open modal for exit price
+        if custom_id.startswith("trade_close:"):
+            symbol = custom_id.split(":", 1)[1]
+            await interaction.response.send_modal(_TradeCloseModal(symbol))
+            return
+
+        # Accept / Skip buttons — format: trade:{proposal_id}:{symbol}:{action}
+        if not custom_id.startswith("trade:"):
+            return
+        parts = custom_id.split(":")
+        if len(parts) != 4:
+            return
+        _, proposal_id, symbol, action = parts
+
+        await interaction.response.defer()
+
+        if action == "accept":
+            close_view = _TradeCloseView(symbol)
+            try:
+                await interaction.message.edit(
+                    content=interaction.message.content + f"\n\n_✅ Accepted by {interaction.user.name}_",
+                    view=close_view,
+                )
+            except Exception:
+                log.warning("Failed to edit proposal message", exc_info=True)
+        else:
+            try:
+                await interaction.message.edit(
+                    content=interaction.message.content + f"\n\n_⏭️ Skipped by {interaction.user.name}_",
+                    view=None,
+                )
+            except Exception:
+                log.warning("Failed to edit proposal message", exc_info=True)
+
+        if _nc:
+            subject = f"{EARS_INTERACTION}.{proposal_id}"
+            payload = {
+                "proposal_id": proposal_id,
+                "action": action,
+                "user": str(interaction.user.name),
+            }
+            await _nc.publish(subject, json.dumps(payload).encode())
+            log.info(
+                "Trade interaction published",
+                extra={"proposal_id": proposal_id, "action": action},
+            )
+
     async def on_message(self, message: discord.Message):
         if message.author == self.user:
             return
@@ -290,42 +352,86 @@ class MakiDiscordClient(discord.Client):
                 pass
 
 
-class _TradeButton(discord.ui.Button):
-    """A single Accept or Skip button for a trade proposal."""
+class _TradeProposalView(discord.ui.View):
+    """Button view for trade proposals.
 
-    def __init__(self, label: str, custom_id: str, style: discord.ButtonStyle) -> None:
-        super().__init__(label=label, custom_id=custom_id, style=style)
+    ``timeout=None`` keeps buttons alive for the full 60-min collection
+    window.  Interaction handling lives in ``MakiDiscordClient.on_interaction``
+    (not in button callbacks) so clicks also work after ears restarts.
+    """
 
-    async def callback(self, interaction: discord.Interaction) -> None:
-        # custom_id format: "trade:{proposal_id}:{action}"
-        parts = self.custom_id.split(":")
-        proposal_id, action = parts[1], parts[2]
-
-        await interaction.response.defer()
-
-        outcome_label = "✅ Accepted" if action == "accept" else "⏭️ Skipped"
-        try:
-            await interaction.message.edit(
-                content=interaction.message.content + f"\n\n_{outcome_label} by {interaction.user.name}_",
-                view=None,
+    def __init__(self, proposal_id: str, symbol: str, direction: str = "buy") -> None:
+        super().__init__(timeout=None)
+        if direction == "buy":
+            label, style = "🟢 Buy", discord.ButtonStyle.success
+        else:
+            label, style = "🔴 Sell", discord.ButtonStyle.danger
+        self.add_item(
+            discord.ui.Button(
+                label=label,
+                custom_id=f"trade:{proposal_id}:{symbol}:accept",
+                style=style,
             )
-        except Exception:
-            log.warning("Failed to edit proposal message after interaction", exc_info=True)
+        )
+        self.add_item(
+            discord.ui.Button(
+                label="⏭️ Skip",
+                custom_id=f"trade:{proposal_id}:{symbol}:skip",
+                style=discord.ButtonStyle.secondary,
+            )
+        )
+
+
+class _TradeCloseView(discord.ui.View):
+    """Replaces proposal buttons after acceptance — shows a Close button."""
+
+    def __init__(self, symbol: str) -> None:
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                label="📊 Close Position",
+                custom_id=f"trade_close:{symbol}",
+                style=discord.ButtonStyle.primary,
+            )
+        )
+
+
+class _TradeCloseModal(discord.ui.Modal):
+    """Modal popup for entering the exit price when closing a trade."""
+
+    exit_price = discord.ui.TextInput(
+        label="Exit Price",
+        placeholder="e.g. 86200",
+        required=True,
+        max_length=20,
+    )
+
+    def __init__(self, symbol: str) -> None:
+        super().__init__(title=f"Close {symbol}")
+        self.symbol = symbol
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            price = float(self.exit_price.value)
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Invalid price.", ephemeral=True)
+            return
 
         if _nc:
-            subject = f"{EARS_INTERACTION}.{proposal_id}"
-            payload = {"proposal_id": proposal_id, "action": action, "user": str(interaction.user.name)}
-            await _nc.publish(subject, json.dumps(payload).encode())
-            log.info("Trade interaction published", extra={"proposal_id": proposal_id, "action": action})
+            payload = {
+                "symbol": self.symbol,
+                "exit_price": price,
+                "username": str(interaction.user.name),
+            }
+            await _nc.publish(TRADING_CLOSE, json.dumps(payload).encode())
+            log.info(
+                "Trade close via modal",
+                extra={"symbol": self.symbol, "exit_price": price},
+            )
 
-
-class _TradeProposalView(discord.ui.View):
-    """Discord button view attached to an outgoing trade proposal message."""
-
-    def __init__(self, proposal_id: str) -> None:
-        super().__init__(timeout=300)  # buttons expire after 5 minutes
-        self.add_item(_TradeButton("✅ Accept", f"trade:{proposal_id}:accept", discord.ButtonStyle.success))
-        self.add_item(_TradeButton("⏭️ Skip", f"trade:{proposal_id}:skip", discord.ButtonStyle.secondary))
+        await interaction.response.send_message(f"⏳ Closing **{self.symbol}** @ {price}...", ephemeral=True)
 
 
 async def _handle_immune_command(message: discord.Message, content: str):
@@ -604,12 +710,14 @@ async def _out_listener():
                     log.warning("Response for unknown message", extra={"message_id": message_id})
                 continue
 
-            # Trade proposal with Accept / Skip buttons
+            # Trade proposal with Buy/Sell + Skip buttons
             proposal_id = data.get("proposal_id")
             text = data.get("text", "")
             if proposal_id and data.get("components") and text:
                 if _bot and not _bot.is_closed():
-                    view = _TradeProposalView(proposal_id)
+                    direction = data.get("direction", "buy")
+                    symbol = data.get("symbol", "")
+                    view = _TradeProposalView(proposal_id, symbol, direction)
                     target_ids = _trading_channel_ids or _general_channel_ids
                     for channel_id in target_ids:
                         channel = _bot.get_channel(channel_id)
