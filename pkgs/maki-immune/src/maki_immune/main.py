@@ -75,6 +75,7 @@ DEFAULT_CONFIG = {
     "health_check_interval": 30,
     "reflex_restart_max": 3,
     "lock_ttl": 300,
+    "passive_patrol_interval_seconds": 2700,
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
@@ -523,6 +524,8 @@ async def main():
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         publish_immune_response=_publish_immune_response,
+        k8s_v1=_k8s_v1,
+        lock_kv=_lock_kv,
     )
 
     health_mod.init(
@@ -587,6 +590,7 @@ async def main():
 
     asyncio.create_task(health_mod.health_monitor_loop())
     asyncio.create_task(claude_mod.immune_heartbeat_loop())
+    asyncio.create_task(claude_mod.passive_log_monitor_loop())
     asyncio.create_task(health_mod.cortex_heartbeat_listener())
     asyncio.create_task(health_mod.token_usage_listener())
     asyncio.create_task(health_mod.gossip_publisher())

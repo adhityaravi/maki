@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
 from maki_common import load_kv_config, parse_config_tags
 from maki_common.claude import invoke_claude
 from maki_common.config import apply_config_updates, parse_tagged
+from maki_common.nats import try_claim_loop
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +40,11 @@ _system_prompt: str = ""
 _publish_alert: Any = None
 _publish_vitals: Any = None
 _publish_immune_response: Any = None
+_k8s_v1: Any = None
+_lock_kv: Any = None
+
+# Error signatures for passive log monitoring
+_ERROR_SIGNATURES = re.compile(r"ERROR|EXCEPTION|Traceback|panic|FATAL|RuntimeError|CrashLoopBackOff")
 
 
 def init(
@@ -63,12 +70,15 @@ def init(
     publish_alert,
     publish_vitals,
     publish_immune_response,
+    k8s_v1=None,
+    lock_kv=None,
 ):
     global _nc, _namespace, _instance_id, _site_name, _check_interval
     global _component_health, _pod_metrics, _recent_actions, _running_images, _hive_state
     global _cortex_state, _failed_image_blacklist
     global _config_kv, _default_config, _config_validators, _mcp_server, _semaphore, _system_prompt
     global _publish_alert, _publish_vitals, _publish_immune_response
+    global _k8s_v1, _lock_kv
     _nc = nc
     _namespace = namespace
     _instance_id = instance_id
@@ -90,6 +100,8 @@ def init(
     _publish_alert = publish_alert
     _publish_vitals = publish_vitals
     _publish_immune_response = publish_immune_response
+    _k8s_v1 = k8s_v1
+    _lock_kv = lock_kv
 
 
 # --- System State Builder ---
@@ -382,6 +394,95 @@ async def immune_heartbeat_loop():
 
         except Exception:
             log.exception("Immune heartbeat error")
+
+
+# --- Passive Log Monitor Loop ---
+
+
+async def passive_log_monitor_loop():
+    """Passive log monitor — tails recent pod logs on a fixed cadence, scanning for error signatures.
+
+    Skeleton for tiered passive monitoring. Detects error candidates only;
+    pattern matching logic is wired up in a separate issue.
+    """
+    log.info("Passive log monitor loop started", extra={"instance_id": _instance_id})
+
+    while True:
+        await asyncio.sleep(_check_interval)
+
+        try:
+            config = await load_kv_config(_config_kv, _default_config)
+            interval = config.get("passive_patrol_interval_seconds", 2700)
+            lock_ttl = max(interval - 60, 60)
+
+            # Distributed lock to prevent double-fire across instances
+            lock_key = f"loop.immune.passive_patrol.{_site_name}"
+            if not await try_claim_loop(_lock_kv, lock_key, lock_ttl, _instance_id):
+                continue
+
+            if not _k8s_v1:
+                log.debug("Passive patrol skipped — no K8s client")
+                continue
+
+            log.info("Passive log patrol triggered")
+
+            # List all pods in namespace
+            pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=_namespace)
+
+            candidates: list[dict] = []
+
+            for pod in pods.items:
+                app_label = (pod.metadata.labels or {}).get("app", "")
+                if not app_label:
+                    continue
+
+                pod_name = pod.metadata.name
+                try:
+                    log_text = await asyncio.to_thread(
+                        _k8s_v1.read_namespaced_pod_log,
+                        name=pod_name,
+                        namespace=_namespace,
+                        tail_lines=15,
+                    )
+                except Exception:
+                    continue
+
+                if not log_text:
+                    continue
+
+                matches = _ERROR_SIGNATURES.findall(log_text)
+                if matches:
+                    candidates.append(
+                        {
+                            "component": app_label,
+                            "pod": pod_name,
+                            "signatures": sorted(set(matches)),
+                            "log_tail": log_text.strip()[-500:],
+                        }
+                    )
+
+            if candidates:
+                log.info(
+                    "Passive patrol found error candidates",
+                    extra={
+                        "candidate_count": len(candidates),
+                        "components": [c["component"] for c in candidates],
+                    },
+                )
+                # Stub: log each candidate for future pattern matching engine
+                for c in candidates:
+                    log.info(
+                        "Error candidate detected",
+                        extra={
+                            "component": c["component"],
+                            "pod": c["pod"],
+                            "signatures": c["signatures"],
+                        },
+                    )
+            # No-error runs are fully silent — no logging
+
+        except Exception:
+            log.exception("Passive log monitor error")
 
 
 # --- Cortex Stuck Handler ---
