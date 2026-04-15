@@ -402,8 +402,9 @@ async def immune_heartbeat_loop():
 async def passive_log_monitor_loop():
     """Passive log monitor — tails recent pod logs on a fixed cadence, scanning for error signatures.
 
-    Skeleton for tiered passive monitoring. Detects error candidates only;
-    pattern matching logic is wired up in a separate issue.
+    When error candidates are found, checks them against known patterns in the
+    error_patterns table. Trusted no-op patterns are silently suppressed;
+    unknown or untrusted patterns are escalated to Claude.
     """
     log.info("Passive log monitor loop started", extra={"instance_id": _instance_id})
 
@@ -469,14 +470,29 @@ async def passive_log_monitor_loop():
                         "components": [c["component"] for c in candidates],
                     },
                 )
-                # Stub: log each candidate for future pattern matching engine
-                for c in candidates:
+
+                # Pattern matching: check candidates against known patterns
+                from maki_immune.patterns import check_candidates
+
+                suppressed, to_escalate = await check_candidates(_nc, candidates)
+
+                if suppressed:
                     log.info(
-                        "Error candidate detected",
+                        "Suppressed known no-op patterns",
+                        extra={
+                            "count": len(suppressed),
+                            "components": [c["component"] for c in suppressed],
+                        },
+                    )
+
+                for c in to_escalate:
+                    log.info(
+                        "Escalating error candidate",
                         extra={
                             "component": c["component"],
                             "pod": c["pod"],
                             "signatures": c["signatures"],
+                            "reason": c.get("reason", "unknown"),
                         },
                     )
             # No-error runs are fully silent — no logging

@@ -44,6 +44,8 @@ from maki_common.subjects import (
     EARS_OUT,
     IMMUNE_STATE_REQUEST,
     MEMORY_STORE,
+    PATTERN_QUERY,
+    PATTERN_UPDATE,
     TRADING_CLOSE,
     TRADING_OUTCOME,
     TRADING_SIGNAL,
@@ -710,6 +712,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_memory_store_listener())
     asyncio.create_task(_config_sync_listener())
     asyncio.create_task(_db_query_listener())
+    asyncio.create_task(_pattern_query_listener())
+    asyncio.create_task(_pattern_update_listener())
     asyncio.create_task(_trading_signal_listener())
     asyncio.create_task(_trading_outcome_listener())
     asyncio.create_task(_trading_close_listener())
@@ -1087,6 +1091,88 @@ async def _db_query_listener():
                 await msg.respond(json.dumps(mcp_result("DB query failed — check logs.")).encode())
             except Exception:
                 pass
+
+
+async def _pattern_query_listener():
+    """Serve error_patterns queries for immune's passive loop.
+
+    Returns JSON list of patterns for a given component.
+    """
+    sub = await _nc.subscribe(PATTERN_QUERY)
+    log.info("Subscribed", extra={"subject": PATTERN_QUERY})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            component = data.get("component", "")
+
+            if not component or not _db_pool:
+                await msg.respond(json.dumps({"patterns": []}).encode())
+                continue
+
+            async with _db_pool.acquire() as conn:
+                rows = await asyncio.wait_for(
+                    conn.fetch(
+                        "SELECT id, component, pattern, classification, confidence, "
+                        "occurrence_count, notes "
+                        "FROM error_patterns WHERE component = $1",
+                        component,
+                    ),
+                    timeout=5.0,
+                )
+
+            patterns = [
+                {
+                    "id": str(row["id"]),
+                    "component": row["component"],
+                    "pattern": row["pattern"],
+                    "classification": row["classification"],
+                    "confidence": row["confidence"],
+                    "occurrence_count": row["occurrence_count"],
+                    "notes": row["notes"],
+                }
+                for row in rows
+            ]
+
+            await msg.respond(json.dumps({"patterns": patterns}).encode())
+
+        except Exception:
+            log.exception("Pattern query error")
+            try:
+                await msg.respond(json.dumps({"patterns": []}).encode())
+            except Exception:
+                pass
+
+
+async def _pattern_update_listener():
+    """Handle fire-and-forget updates to error_patterns from immune.
+
+    Supports bumping occurrence_count/confidence/last_seen_at for known patterns.
+    """
+    sub = await _nc.subscribe(PATTERN_UPDATE)
+    log.info("Subscribed", extra={"subject": PATTERN_UPDATE})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            pattern_id = data.get("id")
+            confidence_delta = data.get("confidence_delta", 0.0)
+            if not pattern_id or not _db_pool:
+                continue
+
+            async with _db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE error_patterns "
+                    "SET occurrence_count = occurrence_count + 1, "
+                    "    confidence = LEAST(confidence + $1, 1.0), "
+                    "    last_seen_at = now() "
+                    "WHERE id = $2",
+                    confidence_delta,
+                    uuid.UUID(pattern_id),
+                )
+
+            log.debug("Pattern stats updated", extra={"pattern_id": pattern_id})
+
+        except Exception:
+            log.exception("Pattern update error")
 
 
 async def _trading_signal_listener():

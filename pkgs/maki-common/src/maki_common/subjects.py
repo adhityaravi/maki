@@ -48,3 +48,7 @@ TRADING_TOOL_REQUEST = "maki.trading.tool"
 
 # Generic DB query
 DB_QUERY = "maki.db.query"
+
+# Error pattern matching (immune ↔ stem)
+PATTERN_QUERY = "maki.immune.pattern.query"
+PATTERN_UPDATE = "maki.immune.pattern.update"
