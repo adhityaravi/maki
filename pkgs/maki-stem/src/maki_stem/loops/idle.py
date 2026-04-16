@@ -308,4 +308,5 @@ IDLE_LOOP_SPEC = LoopSpec(
     pre_claim_guard=_idle_pre_claim_guard,
     should_run=_idle_should_run,
     body=_idle_body,
+    model="claude-opus-4-7",
 )

@@ -336,5 +336,5 @@ WORK_LOOP_SPEC = LoopSpec(
     pre_claim_guard=_work_pre_claim_guard,
     should_run=_work_should_run,
     body=_work_body,
-    model="claude-opus-4-6",
+    model="claude-opus-4-7",
 )
