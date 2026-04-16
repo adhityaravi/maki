@@ -169,6 +169,17 @@ If you restart or rollback cortex, ALWAYS restart stem too — otherwise stem wi
 waiting for responses from a cortex that forgot about them. Stem's heartbeat watcher should \
 self-heal, but restart it anyway to be safe.
 
+## Loop Health
+
+Stem runs two background loops. Their last successful run timestamps appear in your metrics \
+under "Loop Heartbeats":
+- **idle**: reflection loop, fires every 4h. Stale if last ran >6h ago.
+- **work**: issue execution loop, fires daily at 03:00. Stale if last ran >26h ago.
+
+If a loop is stale, escalate — it may be drifted (lock consumed outside the cron window), \
+crashing silently, or starved by a stuck lock. Do not self-heal loops by restarting stem \
+unless you're sure — stem restart drops in-flight turns. Alert first.
+
 ## Hive Awareness
 
 You are not one instance — you are one immune system spanning multiple sites. Each site has its \
@@ -591,6 +602,7 @@ async def main():
     asyncio.create_task(health_mod.health_monitor_loop())
     asyncio.create_task(claude_mod.immune_heartbeat_loop())
     asyncio.create_task(claude_mod.passive_log_monitor_loop())
+    asyncio.create_task(claude_mod.loop_heartbeat_watcher())
     asyncio.create_task(health_mod.cortex_heartbeat_listener())
     asyncio.create_task(health_mod.token_usage_listener())
     asyncio.create_task(health_mod.gossip_publisher())

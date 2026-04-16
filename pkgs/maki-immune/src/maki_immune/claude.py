@@ -42,6 +42,7 @@ _publish_vitals: Any = None
 _publish_immune_response: Any = None
 _k8s_v1: Any = None
 _lock_kv: Any = None
+_loop_heartbeats: dict[str, float] = {}  # name -> last successful run timestamp
 
 # Error signatures for passive log monitoring
 _ERROR_SIGNATURES = re.compile(r"ERROR|EXCEPTION|Traceback|panic|FATAL|RuntimeError|CrashLoopBackOff")
@@ -179,6 +180,15 @@ def _build_system_state() -> str:
                     lines.append(f"  - {dep}: {tag}{drift}")
     else:
         lines.append(f"\n## Hive State (no peers connected, local site: {_site_name})")
+
+    if _loop_heartbeats:
+        lines.append("\n## Loop Heartbeats")
+        now = time.time()
+        for name, ts in sorted(_loop_heartbeats.items()):
+            age_h = round((now - ts) / 3600, 1)
+            lines.append(f"- loop.{name}: last ran {age_h}h ago")
+    else:
+        lines.append("\n## Loop Heartbeats\n- No heartbeats recorded yet (loops haven't fired or pod restarted)")
 
     return "\n".join(lines)
 
@@ -337,6 +347,37 @@ Also use [DIGEST:...] for anything that should go to #maki-vitals."""
 
     except Exception:
         log.exception("Immune command handler error")
+
+
+# --- Loop Heartbeat Watcher ---
+
+
+async def loop_heartbeat_watcher() -> None:
+    """Poll the shared lock KV for loop heartbeat timestamps and cache them locally.
+
+    Stem writes loop.heartbeat.{name} after each successful body execution.
+    We read these periodically so _build_system_state can surface loop health
+    to Claude without blocking on async KV reads inside the sync state builder.
+    """
+    global _loop_heartbeats
+    log.info("Loop heartbeat watcher started")
+    while True:
+        await asyncio.sleep(60)
+        if _lock_kv is None:
+            continue
+        try:
+            keys = await _lock_kv.keys()
+            for key in keys or []:
+                if not key.startswith("loop.heartbeat."):
+                    continue
+                name = key.removeprefix("loop.heartbeat.")
+                try:
+                    entry = await _lock_kv.get(key)
+                    _loop_heartbeats[name] = float(entry.value.decode())
+                except Exception:
+                    pass
+        except Exception:
+            log.warning("Failed to read loop heartbeats from KV")
 
 
 # --- Immune Heartbeat Loop ---

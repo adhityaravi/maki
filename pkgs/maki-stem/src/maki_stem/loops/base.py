@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
 from croniter import croniter
-from maki_common import load_kv_config, try_claim_loop
+from maki_common import kv_put_float, load_kv_config, try_claim_loop
 
 log = logging.getLogger(__name__)
 
@@ -159,5 +160,9 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
             if not await spec.should_run(config, ctx):
                 continue
             await spec.body(spec, config, ctx)
+            try:
+                await kv_put_float(ctx.lock_kv, f"loop.heartbeat.{spec.name}", time.time())
+            except Exception:
+                log.warning("Failed to write loop heartbeat", extra={"loop": spec.name})
         except Exception:
             log.exception("Error in loop", extra={"loop": spec.name})
