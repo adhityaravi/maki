@@ -46,15 +46,16 @@ from maki_common.subjects import (
     MEMORY_STORE,
     PATTERN_QUERY,
     PATTERN_UPDATE,
-    TRADING_CLOSE,
-    TRADING_OUTCOME,
-    TRADING_SIGNAL,
-    TRADING_TOOL_REQUEST,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
 
 from maki_stem.loops import IDLE_LOOP_SPEC, WORK_LOOP_SPEC, LoopSpec, StemContext, _run_loop
+from maki_stem.trading import (
+    trading_manual_listener,
+    trading_signal_listener,
+    trading_tool_listener,
+)
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -714,10 +715,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_db_query_listener())
     asyncio.create_task(_pattern_query_listener())
     asyncio.create_task(_pattern_update_listener())
-    asyncio.create_task(_trading_signal_listener())
-    asyncio.create_task(_trading_outcome_listener())
-    asyncio.create_task(_trading_close_listener())
-    asyncio.create_task(_trading_tool_listener())
+    asyncio.create_task(trading_signal_listener(_nc, _db_pool))
+    asyncio.create_task(trading_manual_listener(_nc, _lock_kv))
+    asyncio.create_task(trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools))
     ctx = StemContext(
         nc=_nc,
         js=_js,
@@ -1173,163 +1173,6 @@ async def _pattern_update_listener():
 
         except Exception:
             log.exception("Pattern update error")
-
-
-async def _trading_signal_listener():
-    """Persist accepted trade signals to maki-vault (PostgreSQL).
-
-    Subscribes to TRADING_SIGNAL, published by the trading loop after a
-    proposal is accepted. Inserts into the trade_signals table.
-    """
-    sub = await _nc.subscribe(TRADING_SIGNAL)
-    log.info("Subscribed", extra={"subject": TRADING_SIGNAL})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-
-            # Map direction: buy→long, sell→short
-            direction = data.get("direction", "")
-            db_direction = "long" if direction == "buy" else "short"
-
-            async with _db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO trade_signals (
-                        trade_id, asset, asset_type, direction, entry_price,
-                        position_size_pct, composite_score,
-                        sentiment_score, indicator_snapshot,
-                        paper, status, accepted_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'accepted', now())
-                    """,
-                    data.get("trade_id"),
-                    data.get("asset"),
-                    data.get("asset_type", "crypto"),
-                    db_direction,
-                    float(data.get("entry_price", 0)),
-                    float(data.get("position_size_eur", 0) or data.get("position_size_pct", 0)),
-                    float(data.get("composite_score", 0)),
-                    float(data.get("sentiment_score", 0)) if data.get("sentiment_score") is not None else None,
-                    json.dumps(data.get("indicator_snapshot")) if data.get("indicator_snapshot") else None,
-                    data.get("paper", True),
-                )
-            log.info(
-                "Trade signal persisted",
-                extra={"trade_id": data.get("trade_id"), "asset": data.get("asset")},
-            )
-        except Exception:
-            log.exception("Failed to persist trade signal")
-
-
-async def _trading_outcome_listener():
-    """Persist trade outcomes to maki-vault (PostgreSQL).
-
-    Subscribes to TRADING_OUTCOME, published by the close_trade function.
-    Looks up the corresponding trade_signals row by trade_id and inserts
-    into trade_outcomes.
-    """
-    sub = await _nc.subscribe(TRADING_OUTCOME)
-    log.info("Subscribed", extra={"subject": TRADING_OUTCOME})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            trade_id = data.get("trade_id", "")
-
-            async with _db_pool.acquire() as conn:
-                # Find the signal UUID from trade_id
-                row = await conn.fetchrow(
-                    "SELECT id FROM trade_signals WHERE trade_id = $1",
-                    trade_id,
-                )
-                if row is None:
-                    log.warning(
-                        "No trade_signals row for outcome — inserting orphan-safe",
-                        extra={"trade_id": trade_id},
-                    )
-                    continue
-
-                signal_id = row["id"]
-                await conn.execute(
-                    """
-                    INSERT INTO trade_outcomes (signal_id, outcome, exit_price, pnl_pct, pnl_eur)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    signal_id,
-                    data.get("outcome", "manual"),
-                    float(data.get("exit_price", 0)),
-                    float(data.get("pnl_pct", 0)) if data.get("pnl_pct") is not None else None,
-                    float(data.get("pnl_eur", 0)) if data.get("pnl_eur") is not None else None,
-                )
-            log.info(
-                "Trade outcome persisted",
-                extra={"trade_id": trade_id, "outcome": data.get("outcome")},
-            )
-        except Exception:
-            log.exception("Failed to persist trade outcome")
-
-
-async def _trading_close_listener():
-    """Handle trade close commands from ears (Discord close button/modal).
-
-    Subscribes to TRADING_CLOSE, calls close_trade from the trading loop
-    outcome module to compute P&L, update stats, and publish results.
-    """
-    from maki_loops.trading.outcome import close_trade
-
-    sub = await _nc.subscribe(TRADING_CLOSE, queue="stem")
-    log.info("Subscribed", extra={"subject": TRADING_CLOSE})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            symbol = data.get("symbol", "")
-            exit_price = float(data.get("exit_price", 0))
-            if not symbol or not exit_price:
-                log.warning("Invalid close payload: %s", data)
-                continue
-            result = await close_trade(_lock_kv, _nc, symbol, exit_price)
-            if result is None:
-                log.warning("No open trade found for %s", symbol)
-            else:
-                log.info(
-                    "Trade closed via Discord",
-                    extra={"trade_id": result.trade_id, "symbol": symbol, "pnl_eur": result.pnl_eur},
-                )
-        except Exception:
-            log.exception("Failed to process trade close")
-
-
-async def _trading_tool_listener():
-    """Handle trading tool requests from cortex via NATS request/reply.
-
-    Priority: loop-specific registry (live market context) > permanent tools (KV reads).
-    """
-    sub = await _nc.subscribe(TRADING_TOOL_REQUEST)
-    log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            tool_name = data.get("tool_name", "")
-            tool_args = data.get("tool_args", {})
-            handler = _trading_tool_registry.get(tool_name) or _permanent_trading_tools.get(tool_name)
-            if handler:
-                result = await handler(tool_args)
-                await msg.respond(json.dumps(result).encode())
-            else:
-                from maki_common.tools.utils import mcp_result
-
-                all_tools = set(_trading_tool_registry) | set(_permanent_trading_tools)
-                if all_tools:
-                    available = ", ".join(sorted(all_tools))
-                    result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
-                    await msg.respond(json.dumps(result).encode())
-                # else: no tools on this instance — stay silent
-        except Exception:
-            log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
-            try:
-                from maki_common.tools.utils import mcp_result
-
-                await msg.respond(json.dumps(mcp_result("Internal tool error")).encode())
-            except Exception:
-                pass
 
 
 @app.get("/health")

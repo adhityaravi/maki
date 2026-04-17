@@ -1,0 +1,206 @@
+"""Trading-specific NATS listeners for maki-stem.
+
+Keeps trade signal persistence, ``!trade`` command handling, and cortex
+tool dispatch out of ``main.py``. Dependencies (NATS connection, DB pool,
+KV handles, tool registries) are passed in by the caller rather than
+pulled from module globals, mirroring ``maki_ears.trading``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+from maki_common.subjects import (
+    EARS_OUT,
+    TRADING_MANUAL_TRADE,
+    TRADING_SIGNAL,
+    TRADING_TOOL_REQUEST,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ── Trade signal persistence ─────────────────────────────────────────────────
+
+
+async def trading_signal_listener(nc, db_pool) -> None:
+    """Persist accepted trade signals to maki-vault (PostgreSQL).
+
+    Subscribes to TRADING_SIGNAL, published by the trading loop after a
+    proposal is accepted. Inserts into the ``trade_signals`` table.
+    """
+    sub = await nc.subscribe(TRADING_SIGNAL)
+    log.info("Subscribed", extra={"subject": TRADING_SIGNAL})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+
+            # Map direction: buy→long, sell→short
+            direction = data.get("direction", "")
+            db_direction = "long" if direction == "buy" else "short"
+
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO trade_signals (
+                        trade_id, asset, asset_type, direction, entry_price,
+                        position_size_pct, composite_score,
+                        sentiment_score, indicator_snapshot,
+                        paper, status, accepted_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'accepted', now())
+                    """,
+                    data.get("trade_id"),
+                    data.get("asset"),
+                    data.get("asset_type", "crypto"),
+                    db_direction,
+                    float(data.get("entry_price", 0)),
+                    float(data.get("position_size_eur", 0) or data.get("position_size_pct", 0)),
+                    float(data.get("composite_score", 0)),
+                    float(data.get("sentiment_score", 0)) if data.get("sentiment_score") is not None else None,
+                    json.dumps(data.get("indicator_snapshot")) if data.get("indicator_snapshot") else None,
+                    data.get("paper", True),
+                )
+            log.info(
+                "Trade signal persisted",
+                extra={"trade_id": data.get("trade_id"), "asset": data.get("asset")},
+            )
+        except Exception:
+            log.exception("Failed to persist trade signal")
+
+
+# ── !trade command dispatch ──────────────────────────────────────────────────
+
+
+async def trading_manual_listener(nc, lock_kv) -> None:
+    """Handle ``!trade`` commands from ears.
+
+    ADDCASH grows the seed via :func:`maki_loops.trading.capital.add_cash`;
+    BUY/SELL are parsed and appended to the trade book via
+    :func:`maki_loops.trading.book.append_trade`. Acks are published back
+    to EARS_OUT so Discord can display them.
+    """
+    from maki_loops.trading.book import append_trade
+    from maki_loops.trading.capital import add_cash
+    from maki_loops.trading.manual import parse_trade_command
+
+    sub = await nc.subscribe(TRADING_MANUAL_TRADE, queue="stem")
+    log.info("Subscribed", extra={"subject": TRADING_MANUAL_TRADE})
+
+    async def _ack(text: str) -> None:
+        try:
+            await nc.publish(
+                EARS_OUT,
+                json.dumps({"text": text, "turn_id": "trading-manual"}).encode(),
+            )
+        except Exception:
+            log.warning("Failed to publish manual-trade ack", exc_info=True)
+
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            command = (data.get("command") or "").strip()
+            tokens = command.split()
+            if len(tokens) < 2:
+                continue
+            verb = tokens[1].upper()
+
+            if verb == "ADDCASH":
+                if len(tokens) < 3:
+                    await _ack("❌ ADDCASH: missing amount")
+                    continue
+                try:
+                    amount = float(tokens[2])
+                except ValueError:
+                    await _ack(f"❌ ADDCASH: invalid amount `{tokens[2]}`")
+                    continue
+                try:
+                    new_seed = await add_cash(lock_kv, amount)
+                except ValueError as exc:
+                    await _ack(f"❌ ADDCASH: {exc}")
+                    continue
+                log.info(
+                    "Capital added",
+                    extra={"amount_eur": amount, "new_seed": new_seed},
+                )
+                await _ack(f"💰 +€{amount:.2f} — seed now €{new_seed:.2f}")
+                continue
+
+            # BUY / SELL — parse via manual module, append to book if priced
+            try:
+                trade = parse_trade_command(command)
+            except ValueError as exc:
+                await _ack(f"❌ {exc}")
+                continue
+
+            if trade.price is None:
+                await _ack(
+                    f"⚠️ {trade.direction.name} {trade.symbol} logged without price — "
+                    "not appended to book (price required)"
+                )
+                continue
+
+            await append_trade(
+                lock_kv,
+                trade.symbol,
+                direction=trade.direction.value,
+                price=trade.price,
+                size_eur=trade.amount_eur,
+            )
+            log.info(
+                "Manual trade appended to book",
+                extra={
+                    "symbol": trade.symbol,
+                    "direction": trade.direction.value,
+                    "amount_eur": trade.amount_eur,
+                    "price": trade.price,
+                },
+            )
+            emoji = "🟢" if trade.direction.name == "BUY" else "🔴"
+            await _ack(
+                f"{emoji} **{trade.direction.name}** {trade.symbol} "
+                f"€{trade.amount_eur:.2f} @ €{trade.price:.2f} — booked"
+            )
+        except Exception:
+            log.exception("Failed to process manual trade command")
+
+
+# ── Cortex tool dispatch ─────────────────────────────────────────────────────
+
+
+async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) -> None:
+    """Handle trading tool requests from cortex via NATS request/reply.
+
+    Priority: loop-specific registry (live market context) over permanent
+    tools (read-only KV). Both dicts are passed by reference so that the
+    trading loop can mutate ``tool_registry`` mid-run to publish
+    context-scoped tools.
+    """
+    sub = await nc.subscribe(TRADING_TOOL_REQUEST)
+    log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            tool_name = data.get("tool_name", "")
+            tool_args = data.get("tool_args", {})
+            handler = tool_registry.get(tool_name) or permanent_tools.get(tool_name)
+            if handler:
+                result = await handler(tool_args)
+                await msg.respond(json.dumps(result).encode())
+            else:
+                from maki_common.tools.utils import mcp_result
+
+                all_tools = set(tool_registry) | set(permanent_tools)
+                if all_tools:
+                    available = ", ".join(sorted(all_tools))
+                    result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
+                    await msg.respond(json.dumps(result).encode())
+                # else: no tools on this instance — stay silent
+        except Exception:
+            log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
+            try:
+                from maki_common.tools.utils import mcp_result
+
+                await msg.respond(json.dumps(mcp_result("Internal tool error")).encode())
+            except Exception:
+                pass

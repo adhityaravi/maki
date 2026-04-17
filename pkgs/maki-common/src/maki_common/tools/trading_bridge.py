@@ -29,9 +29,8 @@ Available trading analysis tools (call via trading_tool):
 - get_price_action(symbol, lookback_days): Get OHLCV summary. lookback_days: 1–30 (default 10).
 - compute_support_resistance(symbol): Compute key support/resistance levels from daily candles.
 - check_correlation(symbol1, symbol2): Check price return correlation between two symbols.
-- get_open_positions(): List all currently open trading positions.
 - get_trade_history(symbol): Get Kelly win/loss statistics for a symbol.
-- get_portfolio_summary(): Overall portfolio value, deployed %, and open position count.
+- get_trade_book(symbol): Full trade book with entries and computed position (units, avg cost, P&L).
 - get_watchlist(): Current trading watchlist (crypto, EU stocks, US stocks).
 - add_watchlist_symbol(symbol, category): Add a symbol. category: crypto, eu_stocks, us_stocks.
 - remove_watchlist_symbol(symbol, category): Remove a symbol from the watchlist."""

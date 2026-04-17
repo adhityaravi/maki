@@ -15,14 +15,17 @@ from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
-    EARS_INTERACTION,
     EARS_OUT,
     EARS_SEARCH,
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
-    TRADING_CLOSE,
-    TRADING_MANUAL_TRADE,
+)
+
+from maki_ears.trading import (
+    TradeProposalView,
+    handle_trade_command,
+    handle_trade_interaction,
 )
 
 configure_logging()
@@ -179,66 +182,9 @@ class MakiDiscordClient(discord.Client):
         return {"ok": True, "messages": hits, "total_results": data.get("total_results", len(hits))}
 
     async def on_interaction(self, interaction: discord.Interaction):
-        """Handle trade button clicks and close modals.
-
-        Uses on_interaction (not view callbacks) so buttons survive ears
-        restarts — Discord resends the interaction regardless of in-memory
-        view state.
-        """
-        if interaction.type not in (
-            discord.InteractionType.component,
-            discord.InteractionType.modal_submit,
-        ):
+        """Route Discord component interactions to their feature handlers."""
+        if await handle_trade_interaction(interaction, _nc):
             return
-
-        custom_id = (interaction.data or {}).get("custom_id", "")
-
-        # Close button → open modal for exit price
-        if custom_id.startswith("trade_close:"):
-            symbol = custom_id.split(":", 1)[1]
-            await interaction.response.send_modal(_TradeCloseModal(symbol))
-            return
-
-        # Accept / Skip buttons — format: trade:{proposal_id}:{symbol}:{action}
-        if not custom_id.startswith("trade:"):
-            return
-        parts = custom_id.split(":")
-        if len(parts) != 4:
-            return
-        _, proposal_id, symbol, action = parts
-
-        await interaction.response.defer()
-
-        if action == "accept":
-            close_view = _TradeCloseView(symbol)
-            try:
-                await interaction.message.edit(
-                    content=interaction.message.content + f"\n\n_✅ Accepted by {interaction.user.name}_",
-                    view=close_view,
-                )
-            except Exception:
-                log.warning("Failed to edit proposal message", exc_info=True)
-        else:
-            try:
-                await interaction.message.edit(
-                    content=interaction.message.content + f"\n\n_⏭️ Skipped by {interaction.user.name}_",
-                    view=None,
-                )
-            except Exception:
-                log.warning("Failed to edit proposal message", exc_info=True)
-
-        if _nc:
-            subject = f"{EARS_INTERACTION}.{proposal_id}"
-            payload = {
-                "proposal_id": proposal_id,
-                "action": action,
-                "user": str(interaction.user.name),
-            }
-            await _nc.publish(subject, json.dumps(payload).encode())
-            log.info(
-                "Trade interaction published",
-                extra={"proposal_id": proposal_id, "action": action},
-            )
 
     async def on_message(self, message: discord.Message):
         if message.author == self.user:
@@ -276,7 +222,7 @@ class MakiDiscordClient(discord.Client):
 
         # !trade command — manual trade log, bypass cortex
         if content.lower().startswith("!trade"):
-            await _handle_trade_command(message, content)
+            await handle_trade_command(message, content, _nc, _dedup_kv)
             return
 
         # !loop command — trigger loop, immediate ack, no typing indicator
@@ -350,97 +296,6 @@ class MakiDiscordClient(discord.Client):
                 await message.remove_reaction(thinking_emoji, self.user)
             except Exception:
                 pass
-
-
-class _TradeProposalView(discord.ui.View):
-    """Button view for trade proposals.
-
-    ``timeout=None`` keeps buttons alive for the full 60-min collection
-    window.  Interaction handling lives in ``MakiDiscordClient.on_interaction``
-    (not in button callbacks) so clicks also work after ears restarts.
-    """
-
-    def __init__(self, proposal_id: str, symbol: str, direction: str = "buy") -> None:
-        super().__init__(timeout=None)
-        if direction == "buy":
-            label, style = "🟢 Buy", discord.ButtonStyle.success
-        else:
-            label, style = "🔴 Sell", discord.ButtonStyle.danger
-        self.add_item(
-            discord.ui.Button(
-                label=label,
-                custom_id=f"trade:{proposal_id}:{symbol}:accept",
-                style=style,
-            )
-        )
-        self.add_item(
-            discord.ui.Button(
-                label="⏭️ Skip",
-                custom_id=f"trade:{proposal_id}:{symbol}:skip",
-                style=discord.ButtonStyle.secondary,
-            )
-        )
-
-
-class _TradeCloseView(discord.ui.View):
-    """Replaces proposal buttons after acceptance — shows a Close button."""
-
-    def __init__(self, symbol: str) -> None:
-        super().__init__(timeout=None)
-        self.add_item(
-            discord.ui.Button(
-                label="📊 Close Position",
-                custom_id=f"trade_close:{symbol}",
-                style=discord.ButtonStyle.primary,
-            )
-        )
-
-
-class _TradeCloseModal(discord.ui.Modal):
-    """Modal popup for entering the exit price when closing a trade."""
-
-    exit_price = discord.ui.TextInput(
-        label="Exit Price",
-        placeholder="e.g. 86200",
-        required=True,
-        max_length=20,
-    )
-
-    def __init__(self, symbol: str) -> None:
-        super().__init__(title=f"Close {symbol}")
-        self.symbol = symbol
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            price = float(self.exit_price.value)
-            if price <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("Invalid price.", ephemeral=True)
-            return
-
-        if _nc:
-            payload = {
-                "symbol": self.symbol,
-                "exit_price": price,
-                "username": str(interaction.user.name),
-            }
-            await _nc.publish(TRADING_CLOSE, json.dumps(payload).encode())
-            log.info(
-                "Trade close via modal",
-                extra={"symbol": self.symbol, "exit_price": price},
-            )
-
-        await interaction.response.send_message(f"⏳ Closing **{self.symbol}** @ {price}...", ephemeral=True)
-
-        # Disable the close button so it can't be clicked again
-        try:
-            await interaction.message.edit(
-                content=interaction.message.content + f"\n\n_📊 Closed by {interaction.user.name} @ {price}_",
-                view=None,
-            )
-        except Exception:
-            log.warning("Failed to disable close button", exc_info=True)
 
 
 async def _handle_immune_command(message: discord.Message, content: str):
@@ -527,123 +382,6 @@ async def _handle_loop_command(message: discord.Message, content: str) -> None:
     await message.channel.send(f"⏳ Triggering **{loop_name}** loop...")
 
 
-async def _handle_trade_close(message: discord.Message, content: str) -> None:
-    """Handle ``!trade CLOSE SYMBOL @ PRICE`` — forward close request to the trading loop.
-
-    Format::
-
-        !trade CLOSE {SYMBOL} @ {PRICE}
-
-    Ears validates the shape and publishes to ``maki.trading.close``.  The
-    orchestrator loop handles the actual P&L computation and Discord reply.
-    """
-    _USAGE = "Usage: `!trade CLOSE {SYMBOL} @ {PRICE}`\nExample: `!trade CLOSE BTC/EUR @ 86200`"
-
-    tokens = content.strip().split()
-    # minimum: !trade CLOSE SYMBOL @ PRICE = 5 tokens
-    if len(tokens) < 5 or tokens[3] != "@":
-        await message.channel.send(f"❌ Invalid close format.\n{_USAGE}")
-        return
-
-    symbol = tokens[2].upper()
-    try:
-        exit_price = float(tokens[4])
-        if exit_price <= 0:
-            raise ValueError
-    except ValueError:
-        await message.channel.send(f"❌ Price must be a positive number, got `{tokens[4]}`.\n{_USAGE}")
-        return
-
-    payload = {
-        "symbol": symbol,
-        "exit_price": exit_price,
-        "message_id": str(message.id),
-        "username": message.author.name,
-    }
-    try:
-        await _nc.publish(TRADING_CLOSE, json.dumps(payload).encode())
-        log.info("Trade close published", extra={"symbol": symbol, "exit_price": exit_price})
-    except Exception:
-        log.exception("Failed to publish trade close command")
-        await message.channel.send("❌ Failed to record close — NATS unavailable.")
-        return
-
-    await message.channel.send(f"⏳ Closing **{symbol}** @ {exit_price} — processing...")
-
-
-async def _handle_trade_command(message: discord.Message, content: str) -> None:
-    """Handle a ``!trade`` command — validate, dedup, and forward to the trading loop.
-
-    Formats::
-
-        !trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE...]
-        !trade CLOSE {SYMBOL} @ {PRICE}
-
-    Ears does minimal inline validation to give immediate Discord feedback.
-    Full canonical parsing lives in maki-loops ``manual`` and ``outcome`` modules.
-    """
-    msg_key = f"msg.{message.id}"
-    try:
-        await _dedup_kv.create(msg_key, b"1")
-    except Exception:
-        log.info("Dedup: trade command already claimed", extra={"message_id": str(message.id)})
-        return
-
-    _USAGE = (
-        "Usage: `!trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE]`\n       `!trade CLOSE {SYMBOL} @ {PRICE}`"
-    )
-
-    tokens = content.strip().split()
-    if len(tokens) < 3:
-        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
-        return
-
-    direction = tokens[1].upper()
-
-    # Route CLOSE to its own handler
-    if direction == "CLOSE":
-        await _handle_trade_close(message, content)
-        return
-
-    # BUY / SELL path requires at least 4 tokens (!trade direction symbol amount)
-    if len(tokens) < 4:
-        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
-        return
-
-    if direction not in ("BUY", "SELL"):
-        await message.channel.send(f"❌ Direction must be `BUY`, `SELL`, or `CLOSE`, got `{tokens[1]}`.\n{_USAGE}")
-        return
-
-    try:
-        amount_eur = float(tokens[3])
-        if amount_eur <= 0:
-            raise ValueError
-    except ValueError:
-        await message.channel.send(f"❌ Amount must be a positive number, got `{tokens[3]}`.\n{_USAGE}")
-        return
-
-    symbol = tokens[2].upper()
-    payload = {
-        "command": content,
-        "username": message.author.name,
-        "message_id": str(message.id),
-    }
-
-    try:
-        await _nc.publish(TRADING_MANUAL_TRADE, json.dumps(payload).encode())
-        log.info(
-            "Trade command published",
-            extra={"symbol": symbol, "direction": direction, "amount_eur": amount_eur},
-        )
-    except Exception:
-        log.exception("Failed to publish trade command")
-        await message.channel.send("❌ Failed to record trade — NATS unavailable.")
-        return
-
-    direction_emoji = "🟢" if direction == "BUY" else "🔴"
-    await message.channel.send(f"{direction_emoji} **{direction}** {symbol} €{amount_eur:.2f} — logged")
-
-
 async def _handle_search_request(msg) -> None:
     """Process one Discord history search request and reply via NATS."""
     try:
@@ -726,7 +464,8 @@ async def _out_listener():
                 if _bot and not _bot.is_closed():
                     direction = data.get("direction", "buy")
                     symbol = data.get("symbol", "")
-                    view = _TradeProposalView(proposal_id, symbol, direction)
+                    entry_price = float(data.get("entry_price") or 0.0)
+                    view = TradeProposalView(proposal_id, symbol, direction, entry_price)
                     target_ids = _trading_channel_ids or _general_channel_ids
                     for channel_id in target_ids:
                         channel = _bot.get_channel(channel_id)
