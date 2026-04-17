@@ -24,14 +24,20 @@ _TOOL_TIMEOUT = 15.0  # seconds
 # Tool descriptions exposed to Claude in the system prompt
 TRADING_TOOL_DESCRIPTIONS = """\
 Available trading analysis tools (call via trading_tool):
+
+Portfolio & book (always on, read-only):
+- get_portfolio_summary(): Seed, realised P&L, total pot, deployed, available, open position count.
+- get_open_positions(): Currently-held positions with units, avg cost, and realised P&L per symbol.
+- get_trade_book(symbol): Full trade book with entries and computed position (units, avg cost, P&L).
+- get_watchlist(): Current trading watchlist (crypto, EU stocks, US stocks).
+
+Live analysis (only during a trading loop run):
 - fetch_news(symbol): Get recent headlines for a symbol from Finnhub.
 - search_market_news(category): Get general market news. Categories: general, crypto, forex, merger.
 - get_price_action(symbol, lookback_days): Get OHLCV summary. lookback_days: 1–30 (default 10).
 - compute_support_resistance(symbol): Compute key support/resistance levels from daily candles.
 - check_correlation(symbol1, symbol2): Check price return correlation between two symbols.
-- get_trade_history(symbol): Get Kelly win/loss statistics for a symbol.
-- get_trade_book(symbol): Full trade book with entries and computed position (units, avg cost, P&L).
-- get_watchlist(): Current trading watchlist (crypto, EU stocks, US stocks).
+- get_trade_history(symbol): Kelly win/loss statistics for a symbol.
 - add_watchlist_symbol(symbol, category): Add a symbol. category: crypto, eu_stocks, us_stocks.
 - remove_watchlist_symbol(symbol, category): Remove a symbol from the watchlist."""
 

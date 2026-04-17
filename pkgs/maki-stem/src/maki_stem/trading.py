@@ -175,6 +175,13 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
     tools (read-only KV). Both dicts are passed by reference so that the
     trading loop can mutate ``tool_registry`` mid-run to publish
     context-scoped tools.
+
+    A tool request fans out to every stem pod in the mesh; only the pod
+    that actually has the handler responds. Pods without the tool stay
+    silent so the requester doesn't see a fast "unknown tool" error from
+    one pod win the race against the real answer from another. If no pod
+    has the tool, the requester's NATS request times out — that's fine
+    and correct.
     """
     sub = await nc.subscribe(TRADING_TOOL_REQUEST)
     log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
@@ -184,18 +191,10 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
             tool_name = data.get("tool_name", "")
             tool_args = data.get("tool_args", {})
             handler = tool_registry.get(tool_name) or permanent_tools.get(tool_name)
-            if handler:
-                result = await handler(tool_args)
-                await msg.respond(json.dumps(result).encode())
-            else:
-                from maki_common.tools.utils import mcp_result
-
-                all_tools = set(tool_registry) | set(permanent_tools)
-                if all_tools:
-                    available = ", ".join(sorted(all_tools))
-                    result = mcp_result(f"Unknown trading tool: {tool_name}. Available: {available}")
-                    await msg.respond(json.dumps(result).encode())
-                # else: no tools on this instance — stay silent
+            if handler is None:
+                continue  # not our tool — another pod will answer, or timeout
+            result = await handler(tool_args)
+            await msg.respond(json.dumps(result).encode())
         except Exception:
             log.exception("Trading tool error", extra={"tool_name": data.get("tool_name", "?")})
             try:
