@@ -47,6 +47,11 @@ spec:
               mountPath: /etc/maki-github
               readOnly: true
           env:
+            - name: TZ
+              # Pod-local TZ drives croniter evaluation; Europe/Berlin is DST-safe
+              # so the trading cron (30 7,22 * * 1-5) lands at TR open and US close
+              # regardless of season.
+              value: "Europe/Berlin"
             - name: NATS_URL
               value: "nats://maki-nerve-nats:4222"
             - name: NATS_TOKEN

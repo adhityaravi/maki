@@ -87,8 +87,8 @@ resource "kubernetes_deployment" "stem" {
           }
         }
         container {
-          name  = "stem"
-          image = "${var.image_registry}/maki-stem:latest"
+          name              = "stem"
+          image             = "${var.image_registry}/maki-stem:latest"
           image_pull_policy = "Always"
           port {
             container_port = 8000
@@ -196,6 +196,21 @@ resource "kubernetes_deployment" "stem" {
                 key  = "password"
               }
             }
+          }
+          env {
+            # Pod-local TZ drives croniter evaluation; Europe/Berlin is DST-safe
+            # so the trading cron (30 7,22 * * 1-5) lands at TR open and US close
+            # regardless of season. Appended to the end of the env list so the
+            # tofu plan shows only an add, not a shift of every subsequent env.
+            name  = "TZ"
+            value = "Europe/Berlin"
+          }
+          env {
+            # Trade proposal cards wait 3h for Adi's decision before timing out.
+            # Default in code is 60 min — too short for the 07:30 CET morning
+            # card to survive Adi's morning routine.
+            name  = "TRADE_PROPOSAL_TIMEOUT"
+            value = "10800"
           }
           startup_probe {
             http_get {
