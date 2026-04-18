@@ -11,13 +11,10 @@ import os
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from maki_common import configure_logging, connect_nats
+from maki_common import configure_logging
 from maki_common.claude import TokenUsage, invoke_claude
-from maki_common.subjects import CORTEX_TOKEN_USAGE
 from pydantic import BaseModel
 
 configure_logging()
@@ -27,37 +24,8 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_QUERIES", "3"))
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
-SITE_NAME = os.environ.get("SITE_NAME", "unknown")
 
-_nc: Any | None = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _nc
-    if NATS_TOKEN:
-        try:
-            # Short timeout so NATS unavailability doesn't block FastAPI startup
-            # and trigger immune health-check rollbacks. Guard on NATS_TOKEN so
-            # we don't burn 5s on a connect guaranteed to fail with auth violation
-            # when the token isn't configured for this deployment.
-            _nc = await asyncio.wait_for(connect_nats(NATS_URL, token=NATS_TOKEN), timeout=5.0)
-            log.info("NATS connected", extra={"url": NATS_URL, "site": SITE_NAME})
-        except Exception:
-            log.warning("NATS unavailable — token usage will not be published to immune")
-    else:
-        log.info("NATS_TOKEN not set — skipping NATS connect, token usage will not be published")
-    yield
-    if _nc:
-        try:
-            await _nc.close()
-        except Exception:
-            pass
-
-
-app = FastAPI(title="maki-synapse", version="0.0.1", lifespan=lifespan)
+app = FastAPI(title="maki-synapse", version="0.0.1")
 
 
 # --- Request / Response models (OpenAI-compatible subset) ---
@@ -185,30 +153,6 @@ def _map_usage(token_usage: TokenUsage) -> Usage:
     )
 
 
-async def _publish_token_usage(request_id: str, token_usage: TokenUsage) -> None:
-    """Publish synapse token usage to NATS so immune can aggregate it."""
-    if _nc is None:
-        return
-    try:
-        payload = {
-            "turn_id": request_id,
-            "timestamp": time.time(),
-            "session_id": "synapse",
-            **token_usage.to_log_dict(),
-        }
-        await _nc.publish(f"{CORTEX_TOKEN_USAGE}.{SITE_NAME}", json.dumps(payload).encode())
-        log.info(
-            "Token usage published",
-            extra={
-                "request_id": request_id,
-                "total_tokens": token_usage.total_tokens,
-                "total_cost_usd": token_usage.total_cost_usd,
-            },
-        )
-    except Exception:
-        log.warning("Failed to publish token usage to NATS", extra={"request_id": request_id})
-
-
 # --- Endpoints ---
 
 
@@ -286,9 +230,7 @@ async def chat_completions(req: ChatCompletionRequest):
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))
 
-    # Map real token usage → OpenAI schema and publish to NATS
     usage = _map_usage(token_usage)
-    await _publish_token_usage(request_id, token_usage)
 
     # Parse response
     message: ResponseMessage
