@@ -46,6 +46,7 @@ from maki_common.subjects import (
     MEMORY_STORE,
     PATTERN_QUERY,
     PATTERN_UPDATE,
+    PATTERN_WRITE,
 )
 from nats.js.api import RetentionPolicy, StorageType
 from pydantic import BaseModel
@@ -715,6 +716,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_db_query_listener())
     asyncio.create_task(_pattern_query_listener())
     asyncio.create_task(_pattern_update_listener())
+    asyncio.create_task(_pattern_write_listener())
     asyncio.create_task(trading_signal_listener(_nc, _db_pool))
     asyncio.create_task(trading_manual_listener(_nc, _lock_kv))
     asyncio.create_task(trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools))
@@ -1173,6 +1175,50 @@ async def _pattern_update_listener():
 
         except Exception:
             log.exception("Pattern update error")
+
+
+async def _pattern_write_listener():
+    """Handle write requests for new error_patterns from immune's Claude escalation.
+
+    Inserts a new classified pattern. Skips silently if the component+pattern already exists.
+    """
+    sub = await _nc.subscribe(PATTERN_WRITE)
+    log.info("Subscribed", extra={"subject": PATTERN_WRITE})
+    async for msg in sub.messages:
+        try:
+            data = json.loads(msg.data.decode())
+            component = data.get("component", "")
+            pattern = data.get("pattern", "")
+            classification = data.get("classification", "escalate")
+            confidence = float(data.get("confidence", 0.5))
+            notes = data.get("notes", "")
+
+            if not component or not pattern or not _db_pool:
+                continue
+
+            async with _db_pool.acquire() as conn:
+                await asyncio.wait_for(
+                    conn.execute(
+                        "INSERT INTO error_patterns "
+                        "(component, pattern, classification, confidence, occurrence_count, notes) "
+                        "VALUES ($1, $2, $3, $4, 1, $5) "
+                        "ON CONFLICT (component, pattern) DO NOTHING",
+                        component,
+                        pattern,
+                        classification,
+                        confidence,
+                        notes,
+                    ),
+                    timeout=5.0,
+                )
+
+            log.info(
+                "Pattern written",
+                extra={"component": component, "pattern": pattern[:60], "classification": classification},
+            )
+
+        except Exception:
+            log.exception("Pattern write error")
 
 
 @app.get("/health")

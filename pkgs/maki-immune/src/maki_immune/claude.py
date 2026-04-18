@@ -437,6 +437,176 @@ async def immune_heartbeat_loop():
             log.exception("Immune heartbeat error")
 
 
+# --- Pattern Escalation ---
+
+_MAX_PATTERN_ESCALATION_TURNS = 4
+
+
+def _parse_pattern_classification(response: str) -> dict | None:
+    """Parse the structured PATTERN_CLASSIFICATION block from Claude's response.
+
+    Returns a dict with keys: component, pattern, classification, confidence, notes
+    or None if the block is missing or malformed.
+    """
+    match = re.search(
+        r"PATTERN_CLASSIFICATION:\s*\n"
+        r"\s*component:\s*(.+)\n"
+        r"\s*pattern:\s*(.+)\n"
+        r"\s*classification:\s*(no_op|escalate)\s*\n"
+        r"\s*confidence:\s*([0-9.]+)\s*\n"
+        r"\s*notes:\s*(.+)",
+        response,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    try:
+        confidence = float(match.group(4))
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        return {
+            "component": match.group(1).strip(),
+            "pattern": match.group(2).strip(),
+            "classification": match.group(3).strip().lower(),
+            "confidence": confidence,
+            "notes": match.group(5).strip(),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _build_escalation_summary(candidate: dict, classification: dict | None) -> str:
+    """Build a brief summary for #maki-immune after pattern escalation."""
+    component = candidate["component"]
+    pod = candidate["pod"]
+
+    if classification:
+        cls = classification["classification"]
+        conf = classification["confidence"]
+        notes = classification["notes"]
+        pat = classification["pattern"]
+        return (
+            f"**Pattern classified** — {component} ({pod})\n"
+            f"classification: `{cls}` (confidence: {conf:.1f})\n"
+            f"pattern: `{pat}`\n"
+            f"notes: {notes}"
+        )
+    else:
+        sigs = ", ".join(candidate.get("signatures", []))
+        return (
+            f"**Pattern escalation** — {component} ({pod}): "
+            f"Claude did not produce a valid PATTERN_CLASSIFICATION block. Manual review needed.\n"
+            f"Signatures: {sigs}"
+        )
+
+
+async def escalate_pattern_to_claude(candidate: dict) -> None:
+    """Escalate an unknown/untrusted error pattern to Claude for immediate classification.
+
+    Claude investigates the log tail, classifies the pattern, and immune writes the result
+    back to error_patterns. At most once per pattern per passive loop window (caller's
+    responsibility to enforce via _escalated_this_window).
+    """
+    from maki_immune.patterns import query_patterns, write_pattern
+
+    component = candidate["component"]
+    pod = candidate["pod"]
+    log_tail = candidate.get("log_tail", "")
+    signatures = candidate.get("signatures", [])
+
+    log.info(
+        "Escalating pattern to Claude",
+        extra={"component": component, "pod": pod, "signatures": signatures},
+    )
+
+    # Fetch last 5 known patterns for context (dedup guard)
+    known_patterns = await query_patterns(_nc, component)
+    if known_patterns:
+        known_context = "\n".join(
+            f"- pattern={p['pattern']!r} classification={p['classification']} "
+            f"confidence={p['confidence']:.1f} notes={p.get('notes', '')!r}"
+            for p in known_patterns[-5:]
+        )
+    else:
+        known_context = "(none — first pattern for this component)"
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    prompt = f"""You are the pattern classifier for maki-immune.
+
+An unknown error signature was detected in pod logs. Classify it: is it a safe no-op, or does it require action?
+
+## Observed Error
+
+- Component: {component}
+- Pod: {pod}
+- Site: {_site_name}
+- Signatures found: {", ".join(signatures)}
+- Timestamp: {timestamp}
+
+## Log tail (raw)
+```
+{log_tail}
+```
+
+## Known patterns for {component} (last 5, for deduplication)
+{known_context}
+
+## Your task
+
+1. Investigate if needed — use get_pod_logs or get_k8s_events for this pod if the tail isn't enough.
+2. Search memories — you may have seen this before.
+3. Act if needed — restart the pod/deployment only if the problem is active and actionable.
+4. End your response with a PATTERN_CLASSIFICATION block (required):
+
+PATTERN_CLASSIFICATION:
+  component: {component}
+  pattern: <concise regex that matches this error>
+  classification: no_op | escalate
+  confidence: <0.1 to 1.0>
+  notes: <one sentence — what this error means and why it's safe or dangerous>
+
+Rules:
+- The block is mandatory. If missing, immune treats the pattern as permanently unknown.
+- Do not duplicate an existing known pattern — if one already covers this, omit the block entirely.
+- Be conservative: when in doubt, classify as escalate rather than no_op."""
+
+    try:
+        response, _usage = await invoke_claude(
+            prompt,
+            model=MODEL,
+            semaphore=_semaphore,
+            max_turns=_MAX_PATTERN_ESCALATION_TURNS,
+            mcp_servers={"maki-immune": _mcp_server},
+        )
+
+        classification = _parse_pattern_classification(response)
+
+        if classification:
+            await write_pattern(_nc, classification)
+            log.info(
+                "Pattern classification written",
+                extra={
+                    "component": component,
+                    "pattern": classification.get("pattern"),
+                    "classification": classification.get("classification"),
+                    "confidence": classification.get("confidence"),
+                },
+            )
+        else:
+            log.warning(
+                "Claude did not produce a valid PATTERN_CLASSIFICATION block",
+                extra={"component": component, "pod": pod},
+            )
+
+        summary = _build_escalation_summary(candidate, classification)
+        await _publish_alert(summary)
+
+    except Exception:
+        log.exception("Pattern escalation to Claude failed", extra={"component": component})
+
+
 # --- Passive Log Monitor Loop ---
 
 
@@ -526,7 +696,11 @@ async def passive_log_monitor_loop():
                         },
                     )
 
+                # Escalate unknowns/untrusted to Claude — at most once per signature
+                # fingerprint per passive window to avoid flooding Claude with the same error
+                escalated_this_window: set[str] = set()
                 for c in to_escalate:
+                    fingerprint = f"{c['component']}:{':'.join(sorted(c.get('signatures', [])))}"
                     log.info(
                         "Escalating error candidate",
                         extra={
@@ -536,6 +710,14 @@ async def passive_log_monitor_loop():
                             "reason": c.get("reason", "unknown"),
                         },
                     )
+                    if fingerprint in escalated_this_window:
+                        log.debug(
+                            "Skipping duplicate pattern escalation this window",
+                            extra={"component": c["component"], "fingerprint": fingerprint},
+                        )
+                        continue
+                    escalated_this_window.add(fingerprint)
+                    asyncio.create_task(escalate_pattern_to_claude(c))
             # No-error runs are fully silent — no logging
 
         except Exception:

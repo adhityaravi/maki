@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any
 
-from maki_common.subjects import PATTERN_QUERY, PATTERN_UPDATE
+from maki_common.subjects import PATTERN_QUERY, PATTERN_UPDATE, PATTERN_WRITE
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +80,17 @@ def match_candidate(candidate: dict, patterns: list[dict]) -> dict | None:
             continue
 
     return None
+
+
+async def write_pattern(nc: Any, pattern: dict) -> None:
+    """Fire-and-forget write: insert a newly classified pattern into error_patterns via stem."""
+    try:
+        await nc.publish(
+            PATTERN_WRITE,
+            json.dumps(pattern).encode(),
+        )
+    except Exception:
+        log.warning("Failed to publish pattern write", extra={"component": pattern.get("component")})
 
 
 async def check_candidates(

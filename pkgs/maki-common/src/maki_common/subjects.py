@@ -50,3 +50,4 @@ DB_QUERY = "maki.db.query"
 # Error pattern matching (immune ↔ stem)
 PATTERN_QUERY = "maki.immune.pattern.query"
 PATTERN_UPDATE = "maki.immune.pattern.update"
+PATTERN_WRITE = "maki.immune.pattern.write"  # insert new classified pattern
