@@ -226,6 +226,12 @@ async def chat_completions(req: ChatCompletionRequest):
                     mode="synapse_proxy_retry",
                 )
                 log.info("Retry response", extra={"response_len": len(text)})
+                retry_raw = extract_json_str(text)
+                try:
+                    json.loads(retry_raw)
+                except json.JSONDecodeError:
+                    log.error("JSON retry also failed, returning 502", extra={"raw_preview": text[:200]})
+                    raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
     except Exception as e:
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))
