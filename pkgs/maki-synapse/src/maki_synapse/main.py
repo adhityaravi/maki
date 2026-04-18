@@ -177,11 +177,15 @@ async def chat_completions(req: ChatCompletionRequest):
         )
 
     user_prompt = "\n".join(user_parts)
-    full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}" if system_prompt else user_prompt
 
     try:
         log.info("Invoking Claude", extra={"tools": bool(req.tools), "user_prompt_len": len(user_prompt)})
-        text, _usage = await invoke_claude(full_prompt, model=MODEL, semaphore=_semaphore)
+        text, _usage = await invoke_claude(
+            user_prompt,
+            model=MODEL,
+            semaphore=_semaphore,
+            system_prompt=system_prompt or None,
+        )
         log.info("Claude response", extra={"response_len": len(text)})
 
         # JSON mode: validate extraction, retry once on failure
@@ -192,11 +196,16 @@ async def chat_completions(req: ChatCompletionRequest):
             except json.JSONDecodeError:
                 log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
                 retry_prompt = (
-                    f"{full_prompt}\n\n"
+                    f"{user_prompt}\n\n"
                     "Your previous response was not valid JSON. "
                     "Respond with ONLY the raw JSON object. No other text."
                 )
-                text, _usage = await invoke_claude(retry_prompt, model=MODEL, semaphore=_semaphore)
+                text, _usage = await invoke_claude(
+                    retry_prompt,
+                    model=MODEL,
+                    semaphore=_semaphore,
+                    system_prompt=system_prompt or None,
+                )
                 log.info("Retry response", extra={"response_len": len(text)})
     except Exception as e:
         log.exception("Claude invocation failed")
