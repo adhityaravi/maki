@@ -365,7 +365,7 @@ async def token_usage_listener():
 
             tokens = payload.get("total_tokens", 0)
             cost = payload.get("total_cost_usd", 0.0)
-            model = payload.get("mode", "unknown")
+            model = payload.get("model", "unknown")
 
             _token_stats["total_tokens"] += tokens
             _token_stats["total_cost_usd"] += cost
