@@ -48,35 +48,55 @@ class GitHubIssueClient:
         self,
         state: str = "open",
         labels: str = "",
-        per_page: int = 30,
+        max_results: int = 200,
     ) -> list[dict[str, Any]]:
         """List issues from the repo, optionally filtered by state and labels.
 
-        Returns issues sorted by priority label (P1 first). Issues without
-        a priority label are sorted last.
+        Paginates through all results (up to max_results) so issues beyond
+        the first 30 are not silently dropped. Returns issues sorted by
+        priority label (P1 first). Issues without a priority label are sorted last.
         """
         try:
-            params: dict[str, Any] = {
-                "state": state,
-                "per_page": per_page,
-                "sort": "created",
-                "direction": "asc",
-            }
-            if labels:
-                params["labels"] = labels
+            issues: list[dict[str, Any]] = []
+            page = 1
 
-            resp = await self._client.get(
-                f"{API}/repos/{self._repo_path}/issues",
-                headers=await self._auth.headers(),
-                params=params,
-            )
-            resp.raise_for_status()
-            issues = resp.json()
+            while len(issues) < max_results:
+                params: dict[str, Any] = {
+                    "state": state,
+                    "per_page": 100,
+                    "page": page,
+                    "sort": "created",
+                    "direction": "asc",
+                }
+                if labels:
+                    params["labels"] = labels
 
-            # Filter out pull requests (GitHub API returns PRs as issues too)
-            issues = [i for i in issues if "pull_request" not in i]
+                resp = await self._client.get(
+                    f"{API}/repos/{self._repo_path}/issues",
+                    headers=await self._auth.headers(),
+                    params=params,
+                )
+                resp.raise_for_status()
+                raw = resp.json()
+                raw_count = len(raw)
 
-            # Sort by priority label
+                # Filter out pull requests (GitHub API returns PRs as issues too)
+                batch = [i for i in raw if "pull_request" not in i]
+
+                if not batch:
+                    break
+
+                issues.extend(batch)
+
+                # If we got fewer than a full page, we've exhausted the results
+                if raw_count < 100:
+                    break
+
+                page += 1
+
+            issues = issues[:max_results]
+
+            # Sort by priority label across the full result set
             def _priority_key(issue: dict[str, Any]) -> int:
                 for label in issue.get("labels", []):
                     name = label.get("name", "") if isinstance(label, dict) else str(label)
@@ -88,7 +108,7 @@ class GitHubIssueClient:
 
             log.info(
                 "Listed GitHub issues",
-                extra={"count": len(issues), "state": state},
+                extra={"count": len(issues), "state": state, "pages": page},
             )
             return issues
         except Exception:
