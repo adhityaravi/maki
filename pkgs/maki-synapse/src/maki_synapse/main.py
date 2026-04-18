@@ -11,21 +11,46 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from maki_common import configure_logging
-from maki_common.claude import invoke_claude
+from maki_common import configure_logging, connect_nats
+from maki_common.claude import TokenUsage, invoke_claude
+from maki_common.subjects import CORTEX_TOKEN_USAGE
 from pydantic import BaseModel
 
 configure_logging()
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="maki-synapse", version="0.0.1")
-
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_QUERIES", "3"))
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
+SITE_NAME = os.environ.get("SITE_NAME", "unknown")
+
+_nc: Any | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _nc
+    try:
+        _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+        log.info("NATS connected", extra={"url": NATS_URL, "site": SITE_NAME})
+    except Exception:
+        log.warning("NATS unavailable — token usage will not be published to immune")
+    yield
+    if _nc:
+        try:
+            await _nc.close()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="maki-synapse", version="0.0.1", lifespan=lifespan)
 
 
 # --- Request / Response models (OpenAI-compatible subset) ---
@@ -137,6 +162,46 @@ def extract_json_str(text: str) -> str:
     return text
 
 
+# --- Token usage helpers ---
+
+
+def _map_usage(token_usage: TokenUsage) -> Usage:
+    """Map Claude TokenUsage to the OpenAI Usage schema.
+
+    prompt_tokens includes cache_read and cache_creation tokens so that callers
+    see the real billable input-token count rather than zeros.
+    """
+    return Usage(
+        prompt_tokens=token_usage.input_tokens + token_usage.cache_read_tokens + token_usage.cache_creation_tokens,
+        completion_tokens=token_usage.output_tokens,
+        total_tokens=token_usage.total_tokens,
+    )
+
+
+async def _publish_token_usage(request_id: str, token_usage: TokenUsage) -> None:
+    """Publish synapse token usage to NATS so immune can aggregate it."""
+    if _nc is None:
+        return
+    try:
+        payload = {
+            "turn_id": request_id,
+            "timestamp": time.time(),
+            "session_id": "synapse",
+            **token_usage.to_log_dict(),
+        }
+        await _nc.publish(f"{CORTEX_TOKEN_USAGE}.{SITE_NAME}", json.dumps(payload).encode())
+        log.info(
+            "Token usage published",
+            extra={
+                "request_id": request_id,
+                "total_tokens": token_usage.total_tokens,
+                "total_cost_usd": token_usage.total_cost_usd,
+            },
+        )
+    except Exception:
+        log.warning("Failed to publish token usage to NATS", extra={"request_id": request_id})
+
+
 # --- Endpoints ---
 
 
@@ -177,14 +242,16 @@ async def chat_completions(req: ChatCompletionRequest):
         )
 
     user_prompt = "\n".join(user_parts)
+    request_id = f"synapse-{uuid.uuid4().hex[:12]}"
 
     try:
         log.info("Invoking Claude", extra={"tools": bool(req.tools), "user_prompt_len": len(user_prompt)})
-        text, _usage = await invoke_claude(
+        text, token_usage = await invoke_claude(
             user_prompt,
             model=MODEL,
             semaphore=_semaphore,
             system_prompt=system_prompt or None,
+            mode="synapse_proxy",
         )
         log.info("Claude response", extra={"response_len": len(text)})
 
@@ -200,16 +267,21 @@ async def chat_completions(req: ChatCompletionRequest):
                     "Your previous response was not valid JSON. "
                     "Respond with ONLY the raw JSON object. No other text."
                 )
-                text, _usage = await invoke_claude(
+                text, token_usage = await invoke_claude(
                     retry_prompt,
                     model=MODEL,
                     semaphore=_semaphore,
                     system_prompt=system_prompt or None,
+                    mode="synapse_proxy_retry",
                 )
                 log.info("Retry response", extra={"response_len": len(text)})
     except Exception as e:
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))
+
+    # Map real token usage → OpenAI schema and publish to NATS
+    usage = _map_usage(token_usage)
+    await _publish_token_usage(request_id, token_usage)
 
     # Parse response
     message: ResponseMessage
@@ -243,10 +315,11 @@ async def chat_completions(req: ChatCompletionRequest):
         message = ResponseMessage(content=text)
 
     return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        id=f"chatcmpl-{request_id}",
         created=int(time.time()),
         model=req.model,
         choices=[Choice(message=message, finish_reason=finish_reason)],
+        usage=usage,
     )
 
 
