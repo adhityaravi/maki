@@ -571,7 +571,7 @@ async def _deploy_propagate_handler(msg):
             )
             log.info("Propagated deploy applied", extra={"deployment": deployment_name, "image": image})
 
-            healthy = await _monitor_rollout(deployment_name, timeout=90)
+            healthy = await _monitor_rollout(deployment_name, timeout=150)
 
             if healthy:
                 result_status = "success"
