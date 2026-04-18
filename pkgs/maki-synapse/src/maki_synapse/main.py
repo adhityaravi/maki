@@ -38,7 +38,9 @@ _nc: Any | None = None
 async def lifespan(app: FastAPI):
     global _nc
     try:
-        _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+        # Short timeout so NATS unavailability doesn't block FastAPI startup
+        # and trigger immune health-check rollbacks.
+        _nc = await asyncio.wait_for(connect_nats(NATS_URL, token=NATS_TOKEN), timeout=5.0)
         log.info("NATS connected", extra={"url": NATS_URL, "site": SITE_NAME})
     except Exception:
         log.warning("NATS unavailable — token usage will not be published to immune")
