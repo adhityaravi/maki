@@ -37,13 +37,18 @@ _nc: Any | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _nc
-    try:
-        # Short timeout so NATS unavailability doesn't block FastAPI startup
-        # and trigger immune health-check rollbacks.
-        _nc = await asyncio.wait_for(connect_nats(NATS_URL, token=NATS_TOKEN), timeout=5.0)
-        log.info("NATS connected", extra={"url": NATS_URL, "site": SITE_NAME})
-    except Exception:
-        log.warning("NATS unavailable — token usage will not be published to immune")
+    if NATS_TOKEN:
+        try:
+            # Short timeout so NATS unavailability doesn't block FastAPI startup
+            # and trigger immune health-check rollbacks. Guard on NATS_TOKEN so
+            # we don't burn 5s on a connect guaranteed to fail with auth violation
+            # when the token isn't configured for this deployment.
+            _nc = await asyncio.wait_for(connect_nats(NATS_URL, token=NATS_TOKEN), timeout=5.0)
+            log.info("NATS connected", extra={"url": NATS_URL, "site": SITE_NAME})
+        except Exception:
+            log.warning("NATS unavailable — token usage will not be published to immune")
+    else:
+        log.info("NATS_TOKEN not set — skipping NATS connect, token usage will not be published")
     yield
     if _nc:
         try:
