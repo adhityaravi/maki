@@ -29,6 +29,7 @@ from maki_common import (
     kv_put_float,
     load_kv_config,
     parse_config_tags,
+    spawn_background,
     strip_tags,
 )
 from maki_common.config import apply_config_updates
@@ -707,19 +708,22 @@ async def lifespan(app: FastAPI):
 
     _github = _init_github_client()
 
-    asyncio.create_task(_response_listener())
-    asyncio.create_task(_cortex_heartbeat_watcher())
-    asyncio.create_task(_conversation_sync_listener())
-    asyncio.create_task(_ears_listener())
-    asyncio.create_task(_memory_store_listener())
-    asyncio.create_task(_config_sync_listener())
-    asyncio.create_task(_db_query_listener())
-    asyncio.create_task(_pattern_query_listener())
-    asyncio.create_task(_pattern_update_listener())
-    asyncio.create_task(_pattern_write_listener())
-    asyncio.create_task(trading_signal_listener(_nc, _db_pool))
-    asyncio.create_task(trading_manual_listener(_nc, _lock_kv))
-    asyncio.create_task(trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools))
+    spawn_background(_response_listener(), name="stem.response_listener")
+    spawn_background(_cortex_heartbeat_watcher(), name="stem.cortex_heartbeat_watcher")
+    spawn_background(_conversation_sync_listener(), name="stem.conversation_sync_listener")
+    spawn_background(_ears_listener(), name="stem.ears_listener")
+    spawn_background(_memory_store_listener(), name="stem.memory_store_listener")
+    spawn_background(_config_sync_listener(), name="stem.config_sync_listener")
+    spawn_background(_db_query_listener(), name="stem.db_query_listener")
+    spawn_background(_pattern_query_listener(), name="stem.pattern_query_listener")
+    spawn_background(_pattern_update_listener(), name="stem.pattern_update_listener")
+    spawn_background(_pattern_write_listener(), name="stem.pattern_write_listener")
+    spawn_background(trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener")
+    spawn_background(trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener")
+    spawn_background(
+        trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools),
+        name="stem.trading_tool_listener",
+    )
     ctx = StemContext(
         nc=_nc,
         js=_js,
@@ -745,7 +749,7 @@ async def lifespan(app: FastAPI):
     _loop_specs = loops
     _stem_ctx = ctx
     for spec in loops:
-        asyncio.create_task(_run_loop(spec, ctx))
+        spawn_background(_run_loop(spec, ctx), name=f"stem.loop.{spec.name}")
 
     yield
 
@@ -860,8 +864,11 @@ async def _process_turn(
         if config_updates:
             await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
-        asyncio.create_task(_publish_turn_to_stream(turn_id, message, clean_response))
-        asyncio.create_task(_feed_memories(message, clean_response))
+        spawn_background(
+            _publish_turn_to_stream(turn_id, message, clean_response),
+            name="stem.publish_turn_to_stream",
+        )
+        spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
 
         return turn_id, clean_response
 
@@ -917,7 +924,10 @@ async def _memory_store_listener():
             source = data.get("source", "unknown")
             metadata = data.get("metadata")
 
-            asyncio.create_task(_store_memory(content, source, user_id, metadata))
+            spawn_background(
+                _store_memory(content, source, user_id, metadata),
+                name="stem.store_memory",
+            )
 
         except Exception:
             log.exception("Error in memory store listener")
@@ -942,7 +952,7 @@ async def _trigger_loop(loop_name: str, forward_to: dict) -> None:
         return
     reply = {"response": f"Triggering loop: {loop_name}", "done": True, **forward_to}
     await _nc.publish(EARS_OUT, json.dumps(reply).encode())
-    asyncio.create_task(_run_manual_loop(spec, loop_name))
+    spawn_background(_run_manual_loop(spec, loop_name), name=f"stem.manual_loop.{loop_name}")
 
 
 async def _handle_discord_message(data: dict):
@@ -1009,7 +1019,7 @@ async def _ears_listener():
             data = json.loads(msg.data.decode())
             username = data.get("username", "unknown")
             log.info("Discord message", extra={"username": username, "content_len": len(data.get("content", ""))})
-            asyncio.create_task(_handle_discord_message(data))
+            spawn_background(_handle_discord_message(data), name="stem.handle_discord_message")
         except Exception:
             log.exception("Error dispatching Discord message")
 

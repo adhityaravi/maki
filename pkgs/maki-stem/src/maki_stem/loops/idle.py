@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from maki_common import kv_get_float, parse_config_tags, strip_tags
+from maki_common import kv_get_float, parse_config_tags, spawn_background, strip_tags
 from maki_common.config import apply_config_updates
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
 
@@ -235,7 +235,10 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
                 if issue_has_label(i, UNKNOWN_ISSUER_LABEL):
                     continue
                 if not is_verified_issue_author(i):
-                    asyncio.create_task(ctx.github.add_label(i.get("number"), UNKNOWN_ISSUER_LABEL))
+                    spawn_background(
+                        ctx.github.add_label(i.get("number"), UNKNOWN_ISSUER_LABEL),
+                        name="idle.add_unknown_issuer_label",
+                    )
                     continue
                 open_issues.append({"number": i.get("number"), "title": i.get("title", "")})
         except Exception:
@@ -286,11 +289,12 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             log.info("Thought published", extra={"turn_id": turn_id})
 
             state_summary = ctx.format_system_state(system_state)
-            asyncio.create_task(
+            spawn_background(
                 ctx.feed_memories(
                     f"[Idle reflection] System state: {state_summary}",
                     clean_thought,
-                )
+                ),
+                name="idle.feed_memories",
             )
 
     except TimeoutError:

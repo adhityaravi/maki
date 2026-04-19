@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from maki_common import kv_get_float, strip_tags
+from maki_common import kv_get_float, spawn_background, strip_tags
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST
 
 from .base import (
@@ -216,11 +216,12 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         extra={"issue": issue_number, "title": issue_title, "priority": issue_priority},
     )
 
-    asyncio.create_task(
+    spawn_background(
         ctx.github.comment_issue(
             issue_number,
             f"🔧 **Starting work on this task.**\n\nTime: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
-        )
+        ),
+        name="work.start_comment",
     )
 
     # Load identity
@@ -272,11 +273,12 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             extra={"turn_id": turn_id, "issue": issue_number},
         )
 
-        asyncio.create_task(
+        spawn_background(
             ctx.feed_memories(
                 f"[Night work] Task: {issue_title} (priority P{issue_priority})",
                 clean_result or "Task completed",
-            )
+            ),
+            name="work.feed_memories",
         )
 
         # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
@@ -290,7 +292,10 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         else:
             ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
             close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
-            asyncio.create_task(ctx.github.close_issue(issue_number, comment=close_comment))
+            spawn_background(
+                ctx.github.close_issue(issue_number, comment=close_comment),
+                name="work.close_issue",
+            )
 
     except TimeoutError:
         log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
@@ -307,22 +312,24 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ).encode(),
         )
 
-        asyncio.create_task(
+        spawn_background(
             ctx.github.comment_issue(
                 issue_number,
                 f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s. Will retry next work session.",
-            )
+            ),
+            name="work.timeout_comment",
         )
 
     except Exception:
         log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
 
         # Comment on issue about failure (issue stays open for retry)
-        asyncio.create_task(
+        spawn_background(
             ctx.github.comment_issue(
                 issue_number,
                 "❌ **Work failed** due to an error. Will retry next work session.",
-            )
+            ),
+            name="work.failure_comment",
         )
 
     finally:
