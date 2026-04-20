@@ -37,23 +37,29 @@ WORK_CRON = "0 3 * * *"
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
-_WORK_PROMPT = """## Work Mode
+# Prompt caching note
+# -------------------
+# The Claude Code CLI (which the Agent SDK uses) wraps the system prompt with
+# Anthropic prompt-caching breakpoints. Caching is a *prefix* match, so every
+# byte before the first variable character must stay byte-identical across
+# turns for the cache to hit. We therefore split the work prompt into a static
+# header (mode description, instructions, rules — identical across every work
+# turn) and a dynamic task block (issue #, title, description, comments) that
+# changes per turn. The final system prompt is assembled as:
+#
+#     identity            (static, shared by every loop)
+#   + TOOLS_PROMPT        (static, shared by every loop)
+#   + _WORK_STATIC_PROMPT (static across all work turns)
+#   + _WORK_TASK_TEMPLATE (dynamic — filled from the issue)
+#   + memories / graph    (dynamic)
+#
+# Everything up to and including _WORK_STATIC_PROMPT is a stable ~2 KTok
+# prefix that the API can serve from cache at 90% discount on subsequent
+# tool-use turns inside a single streaming conversation.
+_WORK_STATIC_PROMPT = """## Work Mode
 
 You have a GitHub issue to execute. Complete it fully — code changes, commit, \
 push, build, deploy if needed. You have every tool available.
-
-## Task
-Issue: #{issue_number}
-Title: {issue_title}
-Description: {issue_description}
-Priority: {issue_priority}
-Comments: {issue_comments}
-
-## Context
-Relevant memories for this task have been preloaded — check the "Relevant memories" and \
-"Relationships" sections below before starting. Use them to inform your approach. \
-Read the issue comments above — they may contain clarifications, design decisions, or \
-explicit instructions that override the original description.
 
 ## Instructions
 1. Understand the task. Use search_code and read_file to study relevant code.
@@ -85,7 +91,21 @@ When opening a PR: assign it to adhityaravi, use add_label to add "human" to the
 comment the PR link on the issue, and leave the issue open. Do NOT close it — Adi will \
 review and merge.
 - Be brief in your response. Report what you did, not what you plan to do.
-- One task at a time. Focus."""
+- One task at a time. Focus.
+
+## Context
+Relevant memories for this task have been preloaded — check the "Relevant memories" and \
+"Relationships" sections below before starting. Use them to inform your approach. \
+Read the issue comments — they may contain clarifications, design decisions, or \
+explicit instructions that override the original description."""
+
+
+_WORK_TASK_TEMPLATE = """## Task
+Issue: #{issue_number}
+Title: {issue_title}
+Description: {issue_description}
+Priority: {issue_priority}
+Comments: {issue_comments}"""
 
 
 def _build_work_system_prompt(
@@ -94,7 +114,11 @@ def _build_work_system_prompt(
     graph_context: list,
     work_context: dict,
 ) -> str:
-    """Assemble the complete system prompt for a work turn."""
+    """Assemble the complete system prompt for a work turn.
+
+    Ordering is tuned for prompt-cache reuse (see the caching note above):
+    every static section comes first, every dynamic section last.
+    """
     raw_comments = work_context.get("issue_comments", [])
     if raw_comments:
         comment_lines = [
@@ -106,11 +130,16 @@ def _build_work_system_prompt(
         issue_comments_str = "None"
 
     parts = []
+
+    # --- Static prefix (cacheable) ---
     if identity:
         parts.append(identity)
+    parts.append(TOOLS_PROMPT)
+    parts.append(_WORK_STATIC_PROMPT)
 
+    # --- Dynamic tail (changes per turn) ---
     parts.append(
-        _WORK_PROMPT.format(
+        _WORK_TASK_TEMPLATE.format(
             issue_number=work_context.get("issue_number", "?"),
             issue_title=work_context.get("issue_title", "?"),
             issue_description=work_context.get("issue_description", "No description provided."),
@@ -126,7 +155,6 @@ def _build_work_system_prompt(
     if graph_context:
         parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
 
-    parts.append(TOOLS_PROMPT)
     return "\n\n".join(parts)
 
 

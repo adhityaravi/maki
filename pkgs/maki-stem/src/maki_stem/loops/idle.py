@@ -36,7 +36,13 @@ IDLE_CRON = "0 */4 * * *"
 KV_KEY = "identity"
 _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
-_IDLE_REFLECTION_PROMPT = """## Reflection Mode
+# Prompt caching note
+# -------------------
+# Caching is a *prefix* match. Split the idle prompt into a static header
+# (mode, missions, rules — identical across every idle turn) and a dynamic
+# context block (open issues, system state, config, time) that changes per
+# turn. See the matching note in work.py for the same layout reasoning.
+_IDLE_STATIC_PROMPT = """## Reflection Mode
 
 You're posting to #maki-general. Adi reads this — write like you're starting a conversation \
 with him. Share what you found, what caught your attention, what you think should change. \
@@ -100,17 +106,16 @@ Use "automated" label too. Example: `labels="P3,automated"`.
 - **Always share something.** Every cycle, tell Adi what you found. One to three sentences. \
 What did you read? What bugged you? What did you file? This is your voice — use it.
 - Store learnings with add_memory.
+- **Dedup rule**: Before calling create_issue, check whether the thought is already \
+covered by an open issue in the list below (same topic, same intent). If it is → do NOT \
+create a duplicate. Still share what you found in your response — just don't double-file.
+- **Hygiene rule**: For each issue in the list below, ask: is this already resolved? \
+Check the code if needed. If the fix is clearly in place → close_issue with a brief reason. \
+Don't close if uncertain. The work loop depends on this list being accurate."""
 
-## Open GitHub Issues
+
+_IDLE_CONTEXT_TEMPLATE = """## Open GitHub Issues
 {open_issues}
-
-**Dedup rule**: Before calling create_issue, check whether the thought is already \
-covered by an open issue above (same topic, same intent). If it is → do NOT create a duplicate. \
-Still share what you found in your response — just don't double-file.
-
-**Hygiene rule**: For each issue above, ask: is this already resolved? Check the code if needed. \
-If the fix is clearly in place → close_issue with a brief reason. Don't close if uncertain. \
-The work loop depends on this list being accurate.
 
 ## System state
 {system_state}
@@ -129,7 +134,11 @@ def _build_idle_system_prompt(
     graph_context: list,
     idle_context: dict,
 ) -> str:
-    """Assemble the complete system prompt for an idle reflection turn."""
+    """Assemble the complete system prompt for an idle reflection turn.
+
+    Ordering is tuned for prompt-cache reuse: every static section comes
+    first, every dynamic section last.
+    """
     time_ctx = idle_context.get("time_context", {})
     system_state = idle_context.get("system_state", {})
     config = idle_context.get("current_config", {})
@@ -151,11 +160,16 @@ def _build_idle_system_prompt(
     )
 
     parts = []
+
+    # --- Static prefix (cacheable) ---
     if identity:
         parts.append(identity)
+    parts.append(TOOLS_PROMPT)
+    parts.append(_IDLE_STATIC_PROMPT)
 
+    # --- Dynamic tail (changes per turn) ---
     parts.append(
-        _IDLE_REFLECTION_PROMPT.format(
+        _IDLE_CONTEXT_TEMPLATE.format(
             open_issues=issues_str,
             system_state=state_str,
             config=config_str,
@@ -172,7 +186,6 @@ def _build_idle_system_prompt(
     if graph_context:
         parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
 
-    parts.append(TOOLS_PROMPT)
     return "\n\n".join(parts)
 
 
