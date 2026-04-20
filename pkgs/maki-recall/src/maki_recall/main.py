@@ -144,9 +144,17 @@ def get_memories(user_id: str | None = None, agent_id: str | None = None, run_id
 
 @app.post("/search")
 def search_memories(req: SearchRequest):
-    params = {k: v for k, v in req.model_dump().items() if v is not None and k != "query"}
+    # mem0 requires entity identifiers (user_id, agent_id, run_id) inside filters={},
+    # not as top-level kwargs — only limit stays top-level.
+    identity_keys = {"user_id", "agent_id", "run_id"}
+    filters = {k: v for k, v in req.model_dump().items() if v is not None and k in identity_keys}
+    kwargs: dict[str, Any] = {}
+    if filters:
+        kwargs["filters"] = filters
+    if req.limit is not None:
+        kwargs["limit"] = req.limit
     try:
-        return memory.search(query=req.query, **params)
+        return memory.search(query=req.query, **kwargs)
     except Exception as e:
         log.exception("Error searching memories")
         raise HTTPException(status_code=500, detail=str(e))
