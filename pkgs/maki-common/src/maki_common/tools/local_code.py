@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -191,21 +190,6 @@ def make_code_tools(
             return mcp_result(f"Error: {stderr}")
         return mcp_result(stdout if stdout.strip() else "No changes.")
 
-    async def git_run(args: dict[str, Any]) -> dict[str, Any]:
-        """Run an arbitrary git command."""
-        raw_args = args.get("args", "")
-        log.info("Tool: git_run", extra={"git_args": raw_args})
-        if not raw_args.strip():
-            return mcp_result("Error: args is required (e.g. 'status', 'log --oneline -10').")
-        try:
-            parts = shlex.split(raw_args)
-        except ValueError as e:
-            return mcp_result(f"Error parsing args: {e}")
-        rc, stdout, stderr = await _run_git(repo_path, *parts)
-        if rc != 0:
-            return mcp_result(f"Exit {rc}: {stderr}" if stderr.strip() else f"Exit {rc}: {stdout}")
-        return mcp_result(stdout if stdout.strip() else "(no output)")
-
     return [
         (
             "read_file",
@@ -229,12 +213,16 @@ def make_code_tools(
             search_text,
         ),
         (
-            "git_run",
-            "Run any git command. Pass the arguments as a string (everything after 'git'). "
-            "Examples: 'status', 'log --oneline -10', 'diff HEAD~1', 'show HEAD:path/to/file', "
-            "'blame path/to/file', 'branch -a'.",
-            {"args": str},
-            git_run,
+            "git_status",
+            "Show git status (short format). Reports 'Working tree clean.' when there are no changes.",
+            {},
+            git_status,
+        ),
+        (
+            "git_diff",
+            "Show unstaged git diff. Optionally pass a 'path' to limit the diff to that file/directory.",
+            {"path": str},
+            git_diff,
         ),
     ]
 
