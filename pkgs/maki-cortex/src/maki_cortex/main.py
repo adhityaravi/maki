@@ -75,7 +75,7 @@ _SILENT_ERROR_PATTERNS: frozenset[str] = frozenset(
         "quota",
         "billing",
         "credit",
-        "limit",
+        # "limit" removed — too broad, already covered by specific rate-limit patterns above
         "resets",
         "429",
         "529",
