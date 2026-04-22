@@ -44,6 +44,43 @@ def issue_has_label(issue: dict, label: str) -> bool:
     return False
 
 
+async def tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[dict]:
+    """Tag issues from unverified authors with UNKNOWN_ISSUER_LABEL.
+
+    Returns the subset of issues whose author is in the allowlist — i.e. the
+    issues a loop is allowed to act on. Issues from unverified authors that
+    are not yet tagged get labeled inline (awaited) so the next pass sees the
+    label and won't re-tag.
+
+    Awaiting (rather than fire-and-forget) is the safer default: it keeps the
+    label-set authoritative across overlapping cycles. Per-call latency is a
+    handful of GitHub API requests at most — well within the loops' budgets.
+    Callers that don't need the label persisted before their *current* pass
+    completes can ignore this property; the security boundary is preserved
+    either way because unverified issues are always filtered out.
+    """
+    if not ctx.github:
+        return issues
+    verified: list[dict] = []
+    for issue in issues:
+        if is_verified_issue_author(issue):
+            verified.append(issue)
+            continue
+        if issue_has_label(issue, UNKNOWN_ISSUER_LABEL):
+            continue
+        number = issue.get("number")
+        login = issue.get("user", {}).get("login", "")
+        log.warning(
+            "Tagging issue from unverified author",
+            extra={"number": number, "author": login},
+        )
+        try:
+            await ctx.github.add_label(number, UNKNOWN_ISSUER_LABEL)
+        except Exception:
+            log.exception("Failed to tag unverified issue", extra={"number": number})
+    return verified
+
+
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
 CRON_WINDOW_SECONDS = 1800  # 30 minutes
 

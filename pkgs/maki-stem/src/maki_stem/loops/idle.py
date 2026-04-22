@@ -16,14 +16,12 @@ from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
 
 from .base import (
     RECENTLY_ACTIVE_THRESHOLD,
-    UNKNOWN_ISSUER_LABEL,
     LoopSpec,
     StemContext,
     assemble_loop_prompt,
     cron_window,
-    is_verified_issue_author,
-    issue_has_label,
     load_identity,
+    tag_unverified_issues,
 )
 
 log = logging.getLogger(__name__)
@@ -216,22 +214,14 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 
     # Fetch open issues for dedup — injected into cortex prompt so it doesn't
     # need to call list_issues itself and can suppress duplicates reliably.
-    # Issues with unknown-issuer label or from non-allowlisted authors are excluded;
-    # newly discovered unknown-author issues get tagged silently in the background.
+    # Issues from non-allowlisted authors are tagged with UNKNOWN_ISSUER_LABEL
+    # by the shared helper and filtered out before reaching cortex.
     open_issues: list[dict] = []
     if ctx.github:
         try:
             issues = await ctx.github.list_issues(state="open")
-            for i in issues or []:
-                if issue_has_label(i, UNKNOWN_ISSUER_LABEL):
-                    continue
-                if not is_verified_issue_author(i):
-                    spawn_background(
-                        ctx.github.add_label(i.get("number"), UNKNOWN_ISSUER_LABEL),
-                        name="idle.add_unknown_issuer_label",
-                    )
-                    continue
-                open_issues.append({"number": i.get("number"), "title": i.get("title", "")})
+            verified = await tag_unverified_issues(issues or [], ctx)
+            open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in verified]
         except Exception:
             log.warning("Failed to fetch open issues for idle dedup")
 

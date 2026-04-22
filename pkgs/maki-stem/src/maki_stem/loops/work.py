@@ -20,9 +20,9 @@ from .base import (
     StemContext,
     assemble_loop_prompt,
     cron_window,
-    is_verified_issue_author,
     issue_has_label,
     load_identity,
+    tag_unverified_issues,
 )
 
 log = logging.getLogger(__name__)
@@ -143,33 +143,7 @@ def _build_work_system_prompt(
 
 def _issue_has_skip_label(issue: dict) -> bool:
     """Return True if the issue carries any label that the work loop must skip."""
-    for lbl in issue.get("labels", []):
-        name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
-        if name.lower() in WORK_SKIP_LABELS:
-            return True
-    return False
-
-
-async def _tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[dict]:
-    """Tag issues from unverified authors with UNKNOWN_ISSUER_LABEL. Returns only verified issues."""
-    if not ctx.github:
-        return issues
-    verified = []
-    for issue in issues:
-        login = issue.get("user", {}).get("login", "")
-        if is_verified_issue_author(issue):
-            verified.append(issue)
-        elif not issue_has_label(issue, UNKNOWN_ISSUER_LABEL):
-            number = issue.get("number")
-            log.warning(
-                "Tagging issue from unverified author",
-                extra={"number": number, "author": login},
-            )
-            try:
-                await ctx.github.add_label(number, UNKNOWN_ISSUER_LABEL)
-            except Exception:
-                log.exception("Failed to tag unverified issue", extra={"number": number})
-    return verified
+    return any(issue_has_label(issue, lbl) for lbl in WORK_SKIP_LABELS)
 
 
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
@@ -204,7 +178,7 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         return
 
     # Tag and filter issues from unverified authors (security boundary)
-    issues = await _tag_unverified_issues(issues, ctx)
+    issues = await tag_unverified_issues(issues, ctx)
     if not issues:
         log.info("No verified-author issues remain after author check — skipping work cycle")
         return
