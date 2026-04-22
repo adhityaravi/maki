@@ -16,13 +16,14 @@ from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
 
 from .base import (
     RECENTLY_ACTIVE_THRESHOLD,
-    TOOLS_PROMPT,
     UNKNOWN_ISSUER_LABEL,
     LoopSpec,
     StemContext,
+    assemble_loop_prompt,
     cron_window,
     is_verified_issue_author,
     issue_has_label,
+    load_identity,
 )
 
 log = logging.getLogger(__name__)
@@ -32,9 +33,6 @@ TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
 # Idle fires every 4 hours
 IDLE_CRON = "0 */4 * * *"
-
-KV_KEY = "identity"
-_DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 
 # Prompt caching note
 # -------------------
@@ -136,8 +134,9 @@ def _build_idle_system_prompt(
 ) -> str:
     """Assemble the complete system prompt for an idle reflection turn.
 
-    Ordering is tuned for prompt-cache reuse: every static section comes
-    first, every dynamic section last.
+    Delegates the shared layout (identity + tools + memories + graph) to
+    :func:`assemble_loop_prompt` and only formats the idle-specific main
+    section here.
     """
     time_ctx = idle_context.get("time_context", {})
     system_state = idle_context.get("system_state", {})
@@ -159,34 +158,17 @@ def _build_idle_system_prompt(
         else "None (GitHub unavailable or no open issues)"
     )
 
-    parts = []
-
-    # --- Static prefix (cacheable) ---
-    if identity:
-        parts.append(identity)
-    parts.append(TOOLS_PROMPT)
-    parts.append(_IDLE_STATIC_PROMPT)
-
-    # --- Dynamic tail (changes per turn) ---
-    parts.append(
-        _IDLE_CONTEXT_TEMPLATE.format(
-            open_issues=issues_str,
-            system_state=state_str,
-            config=config_str,
-            hours_since=idle_context.get("hours_since_last_interaction", "?"),
-            local_time=time_ctx.get("local_time", "?"),
-            day_of_week=datetime.now().strftime("%A"),
-        )
+    dynamic = _IDLE_CONTEXT_TEMPLATE.format(
+        open_issues=issues_str,
+        system_state=state_str,
+        config=config_str,
+        hours_since=idle_context.get("hours_since_last_interaction", "?"),
+        local_time=time_ctx.get("local_time", "?"),
+        day_of_week=datetime.now().strftime("%A"),
     )
+    main_section = f"{_IDLE_STATIC_PROMPT}\n\n{dynamic}"
 
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
-
-    if graph_context:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
-
-    return "\n\n".join(parts)
+    return assemble_loop_prompt(identity, main_section, memories, graph_context)
 
 
 # Rotating memory search queries — varied by hour so each cycle surfaces different memories.
@@ -226,11 +208,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one idle reflection cycle."""
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
 
-    try:
-        entry = await ctx.kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = _DEFAULT_IDENTITY_FALLBACK
+    identity = await load_identity(ctx.kv)
 
     idle_query = _IDLE_MEMORY_QUERIES[int(time.time() / 3600) % len(_IDLE_MEMORY_QUERIES)]
     memories, graph_context = await ctx.search_memories(idle_query)

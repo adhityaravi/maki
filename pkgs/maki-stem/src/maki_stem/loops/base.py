@@ -24,6 +24,10 @@ USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 UNKNOWN_ISSUER_LABEL = "unknown-issuer"
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
 
+# Identity KV — shared by every loop that needs to prepend Maki's self-description.
+IDENTITY_KV_KEY = "identity"
+DEFAULT_IDENTITY = "You are Maki."
+
 
 def is_verified_issue_author(issue: dict) -> bool:
     """Return True if the issue was filed by a trusted author."""
@@ -71,6 +75,60 @@ def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
     c = croniter(expr, now - timedelta(seconds=window_seconds))
     next_scheduled = c.get_next(datetime)
     return next_scheduled <= now
+
+
+async def load_identity(kv: Any) -> str:
+    """Load Maki's identity string from the shared KV, falling back to a safe default.
+
+    Every loop prepends identity to its system prompt. Centralising the load here
+    keeps the try/except block and fallback string in one place so future loops
+    don't re-implement the same boilerplate.
+    """
+    try:
+        entry = await kv.get(IDENTITY_KV_KEY)
+        return entry.value.decode()
+    except Exception:
+        return DEFAULT_IDENTITY
+
+
+def assemble_loop_prompt(
+    identity: str,
+    main_section: str,
+    memories: list,
+    graph_context: list,
+) -> str:
+    """Assemble the shared loop system prompt layout.
+
+    Ordering is tuned for Anthropic prompt-cache reuse — every static section
+    comes first, every dynamic section last:
+
+        identity        (static, shared by every loop)
+      + TOOLS_PROMPT    (static, shared by every loop)
+      + main_section    (loop-specific: static header + dynamic context)
+      + memories        (dynamic tail)
+      + graph_context   (dynamic tail)
+
+    Each loop supplies its own *main_section* (static prompt concatenated with
+    its formatted dynamic template) and lets this function handle the shared
+    identity prefix, tools block, and memory/graph tail.
+    """
+    parts: list[str] = []
+
+    # --- Static prefix (cacheable) ---
+    if identity:
+        parts.append(identity)
+    parts.append(TOOLS_PROMPT)
+    parts.append(main_section)
+
+    # --- Dynamic tail (changes per turn) ---
+    if memories:
+        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
+        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+
+    if graph_context:
+        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
+
+    return "\n\n".join(parts)
 
 
 @dataclass

@@ -14,14 +14,15 @@ from maki_common import kv_get_float, spawn_background, strip_tags
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST
 
 from .base import (
-    TOOLS_PROMPT,
     UNKNOWN_ISSUER_LABEL,
     USER_INACTIVE_THRESHOLD,
     LoopSpec,
     StemContext,
+    assemble_loop_prompt,
     cron_window,
     is_verified_issue_author,
     issue_has_label,
+    load_identity,
 )
 
 log = logging.getLogger(__name__)
@@ -34,9 +35,6 @@ WORK_SKIP_LABELS = {"draft", "human", UNKNOWN_ISSUER_LABEL}
 # Work fires at 03:00 every day
 WORK_CRON = "0 3 * * *"
 
-KV_KEY = "identity"
-_DEFAULT_IDENTITY_FALLBACK = "You are Maki."
-
 # Prompt caching note
 # -------------------
 # The Claude Code CLI (which the Agent SDK uses) wraps the system prompt with
@@ -45,7 +43,8 @@ _DEFAULT_IDENTITY_FALLBACK = "You are Maki."
 # turns for the cache to hit. We therefore split the work prompt into a static
 # header (mode description, instructions, rules — identical across every work
 # turn) and a dynamic task block (issue #, title, description, comments) that
-# changes per turn. The final system prompt is assembled as:
+# changes per turn. The final system prompt is assembled by
+# :func:`assemble_loop_prompt` as:
 #
 #     identity            (static, shared by every loop)
 #   + TOOLS_PROMPT        (static, shared by every loop)
@@ -116,8 +115,9 @@ def _build_work_system_prompt(
 ) -> str:
     """Assemble the complete system prompt for a work turn.
 
-    Ordering is tuned for prompt-cache reuse (see the caching note above):
-    every static section comes first, every dynamic section last.
+    Delegates the shared layout (identity + tools + memories + graph) to
+    :func:`assemble_loop_prompt` and only formats the work-specific main
+    section here.
     """
     raw_comments = work_context.get("issue_comments", [])
     if raw_comments:
@@ -129,33 +129,16 @@ def _build_work_system_prompt(
     else:
         issue_comments_str = "None"
 
-    parts = []
-
-    # --- Static prefix (cacheable) ---
-    if identity:
-        parts.append(identity)
-    parts.append(TOOLS_PROMPT)
-    parts.append(_WORK_STATIC_PROMPT)
-
-    # --- Dynamic tail (changes per turn) ---
-    parts.append(
-        _WORK_TASK_TEMPLATE.format(
-            issue_number=work_context.get("issue_number", "?"),
-            issue_title=work_context.get("issue_title", "?"),
-            issue_description=work_context.get("issue_description", "No description provided."),
-            issue_priority=work_context.get("issue_priority", "?"),
-            issue_comments=issue_comments_str,
-        )
+    dynamic = _WORK_TASK_TEMPLATE.format(
+        issue_number=work_context.get("issue_number", "?"),
+        issue_title=work_context.get("issue_title", "?"),
+        issue_description=work_context.get("issue_description", "No description provided."),
+        issue_priority=work_context.get("issue_priority", "?"),
+        issue_comments=issue_comments_str,
     )
+    main_section = f"{_WORK_STATIC_PROMPT}\n\n{dynamic}"
 
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
-
-    if graph_context:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
-
-    return "\n\n".join(parts)
+    return assemble_loop_prompt(identity, main_section, memories, graph_context)
 
 
 def _issue_has_skip_label(issue: dict) -> bool:
@@ -252,12 +235,7 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         name="work.start_comment",
     )
 
-    # Load identity
-    try:
-        entry = await ctx.kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = _DEFAULT_IDENTITY_FALLBACK
+    identity = await load_identity(ctx.kv)
 
     memories, graph_context = await ctx.search_memories(f"{issue_title} {issue_body[:200]}")
 
