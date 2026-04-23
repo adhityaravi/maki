@@ -44,6 +44,48 @@ class GitHubIssueClient:
     def _repo_path(self) -> str:
         return f"{self._owner}/{self._repo}"
 
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        err_log: str,
+        err_extra: dict[str, Any] | None = None,
+        ok_log: str | None = None,
+        ok_extra: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response | None:
+        """Shared boilerplate for GitHub API calls.
+
+        Every public method repeats the same shape: attach GitHub App auth
+        headers, fire the request, ``raise_for_status``, log success or
+        exception, and return a typed default on failure. This helper collapses
+        that boilerplate into one place so future cross-cutting changes (retry,
+        rate-limit, metrics) land in a single spot.
+
+        - On success: returns the ``httpx.Response``. If ``ok_log`` is given,
+          emits an info log with ``ok_extra`` before returning — callers that
+          need response-dependent fields (e.g. the created issue number) should
+          omit ``ok_log`` and log themselves after post-processing.
+        - On failure: emits an exception log with ``err_extra`` and returns
+          ``None``. Callers translate ``None`` into their own typed default
+          (empty list, ``False``, ``None``, etc.).
+        """
+        try:
+            resp = await self._client.request(
+                method,
+                url,
+                headers=await self._auth.headers(),
+                **kwargs,
+            )
+            resp.raise_for_status()
+            if ok_log is not None:
+                log.info(ok_log, extra=ok_extra or {})
+            return resp
+        except Exception:
+            log.exception(err_log, extra=err_extra or {})
+            return None
+
     async def list_issues(
         self,
         state: str = "open",
@@ -71,12 +113,15 @@ class GitHubIssueClient:
                 if labels:
                     params["labels"] = labels
 
-                resp = await self._client.get(
+                resp = await self._request(
+                    "GET",
                     f"{API}/repos/{self._repo_path}/issues",
-                    headers=await self._auth.headers(),
+                    err_log="Failed to list GitHub issues",
+                    err_extra={"state": state, "page": page},
                     params=params,
                 )
-                resp.raise_for_status()
+                if resp is None:
+                    return []
                 raw = resp.json()
                 raw_count = len(raw)
 
@@ -121,17 +166,17 @@ class GitHubIssueClient:
         Returns the issue number if found, None otherwise.
         Used to avoid creating duplicate issues for the same todo.
         """
+        search_q = f'repo:{self._repo_path} is:issue is:open "{title_query}" in:title'
+        resp = await self._request(
+            "GET",
+            f"{API}/search/issues",
+            err_log="Failed to search GitHub issues",
+            params={"q": search_q, "per_page": 5},
+        )
+        if resp is None:
+            return None
         try:
-            # GitHub search API: search in repo, open issues only
-            search_q = f'repo:{self._repo_path} is:issue is:open "{title_query}" in:title'
-            resp = await self._client.get(
-                f"{API}/search/issues",
-                headers=await self._auth.headers(),
-                params={"q": search_q, "per_page": 5},
-            )
-            resp.raise_for_status()
             items = resp.json().get("items", [])
-
             # Find exact or close title match
             for item in items:
                 if title_query.lower() in item["title"].lower():
@@ -140,7 +185,6 @@ class GitHubIssueClient:
                         extra={"number": item["number"], "title": item["title"]},
                     )
                     return item["number"]
-
             return None
         except Exception:
             log.exception("Failed to search GitHub issues")
@@ -153,122 +197,109 @@ class GitHubIssueClient:
         labels: list[str] | None = None,
     ) -> int | None:
         """Create an issue and return the issue number, or None on failure."""
-        try:
-            payload: dict[str, Any] = {"title": title}
-            if body:
-                payload["body"] = body
-            if labels:
-                payload["labels"] = labels
-            resp = await self._client.post(
-                f"{API}/repos/{self._repo_path}/issues",
-                headers=await self._auth.headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            issue = resp.json()
-            log.info(
-                "GitHub issue created",
-                extra={"number": issue["number"], "title": title},
-            )
-            return issue["number"]
-        except Exception:
-            log.exception("Failed to create GitHub issue", extra={"title": title})
+        payload: dict[str, Any] = {"title": title}
+        if body:
+            payload["body"] = body
+        if labels:
+            payload["labels"] = labels
+        resp = await self._request(
+            "POST",
+            f"{API}/repos/{self._repo_path}/issues",
+            err_log="Failed to create GitHub issue",
+            err_extra={"title": title},
+            json=payload,
+        )
+        if resp is None:
             return None
+        issue = resp.json()
+        log.info(
+            "GitHub issue created",
+            extra={"number": issue["number"], "title": title},
+        )
+        return issue["number"]
 
     async def get_issue_comments(self, number: int, per_page: int = 50) -> list[dict[str, Any]]:
         """Fetch all comments on an issue. Returns list of comment dicts with 'author' and 'body'."""
-        try:
-            resp = await self._client.get(
-                f"{API}/repos/{self._repo_path}/issues/{number}/comments",
-                headers=await self._auth.headers(),
-                params={"per_page": per_page},
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-            comments = [
-                {
-                    "author": c.get("user", {}).get("login", "unknown"),
-                    "body": c.get("body", ""),
-                    "created_at": c.get("created_at", ""),
-                }
-                for c in raw
-            ]
-            log.info("GitHub issue comments fetched", extra={"number": number, "count": len(comments)})
-            return comments
-        except Exception:
-            log.exception("Failed to fetch issue comments", extra={"number": number})
+        resp = await self._request(
+            "GET",
+            f"{API}/repos/{self._repo_path}/issues/{number}/comments",
+            err_log="Failed to fetch issue comments",
+            err_extra={"number": number},
+            params={"per_page": per_page},
+        )
+        if resp is None:
             return []
+        raw = resp.json()
+        comments = [
+            {
+                "author": c.get("user", {}).get("login", "unknown"),
+                "body": c.get("body", ""),
+                "created_at": c.get("created_at", ""),
+            }
+            for c in raw
+        ]
+        log.info("GitHub issue comments fetched", extra={"number": number, "count": len(comments)})
+        return comments
 
     async def comment_issue(self, number: int, body: str) -> bool:
         """Add a comment to an issue. Returns True on success."""
-        try:
-            resp = await self._client.post(
-                f"{API}/repos/{self._repo_path}/issues/{number}/comments",
-                headers=await self._auth.headers(),
-                json={"body": body},
-            )
-            resp.raise_for_status()
-            log.info("GitHub issue comment added", extra={"number": number})
-            return True
-        except Exception:
-            log.exception("Failed to comment on issue", extra={"number": number})
-            return False
+        resp = await self._request(
+            "POST",
+            f"{API}/repos/{self._repo_path}/issues/{number}/comments",
+            ok_log="GitHub issue comment added",
+            ok_extra={"number": number},
+            err_log="Failed to comment on issue",
+            err_extra={"number": number},
+            json={"body": body},
+        )
+        return resp is not None
 
     async def get_issue(self, number: int) -> dict[str, Any] | None:
         """Fetch a single issue by number. Returns the issue dict or None on failure."""
-        try:
-            resp = await self._client.get(
-                f"{API}/repos/{self._repo_path}/issues/{number}",
-                headers=await self._auth.headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            log.exception("Failed to fetch issue", extra={"number": number})
-            return None
+        resp = await self._request(
+            "GET",
+            f"{API}/repos/{self._repo_path}/issues/{number}",
+            err_log="Failed to fetch issue",
+            err_extra={"number": number},
+        )
+        return resp.json() if resp is not None else None
 
     async def close_issue(self, number: int, comment: str = "") -> bool:
         """Close an issue, optionally with a closing comment. Returns True on success."""
-        try:
-            if comment:
-                await self.comment_issue(number, comment)
-            resp = await self._client.patch(
-                f"{API}/repos/{self._repo_path}/issues/{number}",
-                headers=await self._auth.headers(),
-                json={"state": "closed"},
-            )
-            resp.raise_for_status()
-            log.info("GitHub issue closed", extra={"number": number})
-            return True
-        except Exception:
-            log.exception("Failed to close issue", extra={"number": number})
-            return False
+        if comment:
+            await self.comment_issue(number, comment)
+        resp = await self._request(
+            "PATCH",
+            f"{API}/repos/{self._repo_path}/issues/{number}",
+            ok_log="GitHub issue closed",
+            ok_extra={"number": number},
+            err_log="Failed to close issue",
+            err_extra={"number": number},
+            json={"state": "closed"},
+        )
+        return resp is not None
 
     async def add_label(self, number: int, label: str) -> bool:
         """Add a label to an issue. Returns True on success."""
-        try:
-            resp = await self._client.post(
-                f"{API}/repos/{self._repo_path}/issues/{number}/labels",
-                headers=await self._auth.headers(),
-                json={"labels": [label]},
-            )
-            resp.raise_for_status()
-            log.info("GitHub issue label added", extra={"number": number, "label": label})
-            return True
-        except Exception:
-            log.exception("Failed to add label to issue", extra={"number": number, "label": label})
-            return False
+        resp = await self._request(
+            "POST",
+            f"{API}/repos/{self._repo_path}/issues/{number}/labels",
+            ok_log="GitHub issue label added",
+            ok_extra={"number": number, "label": label},
+            err_log="Failed to add label to issue",
+            err_extra={"number": number, "label": label},
+            json={"labels": [label]},
+        )
+        return resp is not None
 
     async def remove_label(self, number: int, label: str) -> bool:
         """Remove a label from an issue. Returns True on success."""
-        try:
-            resp = await self._client.delete(
-                f"{API}/repos/{self._repo_path}/issues/{number}/labels/{label}",
-                headers=await self._auth.headers(),
-            )
-            resp.raise_for_status()
-            log.info("GitHub issue label removed", extra={"number": number, "label": label})
-            return True
-        except Exception:
-            log.exception("Failed to remove label from issue", extra={"number": number, "label": label})
-            return False
+        resp = await self._request(
+            "DELETE",
+            f"{API}/repos/{self._repo_path}/issues/{number}/labels/{label}",
+            ok_log="GitHub issue label removed",
+            ok_extra={"number": number, "label": label},
+            err_log="Failed to remove label from issue",
+            err_extra={"number": number, "label": label},
+        )
+        return resp is not None
