@@ -2,6 +2,24 @@
 
 Translates OpenAI chat completion requests (including tool calling) into
 Claude SDK query() calls, using the host's Claude subscription via OAuth.
+
+OpenAI-compat support matrix
+----------------------------
+Honored:
+  - messages (roles: system, user, assistant, tool)
+  - tools (prompt-engineered into the system prompt)
+  - tool_choice: "auto" | "none" | "required"  (anything else → HTTP 400)
+  - response_format={"type":"json_object"}
+
+Accepted-but-ignored (claude_agent_sdk.invoke_claude does not expose them):
+  - temperature
+  - max_tokens
+  When a caller sets these explicitly, synapse logs a warning so the
+  mismatch is visible rather than silent.
+
+Response echoes the actual Claude model that served the request, not the
+`model` field from the request — `invoke_claude` always uses the `MODEL`
+env var, and lying about it would mislead clients that log/assert on it.
 """
 
 import asyncio
@@ -11,6 +29,7 @@ import os
 import re
 import time
 import uuid
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from maki_common import configure_logging
@@ -25,15 +44,37 @@ _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
+SUPPORTED_TOOL_CHOICE = ("auto", "none", "required")
+
 app = FastAPI(title="maki-synapse", version="0.0.1")
 
 
 # --- Request / Response models (OpenAI-compatible subset) ---
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCallItem(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str | None = None
+    # Present on role="tool" messages: identifies which assistant tool_call
+    # this message is the result of.
+    tool_call_id: str | None = None
+    # Optional function/tool name (used with role="tool" and legacy
+    # role="function" messages).
+    name: str | None = None
+    # Present on role="assistant" messages that previously invoked tools
+    # in a multi-turn flow.
+    tool_calls: list[ToolCallItem] | None = None
 
 
 class ToolFunction(BaseModel):
@@ -55,17 +96,6 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = 0
     max_tokens: int | None = 2000
     response_format: dict | None = None
-
-
-class ToolCallFunction(BaseModel):
-    name: str
-    arguments: str
-
-
-class ToolCallItem(BaseModel):
-    id: str
-    type: str = "function"
-    function: ToolCallFunction
 
 
 class ResponseMessage(BaseModel):
@@ -98,20 +128,61 @@ class ChatCompletionResponse(BaseModel):
 # --- Tool prompt building ---
 
 
-def build_tool_prompt(tools: list[ToolDefinition]) -> str:
+def build_tool_prompt(tools: list[ToolDefinition], *, required: bool = False) -> str:
     tool_descs = []
     for t in tools:
         tool_descs.append(
             f"- {t.function.name}: {t.function.description}\n  Parameters schema: {json.dumps(t.function.parameters)}"
         )
-    return (
+    header = (
         "\n\n---\n"
         "You have access to the following tools. To call a tool, respond ONLY "
         "with a JSON object in this exact format (no markdown, no explanation, no extra text):\n"
         '{"tool_calls": [{"name": "<tool_name>", "arguments": {<arguments>}}]}\n\n'
-        "If you don't need to call any tools, respond with plain text.\n\n"
-        "Available tools:\n" + "\n".join(tool_descs)
     )
+    if required:
+        header += "You MUST call one of the tools below. Do not answer in plain text.\n\n"
+    else:
+        header += "If you don't need to call any tools, respond with plain text.\n\n"
+    return header + "Available tools:\n" + "\n".join(tool_descs)
+
+
+# --- Message serialization for prompt-engineered tool flow ---
+
+
+def _serialize_messages(messages: list[ChatMessage]) -> tuple[list[str], list[str]]:
+    """Flatten OpenAI-style messages into (system_parts, user_parts).
+
+    The Claude Agent SDK has no notion of multi-turn tool results coming back
+    from the caller, so we inline prior assistant tool_calls and tool results
+    into the prompt stream as tagged text. This is best-effort: Mem0 (our
+    only caller today) never sends these, but any future multi-turn tool
+    caller should at least round-trip without data loss.
+    """
+    system_parts: list[str] = []
+    user_parts: list[str] = []
+    for msg in messages:
+        if msg.role == "system":
+            system_parts.append(msg.content or "")
+        elif msg.role == "user":
+            user_parts.append(msg.content or "")
+        elif msg.role == "assistant":
+            parts: list[str] = []
+            if msg.content:
+                parts.append(msg.content)
+            if msg.tool_calls:
+                call_descs = [f"{tc.function.name}({tc.function.arguments})" for tc in msg.tool_calls]
+                parts.append("[Tool calls: " + "; ".join(call_descs) + "]")
+            user_parts.append(f"Assistant: {' '.join(parts).strip()}")
+        elif msg.role in ("tool", "function"):
+            ident = msg.name or msg.tool_call_id or "tool"
+            user_parts.append(f"[Tool result from {ident}]: {msg.content or ''}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported message role: {msg.role!r}",
+            )
+    return system_parts, user_parts
 
 
 # --- JSON extraction ---
@@ -153,6 +224,21 @@ def _map_usage(token_usage: TokenUsage) -> Usage:
     )
 
 
+def _log_ignored_fields(req: ChatCompletionRequest) -> None:
+    """Warn when callers set fields that invoke_claude cannot honor."""
+    ignored: dict[str, Any] = {}
+    fields_set = req.model_fields_set
+    if "temperature" in fields_set:
+        ignored["temperature"] = req.temperature
+    if "max_tokens" in fields_set:
+        ignored["max_tokens"] = req.max_tokens
+    if ignored:
+        log.warning(
+            "synapse does not forward these OpenAI fields to the Claude SDK; they are ignored",
+            extra={"ignored_fields": ignored},
+        )
+
+
 # --- Endpoints ---
 
 
@@ -168,21 +254,25 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    system_parts = []
-    user_parts = []
+    # Validate tool_choice up front — silent mis-handling is the whole point
+    # of this endpoint's prior bug.
+    tool_choice = req.tool_choice or "auto"
+    if tool_choice not in SUPPORTED_TOOL_CHOICE:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Unsupported tool_choice: {req.tool_choice!r}. Supported values: {list(SUPPORTED_TOOL_CHOICE)}."),
+        )
 
-    for msg in req.messages:
-        if msg.role == "system":
-            system_parts.append(msg.content or "")
-        elif msg.role == "user":
-            user_parts.append(msg.content or "")
-        elif msg.role == "assistant":
-            user_parts.append(f"Assistant: {msg.content or ''}")
+    _log_ignored_fields(req)
 
+    system_parts, user_parts = _serialize_messages(req.messages)
     system_prompt = "\n".join(system_parts)
 
-    if req.tools:
-        system_prompt += build_tool_prompt(req.tools)
+    # tool_choice="none" means: act as if no tools were supplied.
+    effective_tools = req.tools if tool_choice != "none" else None
+
+    if effective_tools:
+        system_prompt += build_tool_prompt(effective_tools, required=(tool_choice == "required"))
 
     json_mode = req.response_format and req.response_format.get("type") == "json_object"
     if json_mode:
@@ -196,7 +286,14 @@ async def chat_completions(req: ChatCompletionRequest):
     request_id = f"synapse-{uuid.uuid4().hex[:12]}"
 
     try:
-        log.info("Invoking Claude", extra={"tools": bool(req.tools), "user_prompt_len": len(user_prompt)})
+        log.info(
+            "Invoking Claude",
+            extra={
+                "tools": bool(effective_tools),
+                "tool_choice": tool_choice,
+                "user_prompt_len": len(user_prompt),
+            },
+        )
         text, token_usage = await invoke_claude(
             user_prompt,
             model=MODEL,
@@ -232,6 +329,8 @@ async def chat_completions(req: ChatCompletionRequest):
                 except json.JSONDecodeError:
                     log.error("JSON retry also failed, returning 502", extra={"raw_preview": text[:200]})
                     raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))
@@ -242,7 +341,7 @@ async def chat_completions(req: ChatCompletionRequest):
     message: ResponseMessage
     finish_reason = "stop"
 
-    if req.tools and text.strip():
+    if effective_tools and text.strip():
         try:
             raw = extract_json_str(text)
             parsed = json.loads(raw)
@@ -272,7 +371,10 @@ async def chat_completions(req: ChatCompletionRequest):
     return ChatCompletionResponse(
         id=f"chatcmpl-{request_id}",
         created=int(time.time()),
-        model=req.model,
+        # Echo the actual model that served the request, not req.model.
+        # invoke_claude always uses MODEL, so reporting anything else would
+        # mislead clients that log or assert on response.model.
+        model=MODEL,
         choices=[Choice(message=message, finish_reason=finish_reason)],
         usage=usage,
     )
