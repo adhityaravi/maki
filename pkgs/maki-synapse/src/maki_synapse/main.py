@@ -303,11 +303,14 @@ async def chat_completions(req: ChatCompletionRequest):
         )
         log.info("Claude response", extra={"response_len": len(text)})
 
-        # JSON mode: validate extraction, retry once on failure
+        # JSON mode: validate extraction, retry once on failure.
+        # On success, replace text with the extracted JSON so callers receive a
+        # clean json.loads-able payload (not the original markdown-fenced text).
         if json_mode:
             raw = extract_json_str(text)
             try:
                 json.loads(raw)
+                text = raw
             except json.JSONDecodeError:
                 log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
                 retry_prompt = (
@@ -326,6 +329,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 retry_raw = extract_json_str(text)
                 try:
                     json.loads(retry_raw)
+                    text = retry_raw
                 except json.JSONDecodeError:
                     log.error("JSON retry also failed, returning 502", extra={"raw_preview": text[:200]})
                     raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
