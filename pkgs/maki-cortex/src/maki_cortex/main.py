@@ -59,6 +59,32 @@ _active_turn_mode: str | None = None
 _active_turn_started: float | None = None
 _active_task: asyncio.Task | None = None  # for preemption: cancel background turns
 
+# Health-check inputs — populated as startup progresses. The /health endpoint
+# returns 503 until all of these are wired so kubelet readiness probes
+# accurately reflect "ready to handle turns".
+_nc_ref = None
+_turn_sub_ref = None
+_heartbeat_task: asyncio.Task | None = None
+
+
+def _health_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the readiness/liveness probe."""
+    if _nc_ref is None or not _nc_ref.is_connected:
+        return False, "NATS not connected"
+    if _turn_sub_ref is None:
+        return False, "Turn subscription not yet initialised"
+    if getattr(_turn_sub_ref, "_closed", False):
+        return False, "Turn subscription closed"
+    if _heartbeat_task is None:
+        return False, "Heartbeat task not started"
+    if _heartbeat_task.done():
+        if _heartbeat_task.cancelled():
+            return False, "Heartbeat task cancelled"
+        exc = _heartbeat_task.exception()
+        return False, f"Heartbeat task crashed: {exc!r}"
+    return True, None
+
+
 _BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care", "trading_analyst"})
 
 # Error patterns that should be silent (not forwarded to Discord).
@@ -376,12 +402,16 @@ async def main():
         extra={"nats_url": NATS_URL, "model": MODEL, "max_turns": MAX_TURNS, "session_id": SESSION_ID},
     )
 
-    # Health server first — readiness probe must succeed immediately regardless of
-    # how long NATS or git clone take. Nothing below should block the probe.
-    await tcp_health_server(port=HEALTH_PORT)
+    # Health server up front so kubelet probes can connect from the moment
+    # the pod starts. The check returns 503 until NATS, the turn subscription
+    # and the heartbeat task are all live, which keeps readiness false during
+    # startup (no traffic routed) without killing the pod via liveness.
+    await tcp_health_server(port=HEALTH_PORT, check=_health_check)
     log.info("Health server started", extra={"port": HEALTH_PORT})
 
+    global _nc_ref, _turn_sub_ref, _heartbeat_task
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    _nc_ref = nc
     js = nc.jetstream()
     config_kv = await init_kv(js, "maki-cortex-config")
 
@@ -445,9 +475,10 @@ async def main():
     log.info("MCP tools registered")
 
     sub = await nc.subscribe(CORTEX_TURN_REQUEST, queue="maki-cortex")
+    _turn_sub_ref = sub
     log.info("Subscribed to turn requests", extra={"subject": CORTEX_TURN_REQUEST})
 
-    asyncio.create_task(heartbeat_loop(nc))
+    _heartbeat_task = asyncio.create_task(heartbeat_loop(nc))
     log.info("Heartbeat loop started")
 
     async for msg in sub.messages:

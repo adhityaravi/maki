@@ -242,6 +242,28 @@ _cortex_state: dict = {
     "turn_started": None,
 }
 
+# Health-check inputs — populated as startup progresses. The /health endpoint
+# returns 503 until NATS is up, the infra-lock KV is initialised and the
+# health-monitor scan loop is running. Without this, kubelet readiness was
+# meaningless: a totally broken immune was still routed traffic.
+_health_monitor_task: asyncio.Task | None = None
+
+
+def _health_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the readiness/liveness probe."""
+    if _nc is None or not _nc.is_connected:
+        return False, "NATS not connected"
+    if _lock_kv is None:
+        return False, "Infrastructure-lock KV not initialised"
+    if _health_monitor_task is None:
+        return False, "Health-monitor task not started"
+    if _health_monitor_task.done():
+        if _health_monitor_task.cancelled():
+            return False, "Health-monitor task cancelled"
+        exc = _health_monitor_task.exception()
+        return False, f"Health-monitor task crashed: {exc!r}"
+    return True, None
+
 
 # --- Infrastructure Lock ---
 
@@ -419,6 +441,7 @@ async def _site_query_handler(msg):
 
 async def main():
     global _nc, _js, _config_kv, _lock_kv, _deploy_history_kv, _state_kv, _k8s_v1, _k8s_apps_v1, _mcp_server
+    global _health_monitor_task
 
     log.info("maki-immune starting", extra={"nats_url": NATS_URL})
 
@@ -599,7 +622,7 @@ async def main():
     asyncio.create_task(deploy_mod.restart_propagate_listener())
     log.info("Started JetStream restart propagation listener", extra={"subject": RESTART_PROPAGATE})
 
-    asyncio.create_task(health_mod.health_monitor_loop())
+    _health_monitor_task = asyncio.create_task(health_mod.health_monitor_loop())
     asyncio.create_task(claude_mod.immune_heartbeat_loop())
     asyncio.create_task(claude_mod.passive_log_monitor_loop())
     asyncio.create_task(claude_mod.loop_heartbeat_watcher())
@@ -608,7 +631,7 @@ async def main():
     asyncio.create_task(health_mod.gossip_publisher())
     asyncio.create_task(health_mod.gossip_listener())
 
-    server = await tcp_health_server(port=HEALTH_PORT)
+    server = await tcp_health_server(port=HEALTH_PORT, check=_health_check)
     log.info("Health server listening", extra={"port": HEALTH_PORT})
 
     await server.serve_forever()

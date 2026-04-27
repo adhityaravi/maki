@@ -52,6 +52,17 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
+          livenessProbe:
+            # Generous threshold: 6 × 30s = 3min of /health failure before
+            # kubelet restarts the pod. Lets transient backend hiccups ride
+            # through; only kills genuinely stuck pods.
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
           resources:
             requests:
               memory: 256Mi
