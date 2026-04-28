@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from maki_common.repo import redact_token
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -26,7 +27,12 @@ def _safe_path(repo_path: str, relative: str) -> Path | None:
 
 
 async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
-    """Run a git command and return (returncode, stdout, stderr)."""
+    """Run a git command and return (returncode, stdout, stderr).
+
+    stdout/stderr are pre-redacted of any GitHub token — git's own error
+    messages echo the full remote URL (including `x-access-token:TOKEN@`),
+    and that text flows into both structured logs and MCP results.
+    """
     proc = await asyncio.create_subprocess_exec(
         "git",
         "-C",
@@ -36,11 +42,16 @@ async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
-    return proc.returncode, stdout.decode(), stderr.decode()
+    return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
 async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
-    """Run an arbitrary command in the repo directory and return (returncode, stdout, stderr)."""
+    """Run an arbitrary command in the repo directory and return (returncode, stdout, stderr).
+
+    Output is pre-redacted defensively — most callers run linters, but anything
+    that shells out near a git context can pick up a token from environment or
+    error chaining.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=repo_path,
@@ -48,7 +59,7 @@ async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
-    return proc.returncode, stdout.decode(), stderr.decode()
+    return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
 def make_code_tools(

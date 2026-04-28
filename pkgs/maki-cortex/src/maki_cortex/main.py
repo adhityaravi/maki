@@ -17,6 +17,7 @@ import uuid
 from maki_common import configure_logging, connect_nats, init_kv
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
+from maki_common.repo import redact_token
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
@@ -271,7 +272,17 @@ async def handle_turn_request(msg, nc, mcp_server):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    await proc.communicate()
+                    _stdout, _stderr = await proc.communicate()
+                    if proc.returncode != 0:
+                        # Redact: git error messages echo the full remote URL,
+                        # which contains the installation token.
+                        log.warning(
+                            "Auto-sync git command failed",
+                            extra={
+                                "cmd": git_cmd[3:],
+                                "stderr": redact_token(_stderr.decode(errors="replace")),
+                            },
+                        )
                 log.info("Auto-sync before turn", extra={"turn_id": turn_id})
                 # Invalidate code graph cache — files on disk changed
                 from maki_common.tools.codegraph_tools import _graph  # noqa: F811
@@ -443,7 +454,9 @@ async def main():
             text=True,
         )
         if result.returncode != 0:
-            log.error("Git clone failed", extra={"stderr": result.stderr})
+            # Redact: git's own clone error includes the auth URL, which carries
+            # a live installation token. Logs are forever; tokens shouldn't be.
+            log.error("Git clone failed", extra={"stderr": redact_token(result.stderr)})
         else:
             log.info("Repo cloned", extra={"path": REPO_PATH})
 
