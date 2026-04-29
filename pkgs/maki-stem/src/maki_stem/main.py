@@ -814,66 +814,65 @@ async def _process_turn(
         **({"model": chat_model} if chat_model else {}),
     }
 
-    queue = _pending.create(turn_id)
     full_response = []
 
     try:
-        await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(turn_payload).encode())
-        log.info("Turn request published", extra={"turn_id": turn_id})
+        async with _pending.session(turn_id) as queue:
+            await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(turn_payload).encode())
+            log.info("Turn request published", extra={"turn_id": turn_id})
 
-        while True:
-            try:
-                data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-            except TimeoutError:
-                log.error("Turn timed out", extra={"turn_id": turn_id})
-                await _nc.publish(
-                    CORTEX_STUCK,
-                    json.dumps(
-                        {
-                            "turn_id": turn_id,
-                            "mode": "normal",
-                            "timeout_seconds": TURN_TIMEOUT,
-                            "user_waiting": True,
-                        }
-                    ).encode(),
-                )
-                raise
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
+                except TimeoutError:
+                    log.error("Turn timed out", extra={"turn_id": turn_id})
+                    await _nc.publish(
+                        CORTEX_STUCK,
+                        json.dumps(
+                            {
+                                "turn_id": turn_id,
+                                "mode": "normal",
+                                "timeout_seconds": TURN_TIMEOUT,
+                                "user_waiting": True,
+                            }
+                        ).encode(),
+                    )
+                    raise
 
-            chunk_text = data.get("response", "")
-            done = data.get("done", False)
+                chunk_text = data.get("response", "")
+                done = data.get("done", False)
 
-            if chunk_text:
-                full_response.append(chunk_text)
+                if chunk_text:
+                    full_response.append(chunk_text)
 
-            if forward_to and (chunk_text or done):
-                ears_msg = {
-                    "message_id": forward_to["message_id"],
-                    "channel_id": forward_to["channel_id"],
-                    "turn_id": turn_id,
-                    "response": chunk_text,
-                    "done": done,
-                }
-                await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
+                if forward_to and (chunk_text or done):
+                    ears_msg = {
+                        "message_id": forward_to["message_id"],
+                        "channel_id": forward_to["channel_id"],
+                        "turn_id": turn_id,
+                        "response": chunk_text,
+                        "done": done,
+                    }
+                    await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
 
-            if done:
-                break
+                if done:
+                    break
 
-        cortex_response = "".join(full_response)
-        clean_response = strip_tags(cortex_response)
-        config_updates = parse_config_tags(cortex_response)
-        if config_updates:
-            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
+            cortex_response = "".join(full_response)
+            clean_response = strip_tags(cortex_response)
+            config_updates = parse_config_tags(cortex_response)
+            if config_updates:
+                await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
-        spawn_background(
-            _publish_turn_to_stream(turn_id, message, clean_response),
-            name="stem.publish_turn_to_stream",
-        )
-        spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
+            spawn_background(
+                _publish_turn_to_stream(turn_id, message, clean_response),
+                name="stem.publish_turn_to_stream",
+            )
+            spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
 
-        return turn_id, clean_response
+            return turn_id, clean_response
 
     finally:
-        _pending.remove(turn_id)
         _active_turns.pop(turn_id, None)
 
 

@@ -240,42 +240,42 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         **({"model": spec.model} if spec.model else {}),
     }
 
-    queue = ctx.pending.create(turn_id)
     try:
-        await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
-        log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
+        async with ctx.pending.session(turn_id) as queue:
+            await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
+            log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
 
-        response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
-        result_text = response_data.get("response", "")
-        clean_result = strip_tags(result_text or "")
-        log.info(
-            "Work turn complete",
-            extra={"turn_id": turn_id, "issue": issue_number},
-        )
-
-        spawn_background(
-            ctx.feed_memories(
-                f"[Night work] Task: {issue_title} (priority P{issue_priority})",
-                clean_result or "Task completed",
-            ),
-            name="work.feed_memories",
-        )
-
-        # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
-        # for infra changes and left it open for Adi to review). If so, skip auto-close.
-        refreshed = await ctx.github.get_issue(issue_number)
-        if refreshed and _issue_has_skip_label(refreshed):
+            response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
+            result_text = response_data.get("response", "")
+            clean_result = strip_tags(result_text or "")
             log.info(
-                "Issue has human/draft label after work — skipping auto-close",
-                extra={"issue": issue_number},
+                "Work turn complete",
+                extra={"turn_id": turn_id, "issue": issue_number},
             )
-        else:
-            ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-            close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
+
             spawn_background(
-                ctx.github.close_issue(issue_number, comment=close_comment),
-                name="work.close_issue",
+                ctx.feed_memories(
+                    f"[Night work] Task: {issue_title} (priority P{issue_priority})",
+                    clean_result or "Task completed",
+                ),
+                name="work.feed_memories",
             )
+
+            # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
+            # for infra changes and left it open for Adi to review). If so, skip auto-close.
+            refreshed = await ctx.github.get_issue(issue_number)
+            if refreshed and _issue_has_skip_label(refreshed):
+                log.info(
+                    "Issue has human/draft label after work — skipping auto-close",
+                    extra={"issue": issue_number},
+                )
+            else:
+                ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+                close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
+                spawn_background(
+                    ctx.github.close_issue(issue_number, comment=close_comment),
+                    name="work.close_issue",
+                )
 
     except TimeoutError:
         log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
@@ -311,9 +311,6 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ),
             name="work.failure_comment",
         )
-
-    finally:
-        ctx.pending.remove(turn_id)
 
 
 WORK_LOOP_SPEC = LoopSpec(

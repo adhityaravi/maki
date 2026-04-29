@@ -257,9 +257,8 @@ class MakiDiscordClient(discord.Client):
         await message.add_reaction(thinking_emoji)
 
         received_any = False
-        queue = _pending.create(str(message.id))
         try:
-            async with message.channel.typing():
+            async with _pending.session(str(message.id)) as queue, message.channel.typing():
                 while True:
                     # Use shorter timeout once we've received at least one chunk.
                     # If done signal is lost, we don't hang forever.
@@ -291,7 +290,6 @@ class MakiDiscordClient(discord.Client):
                     if done:
                         break
         finally:
-            _pending.remove(str(message.id))
             try:
                 await message.remove_reaction(thinking_emoji, self.user)
             except Exception:
@@ -327,9 +325,8 @@ async def _handle_immune_command(message: discord.Message, content: str):
     await message.add_reaction(thinking_emoji)
 
     # Wait for immune's response
-    queue = _immune_pending.create(str(message.id))
     try:
-        async with message.channel.typing():
+        async with _immune_pending.session(str(message.id)) as queue, message.channel.typing():
             try:
                 # Immune gets 5 minutes — it may need to investigate with Claude
                 data = await asyncio.wait_for(queue.get(), timeout=300.0)
@@ -341,7 +338,6 @@ async def _handle_immune_command(message: discord.Message, content: str):
             except TimeoutError:
                 await message.channel.send("Immune didn't respond in time. It may still be working on it.")
     finally:
-        _immune_pending.remove(str(message.id))
         try:
             await message.remove_reaction(thinking_emoji, _bot.user)
         except Exception:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -19,6 +21,11 @@ class PendingFutures:
         pending.resolve("msg-123", response_data)
         # ... the awaiter gets the result:
         result = await future
+
+    Or with the context manager (preferred — guarantees cleanup):
+        async with pending.session("msg-123") as future:
+            ...
+            result = await future
     """
 
     def __init__(self) -> None:
@@ -49,6 +56,19 @@ class PendingFutures:
     def __contains__(self, key: str) -> bool:
         return key in self._futures
 
+    @asynccontextmanager
+    async def session(self, key: str) -> AsyncIterator[asyncio.Future]:
+        """Create a future for ``key`` and guarantee removal on exit.
+
+        Eliminates the create/try/finally/remove boilerplate. The future is
+        always removed — even on exception inside the ``async with`` block.
+        """
+        future = self.create(key)
+        try:
+            yield future
+        finally:
+            self.remove(key)
+
 
 class PendingQueues:
     """Manage streaming request/response correlation via asyncio queues.
@@ -67,6 +87,11 @@ class PendingQueues:
             chunk = await queue.get()
             if chunk["done"]:
                 break
+
+    Or with the context manager (preferred — guarantees cleanup):
+        async with pending.session("msg-123") as queue:
+            ...
+            chunk = await queue.get()
     """
 
     def __init__(self) -> None:
@@ -113,3 +138,16 @@ class PendingQueues:
 
     def __contains__(self, key: str) -> bool:
         return key in self._queues
+
+    @asynccontextmanager
+    async def session(self, key: str) -> AsyncIterator[asyncio.Queue]:
+        """Create a queue for ``key`` and guarantee removal on exit.
+
+        Eliminates the create/try/finally/remove boilerplate. The queue is
+        always removed — even on exception inside the ``async with`` block.
+        """
+        queue = self.create(key)
+        try:
+            yield queue
+        finally:
+            self.remove(key)

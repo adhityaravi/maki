@@ -250,40 +250,38 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         **({"model": spec.model} if spec.model else {}),
     }
 
-    queue = ctx.pending.create(turn_id)
     try:
-        await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
-        log.info("Idle turn published", extra={"turn_id": turn_id})
+        async with ctx.pending.session(turn_id) as queue:
+            await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
+            log.info("Idle turn published", extra={"turn_id": turn_id})
 
-        # Idle reflection is single-shot — one response with done=True
-        response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-        thought = response_data.get("response", "")
+            # Idle reflection is single-shot — one response with done=True
+            response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
+            thought = response_data.get("response", "")
 
-        clean_thought = strip_tags(thought or "")
-        config_updates = parse_config_tags(thought or "")
-        if config_updates:
-            await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
+            clean_thought = strip_tags(thought or "")
+            config_updates = parse_config_tags(thought or "")
+            if config_updates:
+                await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
 
-        if clean_thought:
-            thought_payload = {"text": clean_thought, "turn_id": turn_id}
-            await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
-            log.info("Thought published", extra={"turn_id": turn_id})
+            if clean_thought:
+                thought_payload = {"text": clean_thought, "turn_id": turn_id}
+                await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
+                log.info("Thought published", extra={"turn_id": turn_id})
 
-            state_summary = ctx.format_system_state(system_state)
-            spawn_background(
-                ctx.feed_memories(
-                    f"[Idle reflection] System state: {state_summary}",
-                    clean_thought,
-                ),
-                name="idle.feed_memories",
-            )
+                state_summary = ctx.format_system_state(system_state)
+                spawn_background(
+                    ctx.feed_memories(
+                        f"[Idle reflection] System state: {state_summary}",
+                        clean_thought,
+                    ),
+                    name="idle.feed_memories",
+                )
 
     except TimeoutError:
         log.error("Idle turn timed out", extra={"turn_id": turn_id})
     except Exception:
         log.exception("Idle turn failed", extra={"turn_id": turn_id})
-    finally:
-        ctx.pending.remove(turn_id)
 
 
 IDLE_LOOP_SPEC = LoopSpec(
