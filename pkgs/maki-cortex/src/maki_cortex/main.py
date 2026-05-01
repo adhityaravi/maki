@@ -31,6 +31,15 @@ HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
+# Hard turn-duration watchdog. If a turn doesn't return within this window we
+# cancel it from inside the cortex so _active_turn state is cleared, slot
+# semaphores are released, and a `cancelled=True` done signal is published.
+# Without this, a hung invoke_claude / stream_claude (network stall, SDK
+# livelock, uncancellable native call) pins the cortex forever — the heartbeat
+# stays "healthy" (it runs in a separate task), and external stuck detection
+# only fires if the original submitter is still waiting. See issue #150.
+CORTEX_MAX_TURN_SECONDS = int(os.environ.get("CORTEX_MAX_TURN_SECONDS", "1200"))
+
 # GitHub App config (optional — enables self-evolution tools)
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
 GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
@@ -210,156 +219,214 @@ def build_conversation_prompt(turn: dict) -> str:
     return "<conversation_history>\n" + "\n".join(conv_lines) + "\n</conversation_history>"
 
 
-async def handle_turn_request(msg, nc, mcp_server):
-    """Process a single turn request."""
-    global _active_turn, _active_turn_mode, _active_turn_started
+async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> None:
+    """Inner turn processing — wrapped with asyncio.wait_for for the timeout watchdog.
 
+    Kept as a separate coroutine so a hard turn-duration timeout can cancel the
+    whole pipeline (auto-pull, prompt assembly, claude invocation/streaming) in
+    one place. See ``handle_turn_request``.
+    """
+    turn_model = turn.get("model") or MODEL
+    prompt = turn.get("prompt") or ""
+    use_stream = turn.get("stream", True)
+    max_turns = turn.get("max_turns", MAX_TURNS)
+    git_pull = turn.get("git_pull", True)
+
+    # Auto-pull latest code if requested by the loop
+    if git_pull and os.path.exists(REPO_PATH):
+        try:
+            if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
+                from maki_common.tools.github import GitHubAuth
+
+                _auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
+                _token = await _auth.get_token()
+                _url = f"https://x-access-token:{_token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
+                proc = await asyncio.create_subprocess_exec(
+                    "git",
+                    "-C",
+                    REPO_PATH,
+                    "remote",
+                    "set-url",
+                    "origin",
+                    _url,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+            # Hard reset to origin/main — no rebase, no merge conflicts.
+            # Any local-only state is stale (work turns commit+push everything).
+            for git_cmd in (
+                ["git", "-C", REPO_PATH, "fetch", "origin", "main"],
+                ["git", "-C", REPO_PATH, "reset", "--hard", "origin/main"],
+                ["git", "-C", REPO_PATH, "clean", "-fd"],
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    *git_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _stdout, _stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    # Redact: git error messages echo the full remote URL,
+                    # which contains the installation token.
+                    log.warning(
+                        "Auto-sync git command failed",
+                        extra={
+                            "cmd": git_cmd[3:],
+                            "stderr": redact_token(_stderr.decode(errors="replace")),
+                        },
+                    )
+            log.info("Auto-sync before turn", extra={"turn_id": turn_id})
+            # Invalidate code graph cache — files on disk changed
+            from maki_common.tools.codegraph_tools import _graph  # noqa: F811
+
+            if _graph is not None:
+                import maki_common.tools.codegraph_tools as _cg
+
+                _cg._graph = None
+                _cg._graph_repo_path = None
+        except Exception:
+            log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
+
+    static_context = build_system_prompt(turn)
+    conv_context = build_conversation_prompt(turn)
+
+    # Conversation history is XML-tagged and prepended to the human prompt —
+    # never mixed into the system prompt — so injected role: lines cannot
+    # be confused with live turns.
+    human_parts = []
+    if conv_context:
+        human_parts.append(conv_context)
+    if prompt:
+        human_parts.append(prompt)
+    full_prompt = "\n\n".join(human_parts) if human_parts else ""
+
+    if not use_stream:
+        # Single-shot with tools
+        response_text, usage = await invoke_claude(
+            full_prompt,
+            model=turn_model,
+            semaphore=_semaphore,
+            max_turns=max_turns,
+            mcp_servers={"maki": mcp_server},
+            mode=mode,
+            system_prompt=static_context or None,
+        )
+        response = {"turn_id": turn_id, "response": response_text, "done": True}
+        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+        log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
+        await _publish_token_usage(nc, turn_id, usage)
+    else:
+        # Streaming with tools
+        usage_out: list[TokenUsage] = []
+        async with _semaphore:
+            async for chunk in stream_claude(
+                full_prompt,
+                model=turn_model,
+                max_turns=max_turns,
+                mcp_servers={"maki": mcp_server},
+                mode=mode,
+                usage_out=usage_out,
+                system_prompt=static_context or None,
+            ):
+                response = {"turn_id": turn_id, "response": chunk, "done": False}
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+                log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
+
+        # Signal done
+        done_msg = {"turn_id": turn_id, "response": "", "done": True}
+        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        log.info("Turn stream complete", extra={"turn_id": turn_id})
+        if usage_out:
+            await _publish_token_usage(nc, turn_id, usage_out[0])
+
+
+async def handle_turn_request(msg, nc, mcp_server):
+    """Process a single turn request with a hard turn-duration watchdog.
+
+    The whole pipeline runs inside ``asyncio.wait_for`` so a hung
+    ``invoke_claude`` / ``stream_claude`` (network stall, SDK livelock,
+    uncancellable subprocess) cannot pin the cortex forever. On timeout:
+    cancel the body, log, publish a ``cancelled=True`` done signal so the
+    submitter is unblocked, and let ``finally`` clear ``_active_turn`` state
+    so the next turn can run. Heartbeat is in a separate task and stays
+    healthy throughout — without this, only an external CORTEX_STUCK signal
+    (from a still-waiting submitter) could ever recover the pod. See #150.
+    """
+    global _active_turn, _active_turn_mode, _active_turn_started, _active_task
+
+    # Parse turn id / mode early so every error path can reference them.
+    turn_id = "unknown"
+    mode = "unknown"
     try:
         turn = json.loads(msg.data.decode())
         turn_id = turn.get("turn_id", "unknown")
         mode = turn.get("mode", "normal")
-        turn_model = turn.get("model") or MODEL
-        prompt = turn.get("prompt") or ""
-        use_stream = turn.get("stream", True)
-        max_turns = turn.get("max_turns", MAX_TURNS)
-        git_pull = turn.get("git_pull", True)
-        log.info(
-            "Turn request received",
+    except Exception:
+        log.exception("Failed to parse turn request — dropping")
+        return
+
+    prompt_len = len(turn.get("prompt") or "")
+    turn_model = turn.get("model") or MODEL
+    use_stream = turn.get("stream", True)
+    log.info(
+        "Turn request received",
+        extra={
+            "turn_id": turn_id,
+            "mode": mode,
+            "prompt_len": prompt_len,
+            "model": turn_model,
+            "stream": use_stream,
+            "timeout_s": CORTEX_MAX_TURN_SECONDS,
+        },
+    )
+
+    # Track active turn for heartbeat visibility.
+    _active_turn = turn_id
+    _active_turn_mode = mode
+    _active_turn_started = time.time()
+
+    try:
+        await asyncio.wait_for(
+            _process_turn(turn, turn_id, mode, nc, mcp_server),
+            timeout=CORTEX_MAX_TURN_SECONDS,
+        )
+
+    except TimeoutError:
+        # Hard watchdog fired. _process_turn has already been cancelled by
+        # wait_for; we just need to log and unblock the submitter.
+        log.error(
+            "Turn exceeded hard timeout — cancelling",
             extra={
                 "turn_id": turn_id,
                 "mode": mode,
-                "prompt_len": len(prompt),
-                "model": turn_model,
-                "stream": use_stream,
+                "timeout_s": CORTEX_MAX_TURN_SECONDS,
             },
         )
-
-        # Track active turn for heartbeat visibility
-        _active_turn = turn_id
-        _active_turn_mode = mode
-        _active_turn_started = time.time()
-
-        # Auto-pull latest code if requested by the loop
-        if git_pull and os.path.exists(REPO_PATH):
-            try:
-                if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
-                    from maki_common.tools.github import GitHubAuth
-
-                    _auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
-                    _token = await _auth.get_token()
-                    _url = f"https://x-access-token:{_token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-                    proc = await asyncio.create_subprocess_exec(
-                        "git",
-                        "-C",
-                        REPO_PATH,
-                        "remote",
-                        "set-url",
-                        "origin",
-                        _url,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await proc.communicate()
-                # Hard reset to origin/main — no rebase, no merge conflicts.
-                # Any local-only state is stale (work turns commit+push everything).
-                for git_cmd in (
-                    ["git", "-C", REPO_PATH, "fetch", "origin", "main"],
-                    ["git", "-C", REPO_PATH, "reset", "--hard", "origin/main"],
-                    ["git", "-C", REPO_PATH, "clean", "-fd"],
-                ):
-                    proc = await asyncio.create_subprocess_exec(
-                        *git_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _stdout, _stderr = await proc.communicate()
-                    if proc.returncode != 0:
-                        # Redact: git error messages echo the full remote URL,
-                        # which contains the installation token.
-                        log.warning(
-                            "Auto-sync git command failed",
-                            extra={
-                                "cmd": git_cmd[3:],
-                                "stderr": redact_token(_stderr.decode(errors="replace")),
-                            },
-                        )
-                log.info("Auto-sync before turn", extra={"turn_id": turn_id})
-                # Invalidate code graph cache — files on disk changed
-                from maki_common.tools.codegraph_tools import _graph  # noqa: F811
-
-                if _graph is not None:
-                    import maki_common.tools.codegraph_tools as _cg
-
-                    _cg._graph = None
-                    _cg._graph_repo_path = None
-            except Exception:
-                log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
-
-        static_context = build_system_prompt(turn)
-        conv_context = build_conversation_prompt(turn)
-
-        # Conversation history is XML-tagged and prepended to the human prompt —
-        # never mixed into the system prompt — so injected role: lines cannot
-        # be confused with live turns.
-        human_parts = []
-        if conv_context:
-            human_parts.append(conv_context)
-        if prompt:
-            human_parts.append(prompt)
-        full_prompt = "\n\n".join(human_parts) if human_parts else ""
-
-        if not use_stream:
-            # Single-shot with tools
-            response_text, usage = await invoke_claude(
-                full_prompt,
-                model=turn_model,
-                semaphore=_semaphore,
-                max_turns=max_turns,
-                mcp_servers={"maki": mcp_server},
-                mode=mode,
-                system_prompt=static_context or None,
-            )
-            response = {"turn_id": turn_id, "response": response_text, "done": True}
-            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
-            log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
-            await _publish_token_usage(nc, turn_id, usage)
-        else:
-            # Streaming with tools
-            usage_out: list[TokenUsage] = []
-            async with _semaphore:
-                async for chunk in stream_claude(
-                    full_prompt,
-                    model=turn_model,
-                    max_turns=max_turns,
-                    mcp_servers={"maki": mcp_server},
-                    mode=mode,
-                    usage_out=usage_out,
-                    system_prompt=static_context or None,
-                ):
-                    response = {"turn_id": turn_id, "response": chunk, "done": False}
-                    await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
-                    log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
-
-            # Signal done
-            done_msg = {"turn_id": turn_id, "response": "", "done": True}
+        try:
+            done_msg = {
+                "turn_id": turn_id,
+                "response": "",
+                "done": True,
+                "cancelled": True,
+                "reason": "cortex_turn_timeout",
+            }
             await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-            log.info("Turn stream complete", extra={"turn_id": turn_id})
-            if usage_out:
-                await _publish_token_usage(nc, turn_id, usage_out[0])
+        except Exception:
+            log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
 
     except asyncio.CancelledError:
         log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
         done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-        return
+        try:
+            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        except Exception:
+            log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
+        # Re-raise so the cancelling caller sees the cancellation propagate.
+        raise
 
     except Exception as exc:
-        log.exception("Error handling turn request")
-        turn_id = "unknown"
-        try:
-            turn_id = json.loads(msg.data.decode()).get("turn_id", "unknown")
-        except Exception:
-            pass
+        log.exception("Error handling turn request", extra={"turn_id": turn_id})
 
         if _is_silent_error(exc):
             # Rate limits, turn budget, capacity — stay silent, don't spam Discord

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any
@@ -10,7 +11,15 @@ from typing import Any
 import httpx
 from kubernetes import client as k8s_client
 from maki_common import load_kv_config
-from maki_common.subjects import CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
+from maki_common.subjects import CORTEX_STUCK, CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
+
+# Wall-clock seconds a single cortex turn may run before immune publishes
+# CORTEX_STUCK as a safety net. Cortex has its own internal asyncio.wait_for
+# (CORTEX_MAX_TURN_SECONDS, default 1200s); this immune-side watchdog is the
+# layer-2 catch for the case the internal timeout doesn't fire — uncancellable
+# native call, asyncio loop wedged below the application layer, etc. Default
+# 1800s (30 min) leaves head-room above the cortex internal default. See #150.
+CORTEX_STUCK_THRESHOLD_S = int(os.environ.get("CORTEX_STUCK_THRESHOLD_S", "1800"))
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +61,11 @@ _token_stats: dict[str, Any] = {
     "turns": 0,
     "by_model": {},  # model -> {tokens, cost_usd, turns}
 }
+
+# Track which (turn_id, started_at) we've already published CORTEX_STUCK for so
+# the watchdog doesn't re-fire every health-check tick while the turn is still
+# wedged. Cleared whenever the active turn changes.
+_cortex_stuck_alerted: dict[str, Any] = {"turn_id": None, "turn_started": None}
 
 
 def init(
@@ -307,27 +321,85 @@ def component_healthy_in_hive(component: str) -> list[str]:
 
 
 def _check_cortex_heartbeat():
-    """Check if cortex heartbeat is recent and include turn state + hive context."""
+    """Check if cortex heartbeat is recent and include turn state + hive context.
+
+    Also acts as the layer-2 stuck-turn watchdog: if a turn has been running
+    longer than ``CORTEX_STUCK_THRESHOLD_S`` we publish ``CORTEX_STUCK`` so
+    the existing escalation path (``cortex_stuck_handler`` in claude.py) can
+    decide what to do — restart the pod, page Adi, etc. This is the safety net
+    for the case where cortex's own internal timeout failed to fire (e.g.,
+    uncancellable native call). Only the active turn is tracked, and we alert
+    once per (turn_id, turn_started) tuple to avoid spamming every tick.
+    """
     if _cortex_state["last_heartbeat"] == 0:
         return
-    age = time.time() - _cortex_state["last_heartbeat"]
+    now = time.time()
+    age = now - _cortex_state["last_heartbeat"]
     hive_total, hive_healthy = _hive_cortex_status()
     details: dict = {
         "last_heartbeat_age_s": round(age, 1),
         "hive_cortex_total": hive_total,
         "hive_cortex_healthy": hive_healthy,
     }
-    if _cortex_state["active_turn"]:
-        details["active_turn"] = _cortex_state["active_turn"]
-        details["turn_mode"] = _cortex_state["turn_mode"]
-        if _cortex_state["turn_started"]:
-            details["turn_running_s"] = round(time.time() - _cortex_state["turn_started"], 1)
+    active_turn = _cortex_state["active_turn"]
+    turn_mode = _cortex_state["turn_mode"]
+    turn_started = _cortex_state["turn_started"]
+    turn_running_s: float | None = None
+    if active_turn:
+        details["active_turn"] = active_turn
+        details["turn_mode"] = turn_mode
+        if turn_started:
+            turn_running_s = now - turn_started
+            details["turn_running_s"] = round(turn_running_s, 1)
 
     local_healthy = age < 60
     if not local_healthy and hive_healthy > 0:
         details["hive_note"] = f"cortex healthy on {hive_healthy} other site(s) — local issue only"
 
     _update_health("maki-cortex-heartbeat", local_healthy, details)
+
+    # Reset stuck-alerted tracking when the active turn changes (or clears).
+    if _cortex_stuck_alerted["turn_id"] != active_turn or _cortex_stuck_alerted["turn_started"] != turn_started:
+        _cortex_stuck_alerted["turn_id"] = active_turn
+        _cortex_stuck_alerted["turn_started"] = turn_started
+        _cortex_stuck_alerted["fired"] = False  # type: ignore[assignment]
+
+    # Layer-2 watchdog: cortex turn ran past the threshold and we haven't
+    # already escalated for this exact turn. Heartbeat must still be live —
+    # if heartbeat itself is stale, the regular health-check path handles
+    # the unhealthy state and a restart reflex can kick in.
+    if (
+        active_turn
+        and turn_running_s is not None
+        and turn_running_s > CORTEX_STUCK_THRESHOLD_S
+        and local_healthy
+        and not _cortex_stuck_alerted.get("fired")
+        and _nc is not None
+    ):
+        log.error(
+            "Cortex turn exceeded stuck threshold — publishing CORTEX_STUCK",
+            extra={
+                "turn_id": active_turn,
+                "turn_mode": turn_mode,
+                "turn_running_s": round(turn_running_s, 1),
+                "threshold_s": CORTEX_STUCK_THRESHOLD_S,
+            },
+        )
+        payload = json.dumps(
+            {
+                "turn_id": active_turn,
+                "mode": turn_mode or "unknown",
+                "timeout_seconds": int(turn_running_s),
+                "user_waiting": False,
+                "source": "immune_watchdog",
+            }
+        ).encode()
+        # Fire-and-forget so the synchronous check doesn't block the loop.
+        try:
+            asyncio.create_task(_nc.publish(CORTEX_STUCK, payload))
+        except Exception:
+            log.exception("Failed to schedule CORTEX_STUCK publish")
+        _cortex_stuck_alerted["fired"] = True  # type: ignore[assignment]
 
 
 async def cortex_heartbeat_listener():
