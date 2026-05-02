@@ -278,13 +278,9 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                     )
             log.info("Auto-sync before turn", extra={"turn_id": turn_id})
             # Invalidate code graph cache — files on disk changed
-            from maki_common.tools.codegraph_tools import _graph  # noqa: F811
+            from maki_common.tools.codegraph_tools import invalidate_graph_cache
 
-            if _graph is not None:
-                import maki_common.tools.codegraph_tools as _cg
-
-                _cg._graph = None
-                _cg._graph_repo_path = None
+            invalidate_graph_cache(REPO_PATH)
         except Exception:
             log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
 

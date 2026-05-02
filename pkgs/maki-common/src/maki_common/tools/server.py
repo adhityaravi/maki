@@ -6,6 +6,8 @@ import json
 import logging
 from typing import Any
 
+from maki_common.repo import RepoEntry, RepoRegistry
+
 log = logging.getLogger(__name__)
 
 # Bump: expose git push as standalone capability (tracked in issue #47)
@@ -56,6 +58,28 @@ IMMUNE_CONFIG_KEYS = {
 }
 
 
+def _build_repo_registry(
+    repo_path: str | None,
+    repo_owner: str | None,
+    repo_name: str | None,
+    github_auth: Any | None,
+) -> RepoRegistry | None:
+    """Construct a RepoRegistry seeded with the primary repo, or None."""
+    if not repo_path:
+        return None
+    registry = RepoRegistry()
+    registry.register(
+        RepoEntry(
+            path=repo_path,
+            owner=repo_owner or "",
+            name=repo_name or "",
+            auth=github_auth,
+        ),
+        default=True,
+    )
+    return registry
+
+
 def create_immune_tools(
     k8s_v1: Any,
     k8s_apps_v1: Any,
@@ -70,6 +94,8 @@ def create_immune_tools(
     recall_url: str | None = None,
     deploy_history: dict[str, str] | None = None,
     repo_path: str | None = None,
+    repo_owner: str | None = "adhityaravi",
+    repo_name: str | None = "maki",
 ) -> Any:
     """Create an in-process MCP server with immune-specific tools.
 
@@ -87,6 +113,8 @@ def create_immune_tools(
         recall_url: Base URL for maki-recall API (optional, enables memory tools).
         deploy_history: Mutable dict mapping deployment name to previous image (for rollbacks).
         repo_path: Local repo clone path (optional, enables code tools read-only).
+        repo_owner: GitHub owner of the primary repo (for repo registry metadata).
+        repo_name: GitHub name of the primary repo (for repo registry metadata).
     """
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -118,12 +146,13 @@ def create_immune_tools(
 
         all_tools.extend(make_config_tools(config_kv, allowed_keys=IMMUNE_CONFIG_KEYS))
 
-    if repo_path:
+    registry = _build_repo_registry(repo_path, repo_owner, repo_name, github_auth=None)
+    if registry is not None:
         from maki_common.tools.codegraph_tools import make_codegraph_tools
         from maki_common.tools.local_code import make_code_tools
 
-        all_tools.extend(make_code_tools(repo_path))
-        all_tools.extend(make_codegraph_tools(repo_path))
+        all_tools.extend(make_code_tools(registry))
+        all_tools.extend(make_codegraph_tools(registry))
 
     # Cross-site query tool — ask a specific site's immune for rich state
     from maki_common.subjects import IMMUNE_SITE_QUERY
@@ -215,7 +244,8 @@ def create_cortex_tools(
 
         github_auth = GitHubAuth(github_app_id, github_private_key, github_installation_id)
 
-    if repo_path:
+    registry = _build_repo_registry(repo_path, repo_owner, repo_name, github_auth=github_auth)
+    if registry is not None:
         from maki_common.subjects import MEMORY_STORE
         from maki_common.tools.codegraph_tools import make_codegraph_tools
         from maki_common.tools.local_code import make_code_edit_tools, make_code_tools
@@ -228,17 +258,14 @@ def create_cortex_tools(
             await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
             log.info("Commit memory published", extra={"sha": sha, "repo_url": url})
 
-        all_tools.extend(make_code_tools(repo_path))
+        all_tools.extend(make_code_tools(registry))
         all_tools.extend(
             make_code_edit_tools(
-                repo_path,
-                github_auth=github_auth,
-                repo_owner=repo_owner or "",
-                repo_name=repo_name or "",
+                registry,
                 on_commit_success=_on_commit_success,
             )
         )
-        all_tools.extend(make_codegraph_tools(repo_path))
+        all_tools.extend(make_codegraph_tools(registry))
 
     # Discord history search (routes through ears leader via NATS request/reply)
     from maki_common.tools.discord_search import make_discord_search_tools
