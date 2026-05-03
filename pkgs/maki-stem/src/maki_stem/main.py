@@ -66,6 +66,14 @@ NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
+# Single source of truth for the NATS queue group name shared across all stem
+# pods. Every write-side or request/reply listener MUST subscribe with this
+# queue so that a rolling deploy (where two pods coexist briefly) doesn't
+# cause duplicate writes or duplicate request handling. Broadcast listeners
+# (per-pod state, fan-out tool dispatch) intentionally omit it — see the
+# comment at each subscribe site.
+STEM_QUEUE = "maki-stem"
+
 KV_BUCKET = "maki-identity"
 KV_KEY = "identity"
 LOCK_BUCKET = "maki-lock"
@@ -197,6 +205,8 @@ def _truncate_for_title(text: str, max_len: int = 80) -> str:
 async def _response_listener():
     """Listen for cortex responses and push chunks into pending queues."""
     global _sub_response
+    # Broadcast: every pod tracks its own pendings, so each pod must see
+    # every response chunk. Do NOT add a queue group here.
     _sub_response = await _nc.subscribe(CORTEX_TURN_RESPONSE)
     sub = _sub_response
     log.info("Subscribed", extra={"subject": CORTEX_TURN_RESPONSE})
@@ -225,6 +235,8 @@ async def _cortex_heartbeat_watcher():
     Tracks sessions per instance_id to support multi-instance cortex.
     """
     global _sub_cortex_health
+    # Broadcast: each stem pod independently tracks cortex liveness/sessions.
+    # Do NOT add a queue group here.
     _sub_cortex_health = await _nc.subscribe(CORTEX_HEALTH)
     sub = _sub_cortex_health
     log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
@@ -909,7 +921,7 @@ async def _memory_store_listener():
     Each memory is stored concurrently as a background task.
     """
     global _sub_memory_store
-    _sub_memory_store = await _nc.subscribe(MEMORY_STORE, queue="maki-stem")
+    _sub_memory_store = await _nc.subscribe(MEMORY_STORE, queue=STEM_QUEUE)
     sub = _sub_memory_store
     log.info("Subscribed", extra={"subject": MEMORY_STORE})
     async for msg in sub.messages:
@@ -1010,7 +1022,7 @@ async def _handle_discord_message(data: dict):
 async def _ears_listener():
     """Listen for incoming Discord messages via NATS and dispatch as tasks."""
     global _sub_ears
-    _sub_ears = await _nc.subscribe(EARS_IN, queue="maki-stem")
+    _sub_ears = await _nc.subscribe(EARS_IN, queue=STEM_QUEUE)
     sub = _sub_ears
     log.info("Subscribed", extra={"subject": EARS_IN})
     async for msg in sub.messages:
@@ -1025,6 +1037,8 @@ async def _ears_listener():
 
 async def _config_sync_listener():
     """Apply config updates broadcast from other sites."""
+    # Broadcast: each pod owns its own KV cache, so every pod must apply
+    # the update locally. Do NOT add a queue group here.
     sub = await _nc.subscribe(CONFIG_SYNC)
     log.info("Subscribed", extra={"subject": CONFIG_SYNC})
     async for msg in sub.messages:
@@ -1047,7 +1061,7 @@ async def _db_query_listener():
     """
     from maki_common.tools.utils import mcp_result
 
-    sub = await _nc.subscribe(DB_QUERY)
+    sub = await _nc.subscribe(DB_QUERY, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": DB_QUERY})
     async for msg in sub.messages:
         try:
@@ -1109,7 +1123,7 @@ async def _pattern_query_listener():
 
     Returns JSON list of patterns for a given component.
     """
-    sub = await _nc.subscribe(PATTERN_QUERY)
+    sub = await _nc.subscribe(PATTERN_QUERY, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": PATTERN_QUERY})
     async for msg in sub.messages:
         try:
@@ -1159,7 +1173,7 @@ async def _pattern_update_listener():
 
     Supports bumping occurrence_count/confidence/last_seen_at for known patterns.
     """
-    sub = await _nc.subscribe(PATTERN_UPDATE)
+    sub = await _nc.subscribe(PATTERN_UPDATE, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": PATTERN_UPDATE})
     async for msg in sub.messages:
         try:
@@ -1191,7 +1205,7 @@ async def _pattern_write_listener():
 
     Inserts a new classified pattern. Skips silently if the component+pattern already exists.
     """
-    sub = await _nc.subscribe(PATTERN_WRITE)
+    sub = await _nc.subscribe(PATTERN_WRITE, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": PATTERN_WRITE})
     async for msg in sub.messages:
         try:

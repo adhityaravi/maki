@@ -20,6 +20,14 @@ from maki_common.subjects import (
 
 log = logging.getLogger(__name__)
 
+# Single source of truth for the NATS queue group shared across all stem pods.
+# Keep in sync with ``maki_stem.main.STEM_QUEUE``. Every write-side or
+# request/reply listener MUST subscribe with this queue so a rolling deploy
+# (where two pods coexist briefly) doesn't double-write or double-handle a
+# request. Broadcast/fan-out listeners intentionally omit it — see the
+# comment at each subscribe site.
+STEM_QUEUE = "maki-stem"
+
 
 # ── Trade signal persistence ─────────────────────────────────────────────────
 
@@ -30,7 +38,7 @@ async def trading_signal_listener(nc, db_pool) -> None:
     Subscribes to TRADING_SIGNAL, published by the trading loop after a
     proposal is accepted. Inserts into the ``trade_signals`` table.
     """
-    sub = await nc.subscribe(TRADING_SIGNAL)
+    sub = await nc.subscribe(TRADING_SIGNAL, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": TRADING_SIGNAL})
     async for msg in sub.messages:
         try:
@@ -84,7 +92,7 @@ async def trading_manual_listener(nc, lock_kv) -> None:
     from maki_loops.trading.capital import add_cash
     from maki_loops.trading.manual import parse_trade_command
 
-    sub = await nc.subscribe(TRADING_MANUAL_TRADE, queue="stem")
+    sub = await nc.subscribe(TRADING_MANUAL_TRADE, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": TRADING_MANUAL_TRADE})
 
     async def _ack(text: str) -> None:
@@ -183,6 +191,8 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
     has the tool, the requester's NATS request times out — that's fine
     and correct.
     """
+    # Intentional fan-out: every pod must see the request so the one
+    # holding the handler can answer. Do NOT add a queue group here.
     sub = await nc.subscribe(TRADING_TOOL_REQUEST)
     log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
     async for msg in sub.messages:
