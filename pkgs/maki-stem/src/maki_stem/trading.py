@@ -83,14 +83,16 @@ async def trading_signal_listener(nc, db_pool) -> None:
 async def trading_manual_listener(nc, lock_kv) -> None:
     """Handle ``!trade`` commands from ears.
 
-    ADDCASH grows the seed via :func:`maki_loops.trading.capital.add_cash`;
+    ADDCASH grows the seed via :func:`maki_common.trading.capital.add_cash`;
     BUY/SELL are parsed and appended to the trade book via
-    :func:`maki_loops.trading.book.append_trade`. Acks are published back
+    :func:`maki_common.trading.book.append_trade`. Acks are published back
     to EARS_OUT so Discord can display them.
     """
-    from maki_loops.trading.book import append_trade
-    from maki_loops.trading.capital import add_cash
-    from maki_loops.trading.manual import parse_trade_command
+    from maki_common.trading import (
+        add_cash,
+        append_trade,
+        parse_trade_command,
+    )
 
     sub = await nc.subscribe(TRADING_MANUAL_TRADE, queue=STEM_QUEUE)
     log.info("Subscribed", extra={"subject": TRADING_MANUAL_TRADE})

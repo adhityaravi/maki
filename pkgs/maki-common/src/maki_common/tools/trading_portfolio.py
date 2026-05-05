@@ -4,7 +4,7 @@ These tools work 24/7 (no running trading loop required). They read the
 canonical trade book (``trading.book.{symbol}``), capital seed
 (``trading.capital``), and watchlist (``trading.asset_config``) directly
 from the shared KV, and compute positions using the same average-cost
-basis as ``maki_loops.trading.book``.
+basis as :mod:`maki_common.trading.book`.
 
 Stem registers these as permanent handlers so Maki can query portfolio
 state at any time via the ``trading_tool`` bridge, including outside of
@@ -19,33 +19,27 @@ from datetime import UTC, datetime
 from typing import Any
 
 from maki_common.tools.utils import mcp_result
+from maki_common.trading import (
+    compute_position as _compute_position,
+)
+from maki_common.trading import (
+    load_book as _load_book,
+)
+from maki_common.trading import (
+    load_seed as _load_seed,
+)
+from maki_common.trading import (
+    safe_symbol as _safe,
+)
 
 log = logging.getLogger(__name__)
 
-# KV key conventions — must match maki-loops trading modules
-_KV_CAPITAL = "trading.capital"
+# KV key conventions for keys not owned by maki_common.trading
 _KV_ASSET_CONFIG = "trading.asset_config"
-_KV_BOOK_PREFIX = "trading.book"
 _KV_PRICE_PREFIX = "trading.price"  # trading.price.{symbol_safe}: {price, timestamp}
-
-_DEFAULT_SEED_EUR = 200.0  # Matches maki_loops.trading.capital default
-
-
-def _safe(symbol: str) -> str:
-    """Match maki_loops.trading.book._safe."""
-    return symbol.lower().replace("/", "_").replace(" ", "_")
 
 
 # ── KV readers ──────────────────────────────────────────────────────────────
-
-
-async def _load_seed(kv: Any) -> float:
-    try:
-        entry = await kv.get(_KV_CAPITAL)
-        data = json.loads(entry.value.decode())
-        return float(data.get("seed_eur", _DEFAULT_SEED_EUR))
-    except Exception:
-        return _DEFAULT_SEED_EUR
 
 
 async def _load_asset_config(kv: Any) -> dict[str, list[str]]:
@@ -59,16 +53,6 @@ async def _load_asset_config(kv: Any) -> dict[str, list[str]]:
 async def _load_all_symbols(kv: Any) -> list[str]:
     cfg = await _load_asset_config(kv)
     return cfg.get("crypto", []) + cfg.get("eu_stocks", []) + cfg.get("us_stocks", [])
-
-
-async def _load_book(kv: Any, symbol: str) -> list[dict]:
-    """Return raw trade entries (list of dicts) for *symbol*, or [] on miss."""
-    try:
-        entry = await kv.get(f"{_KV_BOOK_PREFIX}.{_safe(symbol)}")
-        raw = json.loads(entry.value.decode())
-        return raw if isinstance(raw, list) else []
-    except Exception:
-        return []
 
 
 async def _load_price(kv: Any, symbol: str) -> tuple[float, str | None]:
@@ -103,55 +87,6 @@ def _age_str(ts_iso: str | None) -> str:
     if hours < 24:
         return f"{hours:.1f}h ago"
     return f"{hours / 24:.1f}d ago"
-
-
-# ── Position math (mirror of maki_loops.trading.book.compute_position) ──────
-
-
-def _compute_position(symbol: str, entries: list[dict]) -> dict:
-    """Average-cost basis. Returns a plain dict (not a dataclass)."""
-    total_units_bought = 0.0
-    total_units_sold = 0.0
-    total_bought_eur = 0.0
-    total_sold_eur = 0.0
-
-    for e in entries:
-        price = float(e.get("price", 0) or 0)
-        size_eur = float(e.get("size_eur", 0) or 0)
-        if price <= 0:
-            continue
-        units = size_eur / price
-        direction = e.get("direction", "")
-        if direction == "buy":
-            total_units_bought += units
-            total_bought_eur += size_eur
-        elif direction == "sell":
-            total_units_sold += units
-            total_sold_eur += size_eur
-
-    avg_cost = total_bought_eur / total_units_bought if total_units_bought > 0 else 0.0
-
-    realized_pnl = 0.0
-    for e in entries:
-        if e.get("direction") != "sell":
-            continue
-        price = float(e.get("price", 0) or 0)
-        if price <= 0:
-            continue
-        sell_units = float(e.get("size_eur", 0) or 0) / price
-        realized_pnl += (price - avg_cost) * sell_units
-
-    net_units = max(0.0, total_units_bought - total_units_sold)
-    return {
-        "symbol": symbol,
-        "net_units": net_units,
-        "avg_cost": avg_cost,
-        "total_bought_eur": total_bought_eur,
-        "total_sold_eur": total_sold_eur,
-        "realized_pnl": realized_pnl,
-        "is_open": net_units > 1e-12,
-        "entries": entries,
-    }
 
 
 async def _load_all_positions(kv: Any) -> list[dict]:
