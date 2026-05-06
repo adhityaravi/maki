@@ -113,9 +113,63 @@ class SearchRequest(BaseModel):
     limit: int | None = None
 
 
+def _probe_pgvector() -> str | None:
+    """Cheapest possible pgvector reachability check.
+
+    Returns None on success, an error string on failure. Uses the PGVector
+    backend's own cursor context manager so we exercise the real connection
+    pool used by reads/writes — not a side-channel connection that could be
+    healthy while the pool is exhausted or the primary has flipped.
+    """
+    try:
+        with memory.vector_store._get_cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def _probe_neo4j() -> str | None:
+    """Cheapest possible Neo4j reachability check.
+
+    Returns None on success, an error string on failure. Uses the Langchain
+    Neo4jGraph wrapper that mem0 itself drives, so a green probe means the
+    same driver our writes go through is reachable.
+    """
+    try:
+        memory.graph.graph.query("RETURN 1 AS ok")
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "graph": graph_enabled}
+    """Liveness/readiness probe.
+
+    Returns 200 when the underlying stores are usable and 503 when they are
+    not, so k8s liveness probes and maki-immune can act on a real signal
+    instead of "FastAPI is alive". See issue #169.
+    """
+    checks: dict[str, Any] = {"status": "ok", "graph": graph_enabled}
+
+    pg_err = _probe_pgvector()
+    if pg_err is not None:
+        log.warning("recall /health pg probe failed: %s", pg_err)
+        checks["status"] = "degraded"
+        checks["pg"] = "down"
+
+    if graph_enabled:
+        neo_err = _probe_neo4j()
+        if neo_err is not None:
+            log.warning("recall /health neo4j probe failed: %s", neo_err)
+            checks["status"] = "degraded"
+            checks["neo4j"] = "down"
+
+    if checks["status"] != "ok":
+        return JSONResponse(status_code=503, content=checks)
+    return checks
 
 
 @app.post("/memories")
