@@ -12,6 +12,7 @@ import re
 import time
 from typing import Any
 
+from maki_common import subscribe_supervised
 from maki_common.subjects import (
     DEPLOY_PROPAGATE,
     IMMUNE_ACTION,
@@ -475,22 +476,23 @@ async def deploy_request_handler(msg):
 
 
 async def deploy_propagate_listener():
-    """JetStream durable consumer for deploy propagation."""
+    """JetStream durable consumer for deploy propagation.
+
+    Wrapped in ``subscribe_supervised`` so a JS reconnect or stream drain
+    doesn't silently terminate cross-site propagation (issue #175).
+    """
     from nats.js.api import DeliverPolicy
 
-    sub = await _js.subscribe(
+    await subscribe_supervised(
+        _nc,
         DEPLOY_PROPAGATE,
+        _deploy_propagate_handler,
+        js=_js,
         durable=f"immune-propagate-{_instance_id}",
         deliver_policy=DeliverPolicy.NEW,
+        auto_ack=True,
+        name="deploy_propagate",
     )
-    log.info("JetStream deploy propagation consumer started", extra={"durable": f"immune-propagate-{_instance_id}"})
-    async for msg in sub.messages:
-        try:
-            await _deploy_propagate_handler(msg)
-        except Exception:
-            log.exception("Deploy propagation listener error")
-        finally:
-            await msg.ack()
 
 
 async def _deploy_propagate_handler(msg):
@@ -793,22 +795,23 @@ async def restart_request_handler(msg):
 
 
 async def restart_propagate_listener():
-    """JetStream durable consumer for restart propagation."""
+    """JetStream durable consumer for restart propagation.
+
+    Wrapped in ``subscribe_supervised`` so a JS reconnect or stream drain
+    doesn't silently terminate cross-site propagation (issue #175).
+    """
     from nats.js.api import DeliverPolicy
 
-    sub = await _js.subscribe(
+    await subscribe_supervised(
+        _nc,
         RESTART_PROPAGATE,
+        _restart_propagate_handler,
+        js=_js,
         durable=f"immune-restart-{_instance_id}",
         deliver_policy=DeliverPolicy.NEW,
+        auto_ack=True,
+        name="restart_propagate",
     )
-    log.info("JetStream restart propagation consumer started", extra={"durable": f"immune-restart-{_instance_id}"})
-    async for msg in sub.messages:
-        try:
-            await _restart_propagate_handler(msg)
-        except Exception:
-            log.exception("Restart propagation listener error")
-        finally:
-            await msg.ack()
 
 
 async def _restart_propagate_handler(msg):

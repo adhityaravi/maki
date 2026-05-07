@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 from kubernetes import client as k8s_client
-from maki_common import load_kv_config
+from maki_common import load_kv_config, subscribe_supervised
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
 
 # Wall-clock seconds a single cortex turn may run before immune publishes
@@ -402,54 +402,67 @@ def _check_cortex_heartbeat():
         _cortex_stuck_alerted["fired"] = True  # type: ignore[assignment]
 
 
+async def _handle_cortex_heartbeat(msg) -> None:
+    _cortex_state["last_heartbeat"] = time.time()
+    payload = json.loads(msg.data.decode())
+    _cortex_state["active_turn"] = payload.get("active_turn")
+    _cortex_state["turn_mode"] = payload.get("turn_mode")
+    _cortex_state["turn_started"] = payload.get("turn_started")
+
+
 async def cortex_heartbeat_listener():
-    """Subscribe to cortex health heartbeat and parse enriched turn state."""
+    """Subscribe to cortex health heartbeat and parse enriched turn state.
+
+    Wrapped in ``subscribe_supervised`` so a silent subscription drop or a
+    NATS client close re-subscribes with backoff instead of leaving the task
+    finished and ``_cortex_state["last_heartbeat"]`` frozen — which would
+    flip ``maki-cortex-heartbeat`` unhealthy and could trigger a reflex
+    restart on a perfectly healthy cortex (issue #175).
+    """
     from maki_common.subjects import CORTEX_HEALTH
 
-    sub = await _nc.subscribe(CORTEX_HEALTH)
-    log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
-    async for msg in sub.messages:
-        try:
-            _cortex_state["last_heartbeat"] = time.time()
-            payload = json.loads(msg.data.decode())
-            _cortex_state["active_turn"] = payload.get("active_turn")
-            _cortex_state["turn_mode"] = payload.get("turn_mode")
-            _cortex_state["turn_started"] = payload.get("turn_started")
-        except Exception:
-            pass
+    await subscribe_supervised(
+        _nc,
+        CORTEX_HEALTH,
+        _handle_cortex_heartbeat,
+        name="cortex_heartbeat",
+    )
+
+
+async def _handle_token_usage(msg) -> None:
+    payload = json.loads(msg.data.decode())
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _token_stats["date"] != today:
+        _token_stats["date"] = today
+        _token_stats["total_tokens"] = 0
+        _token_stats["total_cost_usd"] = 0.0
+        _token_stats["turns"] = 0
+        _token_stats["by_model"] = {}
+
+    tokens = payload.get("total_tokens", 0)
+    cost = payload.get("total_cost_usd", 0.0)
+    model = payload.get("model", "unknown")
+
+    _token_stats["total_tokens"] += tokens
+    _token_stats["total_cost_usd"] += cost
+    _token_stats["turns"] += 1
+
+    if model not in _token_stats["by_model"]:
+        _token_stats["by_model"][model] = {"tokens": 0, "cost_usd": 0.0, "turns": 0}
+    _token_stats["by_model"][model]["tokens"] += tokens
+    _token_stats["by_model"][model]["cost_usd"] += cost
+    _token_stats["by_model"][model]["turns"] += 1
 
 
 async def token_usage_listener():
     """Subscribe to cortex token usage and accumulate daily stats."""
     subject = f"{CORTEX_TOKEN_USAGE}.{_site_name}"
-    sub = await _nc.subscribe(subject)
-    log.info("Subscribed", extra={"subject": subject})
-    async for msg in sub.messages:
-        try:
-            payload = json.loads(msg.data.decode())
-            today = datetime.now().strftime("%Y-%m-%d")
-            if _token_stats["date"] != today:
-                _token_stats["date"] = today
-                _token_stats["total_tokens"] = 0
-                _token_stats["total_cost_usd"] = 0.0
-                _token_stats["turns"] = 0
-                _token_stats["by_model"] = {}
-
-            tokens = payload.get("total_tokens", 0)
-            cost = payload.get("total_cost_usd", 0.0)
-            model = payload.get("model", "unknown")
-
-            _token_stats["total_tokens"] += tokens
-            _token_stats["total_cost_usd"] += cost
-            _token_stats["turns"] += 1
-
-            if model not in _token_stats["by_model"]:
-                _token_stats["by_model"][model] = {"tokens": 0, "cost_usd": 0.0, "turns": 0}
-            _token_stats["by_model"][model]["tokens"] += tokens
-            _token_stats["by_model"][model]["cost_usd"] += cost
-            _token_stats["by_model"][model]["turns"] += 1
-        except Exception:
-            pass
+    await subscribe_supervised(
+        _nc,
+        subject,
+        _handle_token_usage,
+        name="token_usage",
+    )
 
 
 # --- Health Monitor Loop ---
@@ -641,28 +654,30 @@ async def gossip_publisher():
         await asyncio.sleep(_check_interval)
 
 
+async def _handle_gossip(msg) -> None:
+    payload = json.loads(msg.data.decode())
+    site = payload.get("site", "unknown")
+    if site == _site_name:
+        return
+
+    was_new = site not in _hive_state
+    _hive_state[site] = {**payload, "received_at": time.time()}
+
+    if was_new:
+        log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
+
+    now = time.time()
+    stale = [s for s, v in _hive_state.items() if now - v["received_at"] > _gossip_stale_threshold]
+    for s in stale:
+        log.warning("Peer went silent, pruning", extra={"site": s})
+        del _hive_state[s]
+
+
 async def gossip_listener():
     """Subscribe to gossip from all immune instances, build hive-wide state."""
-    sub = await _nc.subscribe(IMMUNE_HEALTH)
-    log.info("Gossip listener started", extra={"subject": IMMUNE_HEALTH})
-    async for msg in sub.messages:
-        try:
-            payload = json.loads(msg.data.decode())
-            site = payload.get("site", "unknown")
-            if site == _site_name:
-                continue
-
-            was_new = site not in _hive_state
-            _hive_state[site] = {**payload, "received_at": time.time()}
-
-            if was_new:
-                log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
-
-            now = time.time()
-            stale = [s for s, v in _hive_state.items() if now - v["received_at"] > _gossip_stale_threshold]
-            for s in stale:
-                log.warning("Peer went silent, pruning", extra={"site": s})
-                del _hive_state[s]
-
-        except Exception:
-            log.exception("Gossip listener error")
+    await subscribe_supervised(
+        _nc,
+        IMMUNE_HEALTH,
+        _handle_gossip,
+        name="gossip",
+    )

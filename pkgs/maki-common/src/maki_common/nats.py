@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats
@@ -156,3 +157,124 @@ async def kv_get_float(kv: KeyValue, key: str, default: float = 0.0) -> float:
         return json.loads(entry.value.decode())
     except Exception:
         return default
+
+
+# --- Supervised subscriptions ---
+
+# Sentinel returned by ``subscribe_supervised`` so callers don't accidentally
+# treat the helper as returning a value. The function is meant to run forever;
+# it only exits via ``CancelledError``.
+MessageHandler = Callable[[Any], Awaitable[None]]
+
+
+async def subscribe_supervised(
+    nc: Any,
+    subject: str,
+    handler: MessageHandler,
+    *,
+    queue: str | None = None,
+    js: Any = None,
+    durable: str | None = None,
+    deliver_policy: Any = None,
+    auto_ack: bool | None = None,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    name: str | None = None,
+) -> None:
+    """Long-running supervised NATS subscription loop.
+
+    Subscribes to ``subject`` and dispatches every incoming message to
+    ``handler``. If the underlying ``async for sub.messages`` generator returns
+    — subscription unsubscribed, NATS connection terminally closed, internal
+    queue drain — this helper logs at WARNING level and re-subscribes with
+    exponential backoff. Same for failures inside ``await nc.subscribe`` /
+    ``js.subscribe`` itself.
+
+    Without this wrapper a bare ``async for msg in sub.messages`` loop exits
+    silently when the iterator is exhausted: the asyncio task simply
+    ``Task: result=None``s and the service goes blind to that subject with no
+    log, no health flip, no restart. See issue #175.
+
+    Args:
+        nc: Core NATS client (used for non-JetStream subscriptions and as a
+            connection-state probe).
+        subject: NATS subject to subscribe to.
+        handler: Async callable receiving each message.
+        queue: Optional queue group for core NATS subscribe.
+        js: JetStream context. When provided, ``js.subscribe`` is used and the
+            ``durable`` / ``deliver_policy`` kwargs apply.
+        durable: JetStream durable consumer name (only with ``js``).
+        deliver_policy: JetStream deliver policy (only with ``js``).
+        auto_ack: If True, ``await msg.ack()`` is called after the handler
+            returns (success or failure). Default: True for JetStream subs,
+            False for core NATS subs.
+        base_delay: Initial backoff delay in seconds (default 1.0).
+        max_delay: Maximum backoff delay in seconds (default 30.0).
+        name: Optional human-readable label for logs (defaults to ``subject``).
+
+    The coroutine never returns under normal operation — it loops forever and
+    only exits via ``asyncio.CancelledError``.
+    """
+    label = name or subject
+    if auto_ack is None:
+        auto_ack = js is not None
+    delay = base_delay
+
+    while True:
+        try:
+            if js is not None:
+                kwargs: dict[str, Any] = {}
+                if durable is not None:
+                    kwargs["durable"] = durable
+                if deliver_policy is not None:
+                    kwargs["deliver_policy"] = deliver_policy
+                sub = await js.subscribe(subject, **kwargs)
+            elif queue is not None:
+                sub = await nc.subscribe(subject, queue=queue)
+            else:
+                sub = await nc.subscribe(subject)
+
+            log.info(
+                "Supervised subscription active",
+                extra={"subject": subject, "sub_name": label, "jetstream": js is not None, "durable": durable},
+            )
+            delay = base_delay  # reset backoff after a successful subscribe
+
+            async for msg in sub.messages:
+                try:
+                    await handler(msg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Supervised handler error",
+                        extra={"subject": subject, "sub_name": label},
+                    )
+                finally:
+                    if auto_ack:
+                        try:
+                            await msg.ack()
+                        except Exception:
+                            log.exception(
+                                "Supervised ack failed",
+                                extra={"subject": subject, "sub_name": label},
+                            )
+
+            # async for exited without raising — subscription drained or the
+            # NATS client closed it. Loop and re-subscribe; this is the whole
+            # point of the supervisor.
+            log.warning(
+                "Supervised subscription stream ended — re-subscribing",
+                extra={"subject": subject, "sub_name": label, "retry_in": delay},
+            )
+        except asyncio.CancelledError:
+            log.info("Supervised subscription cancelled", extra={"subject": subject, "sub_name": label})
+            raise
+        except Exception:
+            log.exception(
+                "Supervised subscribe failed — retrying",
+                extra={"subject": subject, "sub_name": label, "retry_in": delay},
+            )
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, max_delay)
