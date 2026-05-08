@@ -666,7 +666,7 @@ async def main():
             _immune_channel_ids.clear()
             _trading_channel_ids.clear()
 
-            asyncio.create_task(_leader_renewal_loop())
+            renewal_task = asyncio.create_task(_leader_renewal_loop())
             search_task = asyncio.create_task(_search_listener())
 
             try:
@@ -674,6 +674,12 @@ async def main():
             except Exception:
                 log.exception("Discord bot disconnected")
             finally:
+                # Cancel both tasks tied to this bot session. Leaving the
+                # renewal loop alive across reconnects lets an orphaned task
+                # close the *next* bot when its CAS happens to fail — the
+                # global _bot rebinding makes the leak silently destructive.
+                # See #177.
+                renewal_task.cancel()
                 search_task.cancel()
                 log.info("Discord bot stopped, returning to standby")
         else:
