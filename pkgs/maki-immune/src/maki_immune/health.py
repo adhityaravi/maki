@@ -63,9 +63,18 @@ _token_stats: dict[str, Any] = {
 }
 
 # Track which (turn_id, started_at) we've already published CORTEX_STUCK for so
-# the watchdog doesn't re-fire every health-check tick while the turn is still
-# wedged. Cleared whenever the active turn changes.
-_cortex_stuck_alerted: dict[str, Any] = {"turn_id": None, "turn_started": None}
+# the watchdog doesn't re-fire every health-check tick. We re-arm on a
+# ``CORTEX_STUCK_THRESHOLD_S`` cadence: if the first escalation fails to
+# recover the pod (Claude path stalls, restart blocked, etc.) we keep
+# alerting until either the turn clears or kubelet restarts the pod via
+# the cortex liveness probe. See issue #185 — previous behaviour was
+# one-shot per turn_id, which left the system silently wedged for hours.
+_cortex_stuck_alerted: dict[str, Any] = {
+    "turn_id": None,
+    "turn_started": None,
+    "last_fired_at": 0.0,
+    "fire_count": 0,
+}
 
 
 def init(
@@ -362,44 +371,58 @@ def _check_cortex_heartbeat():
     if _cortex_stuck_alerted["turn_id"] != active_turn or _cortex_stuck_alerted["turn_started"] != turn_started:
         _cortex_stuck_alerted["turn_id"] = active_turn
         _cortex_stuck_alerted["turn_started"] = turn_started
-        _cortex_stuck_alerted["fired"] = False  # type: ignore[assignment]
+        _cortex_stuck_alerted["last_fired_at"] = 0.0
+        _cortex_stuck_alerted["fire_count"] = 0
 
-    # Layer-2 watchdog: cortex turn ran past the threshold and we haven't
-    # already escalated for this exact turn. Heartbeat must still be live —
-    # if heartbeat itself is stale, the regular health-check path handles
-    # the unhealthy state and a restart reflex can kick in.
+    # Layer-2 watchdog: cortex turn ran past the threshold. Heartbeat must
+    # still be live — if heartbeat itself is stale, the regular health-check
+    # path handles the unhealthy state and a restart reflex can kick in.
+    #
+    # Re-arming: the previous one-shot-per-turn_id behaviour meant a single
+    # failed escalation left the system silently wedged for hours (#185).
+    # Now we re-fire CORTEX_STUCK on a ``CORTEX_STUCK_THRESHOLD_S`` cadence
+    # until the turn clears or the pod is restarted.
     if (
         active_turn
         and turn_running_s is not None
         and turn_running_s > CORTEX_STUCK_THRESHOLD_S
         and local_healthy
-        and not _cortex_stuck_alerted.get("fired")
         and _nc is not None
     ):
-        log.error(
-            "Cortex turn exceeded stuck threshold — publishing CORTEX_STUCK",
-            extra={
-                "turn_id": active_turn,
-                "turn_mode": turn_mode,
-                "turn_running_s": round(turn_running_s, 1),
-                "threshold_s": CORTEX_STUCK_THRESHOLD_S,
-            },
-        )
-        payload = json.dumps(
-            {
-                "turn_id": active_turn,
-                "mode": turn_mode or "unknown",
-                "timeout_seconds": int(turn_running_s),
-                "user_waiting": False,
-                "source": "immune_watchdog",
-            }
-        ).encode()
-        # Fire-and-forget so the synchronous check doesn't block the loop.
-        try:
-            asyncio.create_task(_nc.publish(CORTEX_STUCK, payload))
-        except Exception:
-            log.exception("Failed to schedule CORTEX_STUCK publish")
-        _cortex_stuck_alerted["fired"] = True  # type: ignore[assignment]
+        last_fired = _cortex_stuck_alerted.get("last_fired_at") or 0.0
+        time_since_last = now - last_fired
+        first_fire = last_fired == 0.0
+        # Fire on first crossing, then re-arm every threshold interval.
+        if first_fire or time_since_last >= CORTEX_STUCK_THRESHOLD_S:
+            fire_count = int(_cortex_stuck_alerted.get("fire_count") or 0) + 1
+            log.error(
+                "Cortex turn exceeded stuck threshold — publishing CORTEX_STUCK",
+                extra={
+                    "turn_id": active_turn,
+                    "turn_mode": turn_mode,
+                    "turn_running_s": round(turn_running_s, 1),
+                    "threshold_s": CORTEX_STUCK_THRESHOLD_S,
+                    "fire_count": fire_count,
+                    "time_since_last_fire_s": round(time_since_last, 1) if not first_fire else None,
+                },
+            )
+            payload = json.dumps(
+                {
+                    "turn_id": active_turn,
+                    "mode": turn_mode or "unknown",
+                    "timeout_seconds": int(turn_running_s),
+                    "user_waiting": False,
+                    "source": "immune_watchdog",
+                    "fire_count": fire_count,
+                }
+            ).encode()
+            # Fire-and-forget so the synchronous check doesn't block the loop.
+            try:
+                asyncio.create_task(_nc.publish(CORTEX_STUCK, payload))
+            except Exception:
+                log.exception("Failed to schedule CORTEX_STUCK publish")
+            _cortex_stuck_alerted["last_fired_at"] = now
+            _cortex_stuck_alerted["fire_count"] = fire_count
 
 
 async def _handle_cortex_heartbeat(msg) -> None:

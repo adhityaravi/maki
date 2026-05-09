@@ -77,8 +77,25 @@ _turn_sub_ref = None
 _heartbeat_task: asyncio.Task | None = None
 
 
+# Liveness escape hatch: if a turn has been "running" for more than this
+# multiple of the soft watchdog, fail the health probe so kubelet SIGKILLs
+# the pod. This is the only way out when the asyncio loop is wedged below
+# the application layer (uncancellable native call, sync-blocking work
+# inside a turn task) — `asyncio.wait_for` can't fire if the loop never
+# reaches a suspension point. See issue #185.
+CORTEX_LIVENESS_TURN_MULTIPLIER = float(os.environ.get("CORTEX_LIVENESS_TURN_MULTIPLIER", "2.0"))
+
+
 def _health_check() -> tuple[bool, str | None]:
-    """Return (ok, reason) for the readiness/liveness probe."""
+    """Return (ok, reason) for the readiness/liveness probe.
+
+    On top of the usual NATS / subscription / heartbeat checks, fail the
+    probe when the active turn has been running far longer than the soft
+    watchdog allows. The soft watchdog (asyncio.wait_for inside
+    handle_turn_request) only fires at suspension points; if the event
+    loop is wedged below the application layer the only recovery is to
+    let kubelet SIGKILL the pod. See issue #185.
+    """
     if _nc_ref is None or not _nc_ref.is_connected:
         return False, "NATS not connected"
     if _turn_sub_ref is None:
@@ -92,6 +109,21 @@ def _health_check() -> tuple[bool, str | None]:
             return False, "Heartbeat task cancelled"
         exc = _heartbeat_task.exception()
         return False, f"Heartbeat task crashed: {exc!r}"
+
+    # Hard liveness escape: if a turn is wedged way past the soft watchdog
+    # window, kubelet must restart us. This is the only way out of an
+    # uncancellable native call or a wedged event loop.
+    if _active_turn_started is not None:
+        running_s = time.time() - _active_turn_started
+        liveness_threshold = CORTEX_LIVENESS_TURN_MULTIPLIER * CORTEX_MAX_TURN_SECONDS
+        if running_s > liveness_threshold:
+            return (
+                False,
+                f"Turn {_active_turn} wedged for {running_s:.0f}s "
+                f"(> {liveness_threshold:.0f}s = {CORTEX_LIVENESS_TURN_MULTIPLIER}x watchdog) — "
+                f"requesting kubelet restart",
+            )
+
     return True, None
 
 
@@ -298,7 +330,21 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
     full_prompt = "\n\n".join(human_parts) if human_parts else ""
 
     if not use_stream:
-        # Single-shot with tools
+        # Single-shot with tools. Timing brackets isolate hangs to the
+        # Claude invocation itself (vs prompt assembly / git auto-pull).
+        # Idle reflection takes this path (stream=False) and is the
+        # specific case wedging the cortex per issue #185.
+        log.info(
+            "Invoking Claude (single-shot)",
+            extra={
+                "turn_id": turn_id,
+                "mode": mode,
+                "model": turn_model,
+                "prompt_len": len(full_prompt),
+                "system_prompt_len": len(static_context or ""),
+            },
+        )
+        invoke_started = time.monotonic()
         response_text, usage = await invoke_claude(
             full_prompt,
             model=turn_model,
@@ -308,12 +354,32 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
             mode=mode,
             system_prompt=static_context or None,
         )
+        log.info(
+            "Claude invocation complete",
+            extra={
+                "turn_id": turn_id,
+                "mode": mode,
+                "duration_s": round(time.monotonic() - invoke_started, 2),
+                "response_len": len(response_text or ""),
+            },
+        )
         response = {"turn_id": turn_id, "response": response_text, "done": True}
         await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
         log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
         await _publish_token_usage(nc, turn_id, usage)
     else:
         # Streaming with tools
+        log.info(
+            "Invoking Claude (stream)",
+            extra={
+                "turn_id": turn_id,
+                "mode": mode,
+                "model": turn_model,
+                "prompt_len": len(full_prompt),
+                "system_prompt_len": len(static_context or ""),
+            },
+        )
+        stream_started = time.monotonic()
         usage_out: list[TokenUsage] = []
         async with _semaphore:
             async for chunk in stream_claude(
@@ -332,7 +398,13 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
         # Signal done
         done_msg = {"turn_id": turn_id, "response": "", "done": True}
         await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-        log.info("Turn stream complete", extra={"turn_id": turn_id})
+        log.info(
+            "Turn stream complete",
+            extra={
+                "turn_id": turn_id,
+                "duration_s": round(time.monotonic() - stream_started, 2),
+            },
+        )
         if usage_out:
             await _publish_token_usage(nc, turn_id, usage_out[0])
 
@@ -350,6 +422,15 @@ async def handle_turn_request(msg, nc, mcp_server):
     (from a still-waiting submitter) could ever recover the pod. See #150.
     """
     global _active_turn, _active_turn_mode, _active_turn_started, _active_task
+
+    # First-line breadcrumb: emitted *before* any work so we can prove from
+    # logs alone whether the dispatcher is even entering the handler. If
+    # this line is missing for a wedged turn, the NATS dispatch into
+    # handle_turn_request is starved (event loop blocked from a prior
+    # task). If it's present but "Turn request received" is not, the
+    # blockage is between this point and the JSON parse / log call below
+    # (extremely unlikely, but worth distinguishing). See issue #185.
+    log.info("Turn handler entered", extra={"data_len": len(msg.data) if msg.data else 0})
 
     # Parse turn id / mode early so every error path can reference them.
     turn_id = "unknown"
