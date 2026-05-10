@@ -482,14 +482,29 @@ async def _out_listener():
             turn_id = data.get("turn_id", "unknown")
             log.info("Loop output received", extra={"turn_id": turn_id, "text_len": len(text)})
 
-            # Route trading output to #maki-trading, everything else to #maki-general
-            is_trading = turn_id in ("discovery", "trading-summary")
-            target_ids = (_trading_channel_ids or _general_channel_ids) if is_trading else _general_channel_ids
+            # Routing intent comes from the publisher via the ``channel`` field.
+            # Default to "general" for back-compat with payloads that don't set it.
+            channel_kind = data.get("channel", "general")
+            channel_map = {
+                "general": _general_channel_ids,
+                "trading": _trading_channel_ids or _general_channel_ids,
+                "vitals": _vitals_channel_ids or _general_channel_ids,
+            }
+            target_ids = channel_map.get(channel_kind)
+            if target_ids is None:
+                log.warning(
+                    "Unknown channel kind — falling back to general",
+                    extra={"channel": channel_kind, "turn_id": turn_id},
+                )
+                target_ids = _general_channel_ids
             for channel_id in target_ids:
                 channel = _bot.get_channel(channel_id)
                 if channel:
                     await _send_response(channel, text)
-                    log.info("Loop output posted", extra={"channel_id": channel_id})
+                    log.info(
+                        "Loop output posted",
+                        extra={"channel_id": channel_id, "channel": channel_kind},
+                    )
 
         except Exception:
             log.exception("Error processing EARS_OUT message")

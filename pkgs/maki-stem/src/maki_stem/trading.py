@@ -101,7 +101,13 @@ async def trading_manual_listener(nc, lock_kv) -> None:
         try:
             await nc.publish(
                 EARS_OUT,
-                json.dumps({"text": text, "turn_id": "trading-manual"}).encode(),
+                json.dumps(
+                    {
+                        "text": text,
+                        "turn_id": "trading-manual",
+                        "channel": "trading",
+                    }
+                ).encode(),
             )
         except Exception:
             log.warning("Failed to publish manual-trade ack", exc_info=True)
