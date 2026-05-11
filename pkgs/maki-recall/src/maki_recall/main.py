@@ -83,16 +83,24 @@ log.info(
     },
 )
 
-try:
+# Phase 1: init vector store (pgvector + llm + embedder) without graph.
+# By separating vector init from graph init, a pgvector or embedder failure
+# propagates its real error message instead of being masked by a broad handler.
+graph_enabled = "graph_store" in config
+if graph_enabled:
+    vector_config = {k: v for k, v in config.items() if k != "graph_store"}
+    memory = Memory.from_config(vector_config)
+else:
     memory = Memory.from_config(config)
-    graph_enabled = "graph_store" in config
-except Exception:
-    if "graph_store" in config:
+
+# Phase 2: try graph store (Neo4j) as an optional add-on
+if graph_enabled:
+    try:
+        memory = Memory.from_config(config)
+    except Exception:
         log.warning("Graph store unreachable, falling back to vector-only")
         del config["graph_store"]
-        memory = Memory.from_config(config)
-    else:
-        raise
+        graph_enabled = False
 
 app = FastAPI(title="maki-recall", version="0.0.1")
 
