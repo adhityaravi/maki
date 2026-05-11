@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 
-from maki_common import configure_logging, connect_nats, init_kv
+from maki_common import configure_logging, connect_nats, init_kv, subscribe_supervised
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
 from maki_common.repo import redact_token
@@ -73,8 +73,11 @@ _active_task: asyncio.Task | None = None  # for preemption: cancel background tu
 # returns 503 until all of these are wired so kubelet readiness probes
 # accurately reflect "ready to handle turns".
 _nc_ref = None
-_turn_sub_ref = None
 _heartbeat_task: asyncio.Task | None = None
+# Critical listener tasks. They're wrapped in ``subscribe_supervised`` so
+# they should never exit cleanly on their own — if any of them is ``done()``
+# the readiness probe must flip red so kubelet restarts the pod (issue #175).
+_critical_listener_tasks: dict[str, asyncio.Task] = {}
 
 
 # Liveness escape hatch: if a turn has been "running" for more than this
@@ -98,10 +101,6 @@ def _health_check() -> tuple[bool, str | None]:
     """
     if _nc_ref is None or not _nc_ref.is_connected:
         return False, "NATS not connected"
-    if _turn_sub_ref is None:
-        return False, "Turn subscription not yet initialised"
-    if getattr(_turn_sub_ref, "_closed", False):
-        return False, "Turn subscription closed"
     if _heartbeat_task is None:
         return False, "Heartbeat task not started"
     if _heartbeat_task.done():
@@ -109,6 +108,17 @@ def _health_check() -> tuple[bool, str | None]:
             return False, "Heartbeat task cancelled"
         exc = _heartbeat_task.exception()
         return False, f"Heartbeat task crashed: {exc!r}"
+    # Critical listeners are wrapped in ``subscribe_supervised`` and should
+    # run forever. If any has exited, the readiness probe must fail so kubelet
+    # restarts the pod (issue #175).
+    if not _critical_listener_tasks:
+        return False, "Turn-request listener not started"
+    for label, task in _critical_listener_tasks.items():
+        if task.done():
+            if task.cancelled():
+                return False, f"{label} listener cancelled"
+            exc = task.exception()
+            return False, f"{label} listener crashed: {exc!r}"
 
     # Hard liveness escape: if a turn is wedged way past the soft watchdog
     # window, kubelet must restart us. This is the only way out of an
@@ -564,7 +574,7 @@ async def main():
     await tcp_health_server(port=HEALTH_PORT, check=_health_check)
     log.info("Health server started", extra={"port": HEALTH_PORT})
 
-    global _nc_ref, _turn_sub_ref, _heartbeat_task
+    global _nc_ref, _heartbeat_task
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _nc_ref = nc
     js = nc.jetstream()
@@ -631,14 +641,17 @@ async def main():
     )
     log.info("MCP tools registered")
 
-    sub = await nc.subscribe(CORTEX_TURN_REQUEST, queue="maki-cortex")
-    _turn_sub_ref = sub
-    log.info("Subscribed to turn requests", extra={"subject": CORTEX_TURN_REQUEST})
-
     _heartbeat_task = asyncio.create_task(heartbeat_loop(nc))
     log.info("Heartbeat loop started")
 
-    async for msg in sub.messages:
+    async def _handle_turn_message(msg) -> None:
+        """Dispatch one CORTEX_TURN_REQUEST message into a background task.
+
+        Kept narrow: preemption logic and per-turn task tracking stay here,
+        while the supervised loop owns the subscribe/iterate lifecycle so a
+        silent stream drain re-subscribes instead of leaving cortex blind to
+        new turns (issue #175).
+        """
         global _active_task
         try:
             turn = json.loads(msg.data.decode())
@@ -656,6 +669,26 @@ async def main():
         task = asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
         if is_background:
             _active_task = task
+
+    # Critical: the turn-request listener is the entire point of cortex. Wrap
+    # it in ``subscribe_supervised`` so a NATS reconnect or stream drain
+    # re-subscribes instead of silently exiting the loop (issue #175). Track
+    # the task in ``_critical_listener_tasks`` so the readiness probe flips
+    # red if it ever finishes (issue #192, mirrored from immune).
+    _critical_listener_tasks["turn_request"] = asyncio.create_task(
+        subscribe_supervised(
+            nc,
+            CORTEX_TURN_REQUEST,
+            _handle_turn_message,
+            queue="maki-cortex",
+            name="cortex.turn_request",
+        ),
+        name="cortex.turn_request_listener",
+    )
+    log.info("Supervised turn-request listener started", extra={"subject": CORTEX_TURN_REQUEST})
+
+    # Keep main() alive — supervised listener runs in the task above.
+    await asyncio.Event().wait()
 
 
 def cli():

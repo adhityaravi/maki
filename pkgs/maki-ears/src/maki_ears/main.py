@@ -11,7 +11,7 @@ import os
 import uuid
 
 import discord
-from maki_common import PendingQueues, configure_logging, connect_nats, init_kv
+from maki_common import PendingQueues, configure_logging, connect_nats, init_kv, subscribe_supervised
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
@@ -406,27 +406,102 @@ async def _handle_search_request(msg) -> None:
             await _nc.publish(msg.reply, json.dumps({"ok": False, "error": "Internal search error"}).encode())
 
 
+async def _dispatch_search(msg) -> None:
+    """Spawn-and-return: per-message task so a slow Discord call never blocks the supervisor."""
+    asyncio.create_task(_handle_search_request(msg))
+
+
 async def _search_listener() -> None:
     """Subscribe to maki.ears.search — active only while this instance is leader.
 
-    Started as a task when leadership is acquired and cancelled (with automatic
-    unsubscription) when the Discord bot disconnects or leadership is lost.
-    Each incoming message is handled in its own task so a slow Discord API call
-    never blocks the subscription loop.
+    Started as a task when leadership is acquired and cancelled when the
+    Discord bot disconnects or leadership is lost. Wrapped in
+    ``subscribe_supervised`` so a NATS reconnect / stream drain re-subscribes
+    instead of silently terminating the listener (issue #175).
     """
-    sub = await _nc.subscribe(EARS_SEARCH)
-    log.info("Subscribed to search requests", extra={"subject": EARS_SEARCH})
     try:
-        async for msg in sub.messages:
-            asyncio.create_task(_handle_search_request(msg))
-    except asyncio.CancelledError:
-        pass
+        await subscribe_supervised(
+            _nc,
+            EARS_SEARCH,
+            _dispatch_search,
+            name="ears.search",
+        )
     finally:
-        try:
-            await sub.unsubscribe()
-        except Exception:
-            pass
         log.info("Search listener stopped")
+
+
+async def _handle_ears_out(msg) -> None:
+    """Process one EARS_OUT message — chat reply, trade proposal, or loop output."""
+    try:
+        data = json.loads(msg.data.decode())
+
+        # Chat response (request/reply via pending queue)
+        message_id = data.get("message_id")
+        if message_id:
+            if _pending.push(message_id, data):
+                log.info(
+                    "Response chunk pushed",
+                    extra={"message_id": message_id, "done": data.get("done", False)},
+                )
+            else:
+                log.warning("Response for unknown message", extra={"message_id": message_id})
+            return
+
+        # Trade proposal with Buy/Sell + Skip buttons
+        proposal_id = data.get("proposal_id")
+        text = data.get("text", "")
+        if proposal_id and data.get("components") and text:
+            if _bot and not _bot.is_closed():
+                direction = data.get("direction", "buy")
+                symbol = data.get("symbol", "")
+                entry_price = float(data.get("entry_price") or 0.0)
+                view = TradeProposalView(proposal_id, symbol, direction, entry_price)
+                target_ids = _trading_channel_ids or _general_channel_ids
+                for channel_id in target_ids:
+                    channel = _bot.get_channel(channel_id)
+                    if channel:
+                        await channel.send(text, view=view)
+                        log.info(
+                            "Trade proposal posted",
+                            extra={"proposal_id": proposal_id, "channel_id": channel_id},
+                        )
+            else:
+                log.warning("Trade proposal dropped — Discord not connected", extra={"proposal_id": proposal_id})
+            return
+
+        # Loop output (fire-and-forget)
+        if not text:
+            return
+
+        turn_id = data.get("turn_id", "unknown")
+        log.info("Loop output received", extra={"turn_id": turn_id, "text_len": len(text)})
+
+        # Routing intent comes from the publisher via the ``channel`` field.
+        # Default to "general" for back-compat with payloads that don't set it.
+        channel_kind = data.get("channel", "general")
+        channel_map = {
+            "general": _general_channel_ids,
+            "trading": _trading_channel_ids or _general_channel_ids,
+            "vitals": _vitals_channel_ids or _general_channel_ids,
+        }
+        target_ids = channel_map.get(channel_kind)
+        if target_ids is None:
+            log.warning(
+                "Unknown channel kind — falling back to general",
+                extra={"channel": channel_kind, "turn_id": turn_id},
+            )
+            target_ids = _general_channel_ids
+        for channel_id in target_ids:
+            channel = _bot.get_channel(channel_id)
+            if channel:
+                await _send_response(channel, text)
+                log.info(
+                    "Loop output posted",
+                    extra={"channel_id": channel_id, "channel": channel_kind},
+                )
+
+    except Exception:
+        log.exception("Error processing EARS_OUT message")
 
 
 async def _out_listener():
@@ -434,150 +509,127 @@ async def _out_listener():
 
     Payload with ``message_id`` → push to pending queue (chat request/reply).
     Payload with ``text`` → fire-and-forget post to #maki-general (loop output).
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently terminating Discord output (issue #175).
     """
-    sub = await _nc.subscribe(EARS_OUT)
-    log.info("Subscribed", extra={"subject": EARS_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
+    await subscribe_supervised(
+        _nc,
+        EARS_OUT,
+        _handle_ears_out,
+        name="ears.out",
+    )
 
-            # Chat response (request/reply via pending queue)
-            message_id = data.get("message_id")
-            if message_id:
-                if _pending.push(message_id, data):
-                    log.info(
-                        "Response chunk pushed",
-                        extra={"message_id": message_id, "done": data.get("done", False)},
-                    )
-                else:
-                    log.warning("Response for unknown message", extra={"message_id": message_id})
-                continue
 
-            # Trade proposal with Buy/Sell + Skip buttons
-            proposal_id = data.get("proposal_id")
-            text = data.get("text", "")
-            if proposal_id and data.get("components") and text:
-                if _bot and not _bot.is_closed():
-                    direction = data.get("direction", "buy")
-                    symbol = data.get("symbol", "")
-                    entry_price = float(data.get("entry_price") or 0.0)
-                    view = TradeProposalView(proposal_id, symbol, direction, entry_price)
-                    target_ids = _trading_channel_ids or _general_channel_ids
-                    for channel_id in target_ids:
-                        channel = _bot.get_channel(channel_id)
-                        if channel:
-                            await channel.send(text, view=view)
-                            log.info(
-                                "Trade proposal posted",
-                                extra={"proposal_id": proposal_id, "channel_id": channel_id},
-                            )
-                else:
-                    log.warning("Trade proposal dropped — Discord not connected", extra={"proposal_id": proposal_id})
-                continue
+async def _handle_immune_response(msg) -> None:
+    """Process one EARS_IMMUNE_OUT message and push to pending queue."""
+    try:
+        data = json.loads(msg.data.decode())
+        message_id = data.get("message_id", "")
 
-            # Loop output (fire-and-forget)
-            if not text:
-                continue
-
-            turn_id = data.get("turn_id", "unknown")
-            log.info("Loop output received", extra={"turn_id": turn_id, "text_len": len(text)})
-
-            # Routing intent comes from the publisher via the ``channel`` field.
-            # Default to "general" for back-compat with payloads that don't set it.
-            channel_kind = data.get("channel", "general")
-            channel_map = {
-                "general": _general_channel_ids,
-                "trading": _trading_channel_ids or _general_channel_ids,
-                "vitals": _vitals_channel_ids or _general_channel_ids,
-            }
-            target_ids = channel_map.get(channel_kind)
-            if target_ids is None:
-                log.warning(
-                    "Unknown channel kind — falling back to general",
-                    extra={"channel": channel_kind, "turn_id": turn_id},
-                )
-                target_ids = _general_channel_ids
-            for channel_id in target_ids:
-                channel = _bot.get_channel(channel_id)
-                if channel:
-                    await _send_response(channel, text)
-                    log.info(
-                        "Loop output posted",
-                        extra={"channel_id": channel_id, "channel": channel_kind},
-                    )
-
-        except Exception:
-            log.exception("Error processing EARS_OUT message")
+        if _immune_pending.push(message_id, data):
+            log.info("Immune response pushed", extra={"message_id": message_id})
+        else:
+            log.warning("Immune response for unknown message", extra={"message_id": message_id})
+    except Exception:
+        log.exception("Error processing immune response")
 
 
 async def _immune_response_listener():
-    """Subscribe to NATS for immune command responses."""
-    sub = await _nc.subscribe(EARS_IMMUNE_OUT)
-    log.info("Subscribed", extra={"subject": EARS_IMMUNE_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            message_id = data.get("message_id", "")
+    """Subscribe to NATS for immune command responses.
 
-            if _immune_pending.push(message_id, data):
-                log.info("Immune response pushed", extra={"message_id": message_id})
-            else:
-                log.warning("Immune response for unknown message", extra={"message_id": message_id})
-        except Exception:
-            log.exception("Error processing immune response")
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently terminating (issue #175).
+    """
+    await subscribe_supervised(
+        _nc,
+        EARS_IMMUNE_OUT,
+        _handle_immune_response,
+        name="ears.immune_out",
+    )
+
+
+async def _handle_vitals(msg) -> None:
+    """Process one vitals digest and post to #maki-general.
+
+    ``subscribe_supervised`` handles the ack on our behalf (auto_ack defaults
+    to True for JetStream subs), so no ``msg.ack()`` here.
+    """
+    try:
+        data = json.loads(msg.data.decode())
+        digest = data.get("digest", "")
+        if not digest:
+            return
+
+        log.info("Health digest received", extra={"digest_len": len(digest)})
+        for channel_id in _vitals_channel_ids:
+            channel = _bot.get_channel(channel_id)
+            if channel:
+                await _send_response(channel, digest)
+                log.info("Digest posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
+
+        if not _vitals_channel_ids:
+            log.warning("No vitals channel available, digest dropped")
+    except Exception:
+        log.exception("Error processing vitals")
 
 
 async def _vitals_listener():
-    """Consume health digests from JetStream and post to #maki-general."""
-    sub = await _js.subscribe(EARS_VITALS_OUT, durable=f"ears-vitals-{INSTANCE_ID}", deliver_policy="new")
-    log.info("JetStream subscribed", extra={"subject": EARS_VITALS_OUT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            digest = data.get("digest", "")
-            if not digest:
-                await msg.ack()
-                continue
+    """Consume health digests from JetStream and post to #maki-general.
 
-            log.info("Health digest received", extra={"digest_len": len(digest)})
-            for channel_id in _vitals_channel_ids:
-                channel = _bot.get_channel(channel_id)
-                if channel:
-                    await _send_response(channel, digest)
-                    log.info("Digest posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
+    Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
+    re-subscribes the durable consumer instead of silently terminating
+    (issue #175). auto_ack=True (JS default) handles message acks.
+    """
+    await subscribe_supervised(
+        _nc,
+        EARS_VITALS_OUT,
+        _handle_vitals,
+        js=_js,
+        durable=f"ears-vitals-{INSTANCE_ID}",
+        deliver_policy="new",
+        name="ears.vitals",
+    )
 
-            if not _vitals_channel_ids:
-                log.warning("No vitals channel available, digest dropped")
-            await msg.ack()
-        except Exception:
-            log.exception("Error processing vitals")
+
+async def _handle_alert(msg) -> None:
+    """Process one immune alert and post to #maki-general."""
+    try:
+        data = json.loads(msg.data.decode())
+        alert = data.get("alert", "")
+        if not alert:
+            return
+
+        alert_text = f"**ALERT** {alert}"
+        log.info("Alert received", extra={"alert_preview": alert[:100]})
+        for channel_id in _vitals_channel_ids:
+            channel = _bot.get_channel(channel_id)
+            if channel:
+                await _send_response(channel, alert_text)
+                log.info("Alert posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
+
+        if not _vitals_channel_ids:
+            log.warning("No vitals channel available, alert dropped")
+    except Exception:
+        log.exception("Error processing alert")
 
 
 async def _alert_listener():
-    """Consume immune alerts from JetStream and post to #maki-general."""
-    sub = await _js.subscribe(IMMUNE_ALERT, durable=f"ears-alert-{INSTANCE_ID}", deliver_policy="new")
-    log.info("JetStream subscribed", extra={"subject": IMMUNE_ALERT})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            alert = data.get("alert", "")
-            if not alert:
-                await msg.ack()
-                continue
+    """Consume immune alerts from JetStream and post to #maki-general.
 
-            alert_text = f"**ALERT** {alert}"
-            log.info("Alert received", extra={"alert_preview": alert[:100]})
-            for channel_id in _vitals_channel_ids:
-                channel = _bot.get_channel(channel_id)
-                if channel:
-                    await _send_response(channel, alert_text)
-                    log.info("Alert posted", extra={"channel": VITALS_CHANNEL_NAME, "channel_id": channel_id})
-
-            if not _vitals_channel_ids:
-                log.warning("No vitals channel available, alert dropped")
-            await msg.ack()
-        except Exception:
-            log.exception("Error processing alert")
+    Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
+    re-subscribes the durable consumer instead of silently terminating
+    (issue #175). auto_ack=True (JS default) handles message acks.
+    """
+    await subscribe_supervised(
+        _nc,
+        IMMUNE_ALERT,
+        _handle_alert,
+        js=_js,
+        durable=f"ears-alert-{INSTANCE_ID}",
+        deliver_policy="new",
+        name="ears.alert",
+    )
 
 
 async def _send_response(channel, text: str):

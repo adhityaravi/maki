@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 
+from maki_common import subscribe_supervised
 from maki_common.subjects import (
     EARS_OUT,
     TRADING_MANUAL_TRADE,
@@ -37,10 +38,13 @@ async def trading_signal_listener(nc, db_pool) -> None:
 
     Subscribes to TRADING_SIGNAL, published by the trading loop after a
     proposal is accepted. Inserts into the ``trade_signals`` table.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent accepted
+    trade (issue #175).
     """
-    sub = await nc.subscribe(TRADING_SIGNAL, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": TRADING_SIGNAL})
-    async for msg in sub.messages:
+
+    async def _handle(msg) -> None:
         try:
             data = json.loads(msg.data.decode())
 
@@ -76,6 +80,14 @@ async def trading_signal_listener(nc, db_pool) -> None:
         except Exception:
             log.exception("Failed to persist trade signal")
 
+    await subscribe_supervised(
+        nc,
+        TRADING_SIGNAL,
+        _handle,
+        queue=STEM_QUEUE,
+        name="stem.trading_signal",
+    )
+
 
 # ── !trade command dispatch ──────────────────────────────────────────────────
 
@@ -87,15 +99,16 @@ async def trading_manual_listener(nc, lock_kv) -> None:
     BUY/SELL are parsed and appended to the trade book via
     :func:`maki_common.trading.book.append_trade`. Acks are published back
     to EARS_OUT so Discord can display them.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent !trade
+    command (issue #175).
     """
     from maki_common.trading import (
         add_cash,
         append_trade,
         parse_trade_command,
     )
-
-    sub = await nc.subscribe(TRADING_MANUAL_TRADE, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": TRADING_MANUAL_TRADE})
 
     async def _ack(text: str) -> None:
         try:
@@ -112,49 +125,49 @@ async def trading_manual_listener(nc, lock_kv) -> None:
         except Exception:
             log.warning("Failed to publish manual-trade ack", exc_info=True)
 
-    async for msg in sub.messages:
+    async def _handle(msg) -> None:
         try:
             data = json.loads(msg.data.decode())
             command = (data.get("command") or "").strip()
             tokens = command.split()
             if len(tokens) < 2:
-                continue
+                return
             verb = tokens[1].upper()
 
             if verb == "ADDCASH":
                 if len(tokens) < 3:
                     await _ack("❌ ADDCASH: missing amount")
-                    continue
+                    return
                 try:
                     amount = float(tokens[2])
                 except ValueError:
                     await _ack(f"❌ ADDCASH: invalid amount `{tokens[2]}`")
-                    continue
+                    return
                 try:
                     new_seed = await add_cash(lock_kv, amount)
                 except ValueError as exc:
                     await _ack(f"❌ ADDCASH: {exc}")
-                    continue
+                    return
                 log.info(
                     "Capital added",
                     extra={"amount_eur": amount, "new_seed": new_seed},
                 )
                 await _ack(f"💰 +€{amount:.2f} — seed now €{new_seed:.2f}")
-                continue
+                return
 
             # BUY / SELL — parse via manual module, append to book if priced
             try:
                 trade = parse_trade_command(command)
             except ValueError as exc:
                 await _ack(f"❌ {exc}")
-                continue
+                return
 
             if trade.price is None:
                 await _ack(
                     f"⚠️ {trade.direction.name} {trade.symbol} logged without price — "
                     "not appended to book (price required)"
                 )
-                continue
+                return
 
             await append_trade(
                 lock_kv,
@@ -180,6 +193,14 @@ async def trading_manual_listener(nc, lock_kv) -> None:
         except Exception:
             log.exception("Failed to process manual trade command")
 
+    await subscribe_supervised(
+        nc,
+        TRADING_MANUAL_TRADE,
+        _handle,
+        queue=STEM_QUEUE,
+        name="stem.trading_manual",
+    )
+
 
 # ── Cortex tool dispatch ─────────────────────────────────────────────────────
 
@@ -198,19 +219,22 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
     one pod win the race against the real answer from another. If no pod
     has the tool, the requester's NATS request times out — that's fine
     and correct.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent tool
+    request (issue #175). Intentional fan-out: every pod must see the
+    request so the one holding the handler can answer — no queue group.
     """
-    # Intentional fan-out: every pod must see the request so the one
-    # holding the handler can answer. Do NOT add a queue group here.
-    sub = await nc.subscribe(TRADING_TOOL_REQUEST)
-    log.info("Subscribed", extra={"subject": TRADING_TOOL_REQUEST})
-    async for msg in sub.messages:
+
+    async def _handle(msg) -> None:
+        data: dict = {}
         try:
             data = json.loads(msg.data.decode())
             tool_name = data.get("tool_name", "")
             tool_args = data.get("tool_args", {})
             handler = tool_registry.get(tool_name) or permanent_tools.get(tool_name)
             if handler is None:
-                continue  # not our tool — another pod will answer, or timeout
+                return  # not our tool — another pod will answer, or timeout
             result = await handler(tool_args)
             await msg.respond(json.dumps(result).encode())
         except Exception:
@@ -221,3 +245,10 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
                 await msg.respond(json.dumps(mcp_result("Internal tool error")).encode())
             except Exception:
                 pass
+
+    await subscribe_supervised(
+        nc,
+        TRADING_TOOL_REQUEST,
+        _handle,
+        name="stem.trading_tool",
+    )

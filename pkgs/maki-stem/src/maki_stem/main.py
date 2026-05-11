@@ -31,6 +31,7 @@ from maki_common import (
     parse_config_tags,
     spawn_background,
     strip_tags,
+    subscribe_supervised,
 )
 from maki_common.config import apply_config_updates
 from maki_common.subjects import (
@@ -150,10 +151,10 @@ _cortex_sessions: dict[str, str] = {}  # instance_id -> session_id
 _active_turns: dict[str, float] = {}  # turn_id → start timestamp
 _turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
-_sub_response = None  # NATS subscription: CORTEX_TURN_RESPONSE
-_sub_cortex_health = None  # NATS subscription: CORTEX_HEALTH
-_sub_memory_store = None  # NATS subscription: MEMORY_STORE
-_sub_ears = None  # NATS subscription: EARS_IN
+# Critical listener tasks. They're wrapped in ``subscribe_supervised`` so they
+# should never exit cleanly on their own — if any is ``done()`` the readiness
+# probe must flip red so kubelet restarts the pod (issue #175 / #192).
+_critical_listener_tasks: dict[str, asyncio.Task] = {}
 _loop_specs: list = []  # discovered LoopSpecs, populated in lifespan
 _stem_ctx = None  # StemContext, populated in lifespan
 _trading_tool_registry: dict = {}  # name → async handler, populated per trading run
@@ -202,27 +203,76 @@ def _truncate_for_title(text: str, max_len: int = 80) -> str:
     return first_line
 
 
+async def _handle_response(msg) -> None:
+    """Push one cortex response chunk into the pending queue."""
+    try:
+        data = json.loads(msg.data.decode())
+        turn_id = data.get("turn_id")
+        if turn_id and _pending.push(turn_id, data):
+            log.info(
+                "Response chunk pushed",
+                extra={"turn_id": turn_id, "done": data.get("done", False)},
+            )
+        else:
+            log.warning("Response for unknown turn", extra={"turn_id": turn_id})
+    except Exception:
+        log.exception("Error processing cortex response")
+
+
 async def _response_listener():
-    """Listen for cortex responses and push chunks into pending queues."""
-    global _sub_response
-    # Broadcast: every pod tracks its own pendings, so each pod must see
-    # every response chunk. Do NOT add a queue group here.
-    _sub_response = await _nc.subscribe(CORTEX_TURN_RESPONSE)
-    sub = _sub_response
-    log.info("Subscribed", extra={"subject": CORTEX_TURN_RESPONSE})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            turn_id = data.get("turn_id")
-            if turn_id and _pending.push(turn_id, data):
-                log.info(
-                    "Response chunk pushed",
-                    extra={"turn_id": turn_id, "done": data.get("done", False)},
+    """Listen for cortex responses and push chunks into pending queues.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of leaving every pending turn hanging until
+    ``TURN_TIMEOUT`` (issue #175). Broadcast: every pod tracks its own
+    pendings, so each pod must see every response chunk — no queue group.
+    """
+    await subscribe_supervised(
+        _nc,
+        CORTEX_TURN_RESPONSE,
+        _handle_response,
+        name="stem.cortex_response",
+    )
+
+
+async def _handle_cortex_heartbeat(msg) -> None:
+    """Track cortex session changes and cancel stale turns on restart."""
+    try:
+        payload = json.loads(msg.data.decode())
+        session_id = payload.get("session_id")
+        if not session_id:
+            return
+
+        instance_id = payload.get("instance_id", session_id)
+
+        if instance_id not in _cortex_sessions:
+            _cortex_sessions[instance_id] = session_id
+            log.info("Cortex session tracked", extra={"instance_id": instance_id, "session_id": session_id})
+            return
+
+        old_session = _cortex_sessions[instance_id]
+        if session_id != old_session:
+            _cortex_sessions[instance_id] = session_id
+            pending_keys = _pending.pending_keys()
+            if pending_keys:
+                cancelled = _pending.cancel_all()
+                log.warning(
+                    "Cortex restarted — cancelled stale turns",
+                    extra={
+                        "instance_id": instance_id,
+                        "old_session": old_session,
+                        "new_session": session_id,
+                        "cancelled_turns": cancelled,
+                        "turn_ids": pending_keys,
+                    },
                 )
             else:
-                log.warning("Response for unknown turn", extra={"turn_id": turn_id})
-        except Exception:
-            log.exception("Error processing cortex response")
+                log.info(
+                    "Cortex instance restarted (no pending turns)",
+                    extra={"instance_id": instance_id, "old_session": old_session, "new_session": session_id},
+                )
+    except Exception:
+        log.exception("Error in cortex heartbeat watcher")
 
 
 async def _cortex_heartbeat_watcher():
@@ -230,53 +280,21 @@ async def _cortex_heartbeat_watcher():
 
     When cortex restarts mid-turn, its session_id changes. We detect this
     and cancel all pending turns immediately instead of waiting 30 minutes
-    for the timeout.
+    for the timeout. Tracks sessions per instance_id to support
+    multi-instance cortex.
 
-    Tracks sessions per instance_id to support multi-instance cortex.
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of leaving ``_cortex_sessions`` frozen and
+    `_HEALTH_KEYWORDS` queries silently returning stale state (issue #175).
+    Broadcast: each stem pod tracks cortex liveness independently — no
+    queue group.
     """
-    global _sub_cortex_health
-    # Broadcast: each stem pod independently tracks cortex liveness/sessions.
-    # Do NOT add a queue group here.
-    _sub_cortex_health = await _nc.subscribe(CORTEX_HEALTH)
-    sub = _sub_cortex_health
-    log.info("Subscribed", extra={"subject": CORTEX_HEALTH})
-    async for msg in sub.messages:
-        try:
-            payload = json.loads(msg.data.decode())
-            session_id = payload.get("session_id")
-            if not session_id:
-                continue
-
-            instance_id = payload.get("instance_id", session_id)
-
-            if instance_id not in _cortex_sessions:
-                _cortex_sessions[instance_id] = session_id
-                log.info("Cortex session tracked", extra={"instance_id": instance_id, "session_id": session_id})
-                continue
-
-            old_session = _cortex_sessions[instance_id]
-            if session_id != old_session:
-                _cortex_sessions[instance_id] = session_id
-                pending_keys = _pending.pending_keys()
-                if pending_keys:
-                    cancelled = _pending.cancel_all()
-                    log.warning(
-                        "Cortex restarted — cancelled stale turns",
-                        extra={
-                            "instance_id": instance_id,
-                            "old_session": old_session,
-                            "new_session": session_id,
-                            "cancelled_turns": cancelled,
-                            "turn_ids": pending_keys,
-                        },
-                    )
-                else:
-                    log.info(
-                        "Cortex instance restarted (no pending turns)",
-                        extra={"instance_id": instance_id, "old_session": old_session, "new_session": session_id},
-                    )
-        except Exception:
-            log.exception("Error in cortex heartbeat watcher")
+    await subscribe_supervised(
+        _nc,
+        CORTEX_HEALTH,
+        _handle_cortex_heartbeat,
+        name="stem.cortex_health",
+    )
 
 
 async def _seed_identity():
@@ -323,49 +341,57 @@ async def _init_conversation_stream():
         log.info("Starting with empty conversation history")
 
 
+async def _handle_conversation_sync(msg) -> None:
+    """Sync one conversation turn into _conversation_history.
+
+    ``subscribe_supervised`` handles JS acking (auto_ack=True), so no
+    ``msg.ack()`` here.
+    """
+    try:
+        turn_doc = json.loads(msg.data.decode())
+        turn_id = turn_doc.get("turn_id", "")
+
+        # Skip if we already have this turn (we added it locally in _publish_turn_to_stream)
+        if any(t.get("turn_id") == turn_id for t in _conversation_history[-50:]):
+            return
+
+        _conversation_history.append(turn_doc)
+
+        # Keep bounded
+        while len(_conversation_history) > STREAM_MAX_MSGS:
+            _conversation_history.pop(0)
+
+        log.info(
+            "Conversation synced from stream",
+            extra={"turn_id": turn_id, "instance": turn_doc.get("instance_id", "?")},
+        )
+    except Exception:
+        log.exception("Error syncing conversation")
+
+
 async def _conversation_sync_listener():
     """Live subscriber to conversation stream — keeps _conversation_history in sync.
 
     Ensures that all stem instances see turns processed by any instance.
     Uses a durable push consumer so we don't miss messages while running.
+
+    Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
+    re-subscribes instead of silently freezing the conversation history
+    (issue #175).
     """
-    # Use deliver_last_per_subject to start from where we left off (after startup replay)
-    # Subscribe with a unique durable name per instance to get independent delivery
+    # Use deliver_last_per_subject to start from where we left off (after startup replay).
+    # Subscribe with a unique durable name per instance to get independent delivery.
     consumer_name = f"stem-sync-{INSTANCE_ID}"
-    try:
-        sub = await _js.subscribe(
-            CONVERSATION_STREAM,
-            durable=consumer_name,
-            deliver_policy=nats.js.api.DeliverPolicy.LAST_PER_SUBJECT,
-        )
-    except Exception:
-        # Fallback: ordered consumer starting from now (may miss some, but won't crash)
-        sub = await _js.subscribe(CONVERSATION_STREAM, ordered_consumer=True)
-
     log.info("Conversation sync listener started", extra={"instance_id": INSTANCE_ID})
-    async for msg in sub.messages:
-        try:
-            turn_doc = json.loads(msg.data.decode())
-            turn_id = turn_doc.get("turn_id", "")
-
-            # Skip if we already have this turn (we added it locally in _publish_turn_to_stream)
-            if any(t.get("turn_id") == turn_id for t in _conversation_history[-50:]):
-                await msg.ack()
-                continue
-
-            _conversation_history.append(turn_doc)
-
-            # Keep bounded
-            while len(_conversation_history) > STREAM_MAX_MSGS:
-                _conversation_history.pop(0)
-
-            log.info(
-                "Conversation synced from stream",
-                extra={"turn_id": turn_id, "instance": turn_doc.get("instance_id", "?")},
-            )
-            await msg.ack()
-        except Exception:
-            log.exception("Error syncing conversation")
+    await subscribe_supervised(
+        _nc,
+        CONVERSATION_STREAM,
+        _handle_conversation_sync,
+        js=_js,
+        durable=consumer_name,
+        deliver_policy=nats.js.api.DeliverPolicy.LAST_PER_SUBJECT,
+        name="stem.conversation_sync",
+    )
 
 
 async def _publish_turn_to_stream(turn_id: str, user_message: str, cortex_response: str):
@@ -720,19 +746,39 @@ async def lifespan(app: FastAPI):
 
     _github = _init_github_client()
 
-    spawn_background(_response_listener(), name="stem.response_listener")
-    spawn_background(_cortex_heartbeat_watcher(), name="stem.cortex_heartbeat_watcher")
-    spawn_background(_conversation_sync_listener(), name="stem.conversation_sync_listener")
-    spawn_background(_ears_listener(), name="stem.ears_listener")
-    spawn_background(_memory_store_listener(), name="stem.memory_store_listener")
-    spawn_background(_config_sync_listener(), name="stem.config_sync_listener")
-    spawn_background(_db_query_listener(), name="stem.db_query_listener")
-    spawn_background(_pattern_query_listener(), name="stem.pattern_query_listener")
-    spawn_background(_pattern_update_listener(), name="stem.pattern_update_listener")
-    spawn_background(_pattern_write_listener(), name="stem.pattern_write_listener")
-    spawn_background(trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener")
-    spawn_background(trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener")
-    spawn_background(
+    # Track every supervised listener so the readiness probe can fail if any
+    # of them dies — see ``_critical_listener_tasks`` and #175/#192.
+    _critical_listener_tasks["response"] = asyncio.create_task(_response_listener(), name="stem.response_listener")
+    _critical_listener_tasks["cortex_heartbeat"] = asyncio.create_task(
+        _cortex_heartbeat_watcher(), name="stem.cortex_heartbeat_watcher"
+    )
+    _critical_listener_tasks["conversation_sync"] = asyncio.create_task(
+        _conversation_sync_listener(), name="stem.conversation_sync_listener"
+    )
+    _critical_listener_tasks["ears_in"] = asyncio.create_task(_ears_listener(), name="stem.ears_listener")
+    _critical_listener_tasks["memory_store"] = asyncio.create_task(
+        _memory_store_listener(), name="stem.memory_store_listener"
+    )
+    _critical_listener_tasks["config_sync"] = asyncio.create_task(
+        _config_sync_listener(), name="stem.config_sync_listener"
+    )
+    _critical_listener_tasks["db_query"] = asyncio.create_task(_db_query_listener(), name="stem.db_query_listener")
+    _critical_listener_tasks["pattern_query"] = asyncio.create_task(
+        _pattern_query_listener(), name="stem.pattern_query_listener"
+    )
+    _critical_listener_tasks["pattern_update"] = asyncio.create_task(
+        _pattern_update_listener(), name="stem.pattern_update_listener"
+    )
+    _critical_listener_tasks["pattern_write"] = asyncio.create_task(
+        _pattern_write_listener(), name="stem.pattern_write_listener"
+    )
+    _critical_listener_tasks["trading_signal"] = asyncio.create_task(
+        trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener"
+    )
+    _critical_listener_tasks["trading_manual"] = asyncio.create_task(
+        trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener"
+    )
+    _critical_listener_tasks["trading_tool"] = asyncio.create_task(
         trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools),
         name="stem.trading_tool_listener",
     )
@@ -913,35 +959,44 @@ async def _store_memory(content: str, source: str, user_id: str, metadata: dict 
             return
 
 
+async def _handle_memory_store(msg) -> None:
+    """Spawn a background task to store one memory."""
+    try:
+        data = json.loads(msg.data.decode())
+        content = data.get("content", "").strip()
+        if not content:
+            return
+
+        user_id = data.get("user_id", MEMORY_USER_ID)
+        source = data.get("source", "unknown")
+        metadata = data.get("metadata")
+
+        spawn_background(
+            _store_memory(content, source, user_id, metadata),
+            name="stem.store_memory",
+        )
+    except Exception:
+        log.exception("Error in memory store listener")
+
+
 async def _memory_store_listener():
     """Listen for memory store requests from any component via NATS.
 
     Any component can publish to MEMORY_STORE with:
     {"content": "...", "user_id": "...", "metadata": {...}}
     Each memory is stored concurrently as a background task.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent memory
+    write (issue #175).
     """
-    global _sub_memory_store
-    _sub_memory_store = await _nc.subscribe(MEMORY_STORE, queue=STEM_QUEUE)
-    sub = _sub_memory_store
-    log.info("Subscribed", extra={"subject": MEMORY_STORE})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            content = data.get("content", "").strip()
-            if not content:
-                continue
-
-            user_id = data.get("user_id", MEMORY_USER_ID)
-            source = data.get("source", "unknown")
-            metadata = data.get("metadata")
-
-            spawn_background(
-                _store_memory(content, source, user_id, metadata),
-                name="stem.store_memory",
-            )
-
-        except Exception:
-            log.exception("Error in memory store listener")
+    await subscribe_supervised(
+        _nc,
+        MEMORY_STORE,
+        _handle_memory_store,
+        queue=STEM_QUEUE,
+        name="stem.memory_store",
+    )
 
 
 async def _run_manual_loop(spec: LoopSpec, loop_name: str) -> None:
@@ -1019,229 +1074,295 @@ async def _handle_discord_message(data: dict):
                 log.exception("Failed to send error to ears")
 
 
+async def _handle_ears_message(msg) -> None:
+    """Dispatch one EARS_IN Discord message into a background task."""
+    try:
+        data = json.loads(msg.data.decode())
+        username = data.get("username", "unknown")
+        log.info("Discord message", extra={"username": username, "content_len": len(data.get("content", ""))})
+        spawn_background(_handle_discord_message(data), name="stem.handle_discord_message")
+    except Exception:
+        log.exception("Error dispatching Discord message")
+
+
 async def _ears_listener():
-    """Listen for incoming Discord messages via NATS and dispatch as tasks."""
-    global _sub_ears
-    _sub_ears = await _nc.subscribe(EARS_IN, queue=STEM_QUEUE)
-    sub = _sub_ears
-    log.info("Subscribed", extra={"subject": EARS_IN})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            username = data.get("username", "unknown")
-            log.info("Discord message", extra={"username": username, "content_len": len(data.get("content", ""))})
-            spawn_background(_handle_discord_message(data), name="stem.handle_discord_message")
-        except Exception:
-            log.exception("Error dispatching Discord message")
+    """Listen for incoming Discord messages via NATS and dispatch as tasks.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent Discord
+    message (issue #175).
+    """
+    await subscribe_supervised(
+        _nc,
+        EARS_IN,
+        _handle_ears_message,
+        queue=STEM_QUEUE,
+        name="stem.ears_in",
+    )
+
+
+async def _handle_config_sync(msg) -> None:
+    """Apply one config update from a peer site."""
+    try:
+        data = json.loads(msg.data.decode())
+        key = data.get("key", "")
+        value = data.get("value", "")
+        if key and _config_kv is not None:
+            await _config_kv.put(key, value.encode())
+            log.info("Config synced from peer", extra={"key": key, "value": value})
+    except Exception:
+        log.exception("Config sync error")
 
 
 async def _config_sync_listener():
-    """Apply config updates broadcast from other sites."""
-    # Broadcast: each pod owns its own KV cache, so every pod must apply
-    # the update locally. Do NOT add a queue group here.
-    sub = await _nc.subscribe(CONFIG_SYNC)
-    log.info("Subscribed", extra={"subject": CONFIG_SYNC})
-    async for msg in sub.messages:
+    """Apply config updates broadcast from other sites.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently leaving this pod's KV cache stale
+    (issue #175). Broadcast: each pod must apply the update locally — no
+    queue group.
+    """
+    await subscribe_supervised(
+        _nc,
+        CONFIG_SYNC,
+        _handle_config_sync,
+        name="stem.config_sync",
+    )
+
+
+async def _handle_db_query(msg) -> None:
+    """Run one DB query and respond via NATS request/reply."""
+    from maki_common.tools.utils import mcp_result
+
+    try:
+        data = json.loads(msg.data.decode())
+        sql = data.get("sql", "").strip()
+
+        # Validate: SELECT or WITH only
+        first_word = sql.split()[0].upper() if sql.split() else ""
+        if first_word not in ("SELECT", "WITH"):
+            await msg.respond(json.dumps(mcp_result("Only SELECT/WITH queries are allowed.")).encode())
+            return
+
+        # Reject multi-statement queries
+        if ";" in sql.rstrip(";"):
+            await msg.respond(json.dumps(mcp_result("Multi-statement queries are not allowed.")).encode())
+            return
+
+        sql = sql.rstrip(";")
+
+        # Inject LIMIT if missing
+        if "limit" not in sql.lower():
+            sql += " LIMIT 50"
+
+        log.info("Executing DB query", extra={"sql": sql[:200]})
+
+        async with _db_pool.acquire() as conn:
+            rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
+
+        if not rows:
+            await msg.respond(json.dumps(mcp_result("Query returned 0 rows.")).encode())
+            return
+
+        # Format as text table
+        columns = list(rows[0].keys())
+        lines = [" | ".join(columns)]
+        lines.append("-" * len(lines[0]))
+        for row in rows:
+            lines.append(" | ".join(str(row[c]) for c in columns))
+        lines.append(f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})")
+
+        await msg.respond(json.dumps(mcp_result("\n".join(lines))).encode())
+
+    except TimeoutError:
+        log.warning("DB query timed out")
         try:
-            data = json.loads(msg.data.decode())
-            key = data.get("key", "")
-            value = data.get("value", "")
-            if key and _config_kv is not None:
-                await _config_kv.put(key, value.encode())
-                log.info("Config synced from peer", extra={"key": key, "value": value})
+            await msg.respond(json.dumps(mcp_result("Query timed out (10s limit).")).encode())
         except Exception:
-            log.exception("Config sync error")
+            pass
+    except Exception:
+        log.exception("DB query error")
+        try:
+            await msg.respond(json.dumps(mcp_result("DB query failed — check logs.")).encode())
+        except Exception:
+            pass
 
 
 async def _db_query_listener():
     """Handle generic DB query requests from cortex via NATS request/reply.
 
-    Safety: only SELECT/WITH queries are allowed, LIMIT 50 is injected if missing,
-    and a 10s query timeout is enforced.
+    Safety: only SELECT/WITH queries are allowed, LIMIT 50 is injected if
+    missing, and a 10s query timeout is enforced.
+
+    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
+    re-subscribes instead of silently dropping every subsequent DB query
+    from cortex (issue #175).
     """
-    from maki_common.tools.utils import mcp_result
+    await subscribe_supervised(
+        _nc,
+        DB_QUERY,
+        _handle_db_query,
+        queue=STEM_QUEUE,
+        name="stem.db_query",
+    )
 
-    sub = await _nc.subscribe(DB_QUERY, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": DB_QUERY})
-    async for msg in sub.messages:
+
+async def _handle_pattern_query(msg) -> None:
+    """Serve one error_patterns query for immune's passive loop."""
+    try:
+        data = json.loads(msg.data.decode())
+        component = data.get("component", "")
+
+        if not component or not _db_pool:
+            await msg.respond(json.dumps({"patterns": []}).encode())
+            return
+
+        async with _db_pool.acquire() as conn:
+            rows = await asyncio.wait_for(
+                conn.fetch(
+                    "SELECT id, component, pattern, classification, confidence, "
+                    "occurrence_count, notes "
+                    "FROM error_patterns WHERE component = $1",
+                    component,
+                ),
+                timeout=5.0,
+            )
+
+        patterns = [
+            {
+                "id": str(row["id"]),
+                "component": row["component"],
+                "pattern": row["pattern"],
+                "classification": row["classification"],
+                "confidence": row["confidence"],
+                "occurrence_count": row["occurrence_count"],
+                "notes": row["notes"],
+            }
+            for row in rows
+        ]
+
+        await msg.respond(json.dumps({"patterns": patterns}).encode())
+
+    except Exception:
+        log.exception("Pattern query error")
         try:
-            data = json.loads(msg.data.decode())
-            sql = data.get("sql", "").strip()
-
-            # Validate: SELECT or WITH only
-            first_word = sql.split()[0].upper() if sql.split() else ""
-            if first_word not in ("SELECT", "WITH"):
-                await msg.respond(json.dumps(mcp_result("Only SELECT/WITH queries are allowed.")).encode())
-                continue
-
-            # Reject multi-statement queries
-            if ";" in sql.rstrip(";"):
-                await msg.respond(json.dumps(mcp_result("Multi-statement queries are not allowed.")).encode())
-                continue
-
-            sql = sql.rstrip(";")
-
-            # Inject LIMIT if missing
-            if "limit" not in sql.lower():
-                sql += " LIMIT 50"
-
-            log.info("Executing DB query", extra={"sql": sql[:200]})
-
-            async with _db_pool.acquire() as conn:
-                rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
-
-            if not rows:
-                await msg.respond(json.dumps(mcp_result("Query returned 0 rows.")).encode())
-                continue
-
-            # Format as text table
-            columns = list(rows[0].keys())
-            lines = [" | ".join(columns)]
-            lines.append("-" * len(lines[0]))
-            for row in rows:
-                lines.append(" | ".join(str(row[c]) for c in columns))
-            lines.append(f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})")
-
-            await msg.respond(json.dumps(mcp_result("\n".join(lines))).encode())
-
-        except TimeoutError:
-            log.warning("DB query timed out")
-            try:
-                await msg.respond(json.dumps(mcp_result("Query timed out (10s limit).")).encode())
-            except Exception:
-                pass
+            await msg.respond(json.dumps({"patterns": []}).encode())
         except Exception:
-            log.exception("DB query error")
-            try:
-                await msg.respond(json.dumps(mcp_result("DB query failed — check logs.")).encode())
-            except Exception:
-                pass
+            pass
 
 
 async def _pattern_query_listener():
     """Serve error_patterns queries for immune's passive loop.
 
-    Returns JSON list of patterns for a given component.
+    Returns JSON list of patterns for a given component. Wrapped in
+    ``subscribe_supervised`` so a NATS reconnect / stream drain re-subscribes
+    instead of silently dropping every subsequent immune query (issue #175).
     """
-    sub = await _nc.subscribe(PATTERN_QUERY, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": PATTERN_QUERY})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            component = data.get("component", "")
+    await subscribe_supervised(
+        _nc,
+        PATTERN_QUERY,
+        _handle_pattern_query,
+        queue=STEM_QUEUE,
+        name="stem.pattern_query",
+    )
 
-            if not component or not _db_pool:
-                await msg.respond(json.dumps({"patterns": []}).encode())
-                continue
 
-            async with _db_pool.acquire() as conn:
-                rows = await asyncio.wait_for(
-                    conn.fetch(
-                        "SELECT id, component, pattern, classification, confidence, "
-                        "occurrence_count, notes "
-                        "FROM error_patterns WHERE component = $1",
-                        component,
-                    ),
-                    timeout=5.0,
-                )
+async def _handle_pattern_update(msg) -> None:
+    """Apply one fire-and-forget pattern stats bump."""
+    try:
+        data = json.loads(msg.data.decode())
+        pattern_id = data.get("id")
+        confidence_delta = data.get("confidence_delta", 0.0)
+        if not pattern_id or not _db_pool:
+            return
 
-            patterns = [
-                {
-                    "id": str(row["id"]),
-                    "component": row["component"],
-                    "pattern": row["pattern"],
-                    "classification": row["classification"],
-                    "confidence": row["confidence"],
-                    "occurrence_count": row["occurrence_count"],
-                    "notes": row["notes"],
-                }
-                for row in rows
-            ]
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE error_patterns "
+                "SET occurrence_count = occurrence_count + 1, "
+                "    confidence = LEAST(confidence + $1, 1.0), "
+                "    last_seen_at = now() "
+                "WHERE id = $2",
+                confidence_delta,
+                uuid.UUID(pattern_id),
+            )
 
-            await msg.respond(json.dumps({"patterns": patterns}).encode())
+        log.debug("Pattern stats updated", extra={"pattern_id": pattern_id})
 
-        except Exception:
-            log.exception("Pattern query error")
-            try:
-                await msg.respond(json.dumps({"patterns": []}).encode())
-            except Exception:
-                pass
+    except Exception:
+        log.exception("Pattern update error")
 
 
 async def _pattern_update_listener():
     """Handle fire-and-forget updates to error_patterns from immune.
 
-    Supports bumping occurrence_count/confidence/last_seen_at for known patterns.
+    Supports bumping occurrence_count/confidence/last_seen_at for known
+    patterns. Wrapped in ``subscribe_supervised`` so a NATS reconnect /
+    stream drain re-subscribes instead of silently dropping every update
+    (issue #175).
     """
-    sub = await _nc.subscribe(PATTERN_UPDATE, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": PATTERN_UPDATE})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            pattern_id = data.get("id")
-            confidence_delta = data.get("confidence_delta", 0.0)
-            if not pattern_id or not _db_pool:
-                continue
+    await subscribe_supervised(
+        _nc,
+        PATTERN_UPDATE,
+        _handle_pattern_update,
+        queue=STEM_QUEUE,
+        name="stem.pattern_update",
+    )
 
-            async with _db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE error_patterns "
-                    "SET occurrence_count = occurrence_count + 1, "
-                    "    confidence = LEAST(confidence + $1, 1.0), "
-                    "    last_seen_at = now() "
-                    "WHERE id = $2",
-                    confidence_delta,
-                    uuid.UUID(pattern_id),
-                )
 
-            log.debug("Pattern stats updated", extra={"pattern_id": pattern_id})
+async def _handle_pattern_write(msg) -> None:
+    """Insert one new error_patterns row from immune's Claude escalation."""
+    try:
+        data = json.loads(msg.data.decode())
+        component = data.get("component", "")
+        pattern = data.get("pattern", "")
+        classification = data.get("classification", "escalate")
+        confidence = float(data.get("confidence", 0.5))
+        notes = data.get("notes", "")
 
-        except Exception:
-            log.exception("Pattern update error")
+        if not component or not pattern or not _db_pool:
+            return
+
+        async with _db_pool.acquire() as conn:
+            await asyncio.wait_for(
+                conn.execute(
+                    "INSERT INTO error_patterns "
+                    "(component, pattern, classification, confidence, occurrence_count, notes) "
+                    "VALUES ($1, $2, $3, $4, 1, $5) "
+                    "ON CONFLICT (component, pattern) DO NOTHING",
+                    component,
+                    pattern,
+                    classification,
+                    confidence,
+                    notes,
+                ),
+                timeout=5.0,
+            )
+
+        log.info(
+            "Pattern written",
+            extra={"component": component, "pattern": pattern[:60], "classification": classification},
+        )
+
+    except Exception:
+        log.exception("Pattern write error")
 
 
 async def _pattern_write_listener():
     """Handle write requests for new error_patterns from immune's Claude escalation.
 
-    Inserts a new classified pattern. Skips silently if the component+pattern already exists.
+    Inserts a new classified pattern. Skips silently if the
+    component+pattern already exists. Wrapped in ``subscribe_supervised``
+    so a NATS reconnect / stream drain re-subscribes instead of silently
+    dropping every subsequent pattern write (issue #175).
     """
-    sub = await _nc.subscribe(PATTERN_WRITE, queue=STEM_QUEUE)
-    log.info("Subscribed", extra={"subject": PATTERN_WRITE})
-    async for msg in sub.messages:
-        try:
-            data = json.loads(msg.data.decode())
-            component = data.get("component", "")
-            pattern = data.get("pattern", "")
-            classification = data.get("classification", "escalate")
-            confidence = float(data.get("confidence", 0.5))
-            notes = data.get("notes", "")
-
-            if not component or not pattern or not _db_pool:
-                continue
-
-            async with _db_pool.acquire() as conn:
-                await asyncio.wait_for(
-                    conn.execute(
-                        "INSERT INTO error_patterns "
-                        "(component, pattern, classification, confidence, occurrence_count, notes) "
-                        "VALUES ($1, $2, $3, $4, 1, $5) "
-                        "ON CONFLICT (component, pattern) DO NOTHING",
-                        component,
-                        pattern,
-                        classification,
-                        confidence,
-                        notes,
-                    ),
-                    timeout=5.0,
-                )
-
-            log.info(
-                "Pattern written",
-                extra={"component": component, "pattern": pattern[:60], "classification": classification},
-            )
-
-        except Exception:
-            log.exception("Pattern write error")
+    await subscribe_supervised(
+        _nc,
+        PATTERN_WRITE,
+        _handle_pattern_write,
+        queue=STEM_QUEUE,
+        name="stem.pattern_write",
+    )
 
 
 @app.get("/health")
@@ -1249,19 +1370,17 @@ def health():
     if not _nc or not _nc.is_connected:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "reason": "NATS not connected"})
 
-    dead_subs = []
-    for name, sub in [
-        ("response", _sub_response),
-        ("cortex_health", _sub_cortex_health),
-        ("memory_store", _sub_memory_store),
-        ("ears", _sub_ears),
-    ]:
-        if sub is None or getattr(sub, "_closed", False):
-            dead_subs.append(name)
-    if dead_subs:
+    # Critical listeners are wrapped in ``subscribe_supervised`` and should
+    # run forever. If any has exited, fail readiness so kubelet restarts
+    # the pod (issue #175 / #192).
+    dead_tasks = []
+    for label, task in _critical_listener_tasks.items():
+        if task is None or task.done():
+            dead_tasks.append(label)
+    if dead_tasks:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "reason": "NATS subscriptions closed", "dead": dead_subs},
+            content={"status": "unhealthy", "reason": "Listener task(s) exited", "dead": dead_tasks},
         )
 
     now = time.time()
