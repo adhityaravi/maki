@@ -32,7 +32,7 @@ MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
 # Hard turn-duration watchdog. If a turn doesn't return within this window we
-# cancel it from inside the cortex so _active_turn state is cleared, slot
+# cancel it from inside the cortex so the tracked turn state is cleared, slot
 # semaphores are released, and a `cancelled=True` done signal is published.
 # Without this, a hung invoke_claude / stream_claude (network stall, SDK
 # livelock, uncancellable native call) pins the cortex forever — the heartbeat
@@ -63,11 +63,58 @@ _semaphore = asyncio.Semaphore(1)
 # Hoisted from main() so handle_turn_request can use it for auto-pull
 _github_private_key: str | None = None
 
-# Active turn tracking — exposed via heartbeat for immune awareness
-_active_turn: str | None = None
-_active_turn_mode: str | None = None
-_active_turn_started: float | None = None
-_active_task: asyncio.Task | None = None  # for preemption: cancel background turns
+
+class _TurnState:
+    """Single source of truth for the in-flight turn.
+
+    Replaces four module globals (``_active_turn``, ``_active_turn_mode``,
+    ``_active_turn_started``, ``_active_task``) that raced across concurrent
+    turn handlers — heartbeats lied, the liveness-escape timer cleared early
+    when the wrong handler's ``finally`` fired, and preemption could target a
+    task that wasn't the one actually running. State is mutated only by the
+    handler that currently holds ``_turn_lock``, so heartbeat / liveness /
+    preemption always read a snapshot that matches the actually-running turn.
+    See issue #203.
+    """
+
+    __slots__ = ("turn_id", "mode", "started", "task")
+
+    def __init__(self) -> None:
+        self.turn_id: str | None = None
+        self.mode: str | None = None
+        self.started: float | None = None
+        self.task: asyncio.Task | None = None
+
+    def set_active(
+        self,
+        *,
+        turn_id: str,
+        mode: str,
+        started: float,
+        task: asyncio.Task | None,
+    ) -> None:
+        self.turn_id = turn_id
+        self.mode = mode
+        self.started = started
+        self.task = task
+
+    def clear(self) -> None:
+        self.turn_id = None
+        self.mode = None
+        self.started = None
+        self.task = None
+
+
+# Active turn tracking — exposed via heartbeat for immune awareness.
+_turn_state = _TurnState()
+
+# Dispatcher-level serialization gate. Wrapping the body of handle_turn_request
+# in this lock enforces the cortex's actual single-turn-at-a-time intent and
+# naturally serializes git auto-pull on the shared /repo/maki working tree.
+# Without it, the four pieces of turn state above raced across concurrent
+# handlers — see issue #203. The inner Claude semaphore becomes redundant
+# (only one handler runs at a time) but is harmless and left as a backstop.
+_turn_lock = asyncio.Lock()
 
 # Health-check inputs — populated as startup progresses. The /health endpoint
 # returns 503 until all of these are wired so kubelet readiness probes
@@ -122,14 +169,18 @@ def _health_check() -> tuple[bool, str | None]:
 
     # Hard liveness escape: if a turn is wedged way past the soft watchdog
     # window, kubelet must restart us. This is the only way out of an
-    # uncancellable native call or a wedged event loop.
-    if _active_turn_started is not None:
-        running_s = time.time() - _active_turn_started
+    # uncancellable native call or a wedged event loop. Snapshot both fields
+    # together so a concurrent clear() between the two reads can't surface
+    # a stale started timestamp paired with a None turn_id.
+    started = _turn_state.started
+    turn_id = _turn_state.turn_id
+    if started is not None:
+        running_s = time.time() - started
         liveness_threshold = CORTEX_LIVENESS_TURN_MULTIPLIER * CORTEX_MAX_TURN_SECONDS
         if running_s > liveness_threshold:
             return (
                 False,
-                f"Turn {_active_turn} wedged for {running_s:.0f}s "
+                f"Turn {turn_id} wedged for {running_s:.0f}s "
                 f"(> {liveness_threshold:.0f}s = {CORTEX_LIVENESS_TURN_MULTIPLIER}x watchdog) — "
                 f"requesting kubelet restart",
             )
@@ -426,13 +477,15 @@ async def handle_turn_request(msg, nc, mcp_server):
     ``invoke_claude`` / ``stream_claude`` (network stall, SDK livelock,
     uncancellable subprocess) cannot pin the cortex forever. On timeout:
     cancel the body, log, publish a ``cancelled=True`` done signal so the
-    submitter is unblocked, and let ``finally`` clear ``_active_turn`` state
+    submitter is unblocked, and let ``finally`` clear the tracked turn state
     so the next turn can run. Heartbeat is in a separate task and stays
     healthy throughout — without this, only an external CORTEX_STUCK signal
     (from a still-waiting submitter) could ever recover the pod. See #150.
-    """
-    global _active_turn, _active_turn_mode, _active_turn_started, _active_task
 
+    The body is wrapped in ``_turn_lock`` so only one handler ever runs at a
+    time — heartbeat / liveness / preemption read state set under the same
+    lock and therefore always match the actually-running turn. See #203.
+    """
     # First-line breadcrumb: emitted *before* any work so we can prove from
     # logs alone whether the dispatcher is even entering the handler. If
     # this line is missing for a wedged turn, the NATS dispatch into
@@ -468,75 +521,81 @@ async def handle_turn_request(msg, nc, mcp_server):
         },
     )
 
-    # Track active turn for heartbeat visibility.
-    _active_turn = turn_id
-    _active_turn_mode = mode
-    _active_turn_started = time.time()
-
-    try:
-        await asyncio.wait_for(
-            _process_turn(turn, turn_id, mode, nc, mcp_server),
-            timeout=CORTEX_MAX_TURN_SECONDS,
+    # Serialize at the dispatcher: only one handler body runs at a time.
+    # Concurrent dispatches queue on this lock instead of overwriting each
+    # other's turn-state. See issue #203.
+    async with _turn_lock:
+        # State is set under the lock so heartbeat / liveness / preemption
+        # always observe a snapshot that matches the actually-running turn.
+        # Record our own task so an interactive turn can preempt this one.
+        _turn_state.set_active(
+            turn_id=turn_id,
+            mode=mode,
+            started=time.time(),
+            task=asyncio.current_task(),
         )
 
-    except TimeoutError:
-        # Hard watchdog fired. _process_turn has already been cancelled by
-        # wait_for; we just need to log and unblock the submitter.
-        log.error(
-            "Turn exceeded hard timeout — cancelling",
-            extra={
-                "turn_id": turn_id,
-                "mode": mode,
-                "timeout_s": CORTEX_MAX_TURN_SECONDS,
-            },
-        )
         try:
-            done_msg = {
-                "turn_id": turn_id,
-                "response": "",
-                "done": True,
-                "cancelled": True,
-                "reason": "cortex_turn_timeout",
-            }
-            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-        except Exception:
-            log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
-
-    except asyncio.CancelledError:
-        log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
-        done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
-        try:
-            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-        except Exception:
-            log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
-        # Re-raise so the cancelling caller sees the cancellation propagate.
-        raise
-
-    except Exception as exc:
-        log.exception("Error handling turn request", extra={"turn_id": turn_id})
-
-        if _is_silent_error(exc):
-            # Rate limits, turn budget, capacity — stay silent, don't spam Discord
-            log.info(
-                "Silent error — not forwarding to Discord",
-                extra={"turn_id": turn_id, "error": str(exc)[:200]},
+            await asyncio.wait_for(
+                _process_turn(turn, turn_id, mode, nc, mcp_server),
+                timeout=CORTEX_MAX_TURN_SECONDS,
             )
-            # Still send done signal so ears cleans up, but with empty response
-            done_msg = {"turn_id": turn_id, "response": "", "done": True}
-            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-        else:
-            # Genuine unexpected error — send a brief message
-            error_response = {
-                "turn_id": turn_id,
-                "response": "Something went wrong on my end. I'll try again next turn.",
-                "done": True,
-            }
-            await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
-    finally:
-        _active_turn = None
-        _active_turn_mode = None
-        _active_turn_started = None
-        _active_task = None
+
+        except TimeoutError:
+            # Hard watchdog fired. _process_turn has already been cancelled by
+            # wait_for; we just need to log and unblock the submitter.
+            log.error(
+                "Turn exceeded hard timeout — cancelling",
+                extra={
+                    "turn_id": turn_id,
+                    "mode": mode,
+                    "timeout_s": CORTEX_MAX_TURN_SECONDS,
+                },
+            )
+            try:
+                done_msg = {
+                    "turn_id": turn_id,
+                    "response": "",
+                    "done": True,
+                    "cancelled": True,
+                    "reason": "cortex_turn_timeout",
+                }
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            except Exception:
+                log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
+
+        except asyncio.CancelledError:
+            log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
+            done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
+            try:
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            except Exception:
+                log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
+            # Re-raise so the cancelling caller sees the cancellation propagate.
+            raise
+
+        except Exception as exc:
+            log.exception("Error handling turn request", extra={"turn_id": turn_id})
+
+            if _is_silent_error(exc):
+                # Rate limits, turn budget, capacity — stay silent, don't spam Discord
+                log.info(
+                    "Silent error — not forwarding to Discord",
+                    extra={"turn_id": turn_id, "error": str(exc)[:200]},
+                )
+                # Still send done signal so ears cleans up, but with empty response
+                done_msg = {"turn_id": turn_id, "response": "", "done": True}
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            else:
+                # Genuine unexpected error — send a brief message
+                error_response = {
+                    "turn_id": turn_id,
+                    "response": "Something went wrong on my end. I'll try again next turn.",
+                    "done": True,
+                }
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
+        finally:
+            _turn_state.clear()
 
 
 async def heartbeat_loop(nc):
@@ -550,9 +609,9 @@ async def heartbeat_loop(nc):
                     "model": MODEL,
                     "session_id": SESSION_ID,
                     "instance_id": os.environ.get("HOSTNAME", "unknown"),
-                    "active_turn": _active_turn,
-                    "turn_mode": _active_turn_mode,
-                    "turn_started": _active_turn_started,
+                    "active_turn": _turn_state.turn_id,
+                    "turn_mode": _turn_state.mode,
+                    "turn_started": _turn_state.started,
                 }
             ).encode()
             await nc.publish(CORTEX_HEALTH, payload)
@@ -647,12 +706,14 @@ async def main():
     async def _handle_turn_message(msg) -> None:
         """Dispatch one CORTEX_TURN_REQUEST message into a background task.
 
-        Kept narrow: preemption logic and per-turn task tracking stay here,
-        while the supervised loop owns the subscribe/iterate lifecycle so a
-        silent stream drain re-subscribes instead of leaving cortex blind to
-        new turns (issue #175).
+        Kept narrow: preemption is the only decision made here. The spawned
+        task acquires ``_turn_lock`` inside ``handle_turn_request`` so the
+        cortex only ever runs one handler body at a time — concurrent
+        dispatches queue safely on the lock instead of racing on the
+        turn-state globals the way they used to (issue #203). The supervised
+        loop owns the subscribe/iterate lifecycle so a silent stream drain
+        re-subscribes instead of leaving cortex blind to new turns (#175).
         """
-        global _active_task
         try:
             turn = json.loads(msg.data.decode())
             mode = turn.get("mode", "")
@@ -661,14 +722,21 @@ async def main():
 
         is_background = mode in _BACKGROUND_MODES
 
-        # Preempt: interactive turn cancels running background turn
-        if not is_background and _active_task and _active_turn_mode in _BACKGROUND_MODES:
-            _active_task.cancel()
-            log.info("Preempted background turn", extra={"cancelled_mode": _active_turn_mode})
+        # Preempt: an interactive turn cancels a currently-running background
+        # turn. Snapshot the tracked task/mode — they're written only under
+        # ``_turn_lock`` so reading them here gives a consistent view of the
+        # actually-running handler. The cancellation propagates through
+        # ``asyncio.wait_for`` → the handler's ``finally`` clears state and
+        # releases the lock so this new turn can claim it.
+        active_task = _turn_state.task
+        active_mode = _turn_state.mode
+        if not is_background and active_task is not None and active_mode in _BACKGROUND_MODES:
+            active_task.cancel()
+            log.info("Preempted background turn", extra={"cancelled_mode": active_mode})
 
-        task = asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
-        if is_background:
-            _active_task = task
+        # No need to track the spawned task here — _turn_state.task gets
+        # populated under _turn_lock the moment the handler enters its body.
+        asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
 
     # Critical: the turn-request listener is the entire point of cortex. Wrap
     # it in ``subscribe_supervised`` so a NATS reconnect or stream drain
