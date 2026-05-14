@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -72,6 +73,74 @@ def _parse_usage(result_message: Any, model: str, mode: str, duration_ms: float)
     )
 
 
+def _build_options(
+    model: str,
+    max_turns: int,
+    mcp_servers: dict[str, Any] | None,
+    system_prompt: str | None,
+) -> Any:
+    """Build ClaudeAgentOptions with maki defaults."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    options_kwargs: dict[str, Any] = dict(
+        model=model,
+        permission_mode="bypassPermissions",
+        max_turns=max_turns,
+        mcp_servers=mcp_servers or {},
+    )
+    if system_prompt:
+        options_kwargs["system_prompt"] = system_prompt
+    return ClaudeAgentOptions(**options_kwargs)
+
+
+@contextlib.asynccontextmanager
+async def _maybe_acquire(semaphore: asyncio.Semaphore | None) -> AsyncIterator[None]:
+    """Acquire `semaphore` if provided, otherwise no-op."""
+    if semaphore is None:
+        yield
+    else:
+        async with semaphore:
+            yield
+
+
+async def _run_query(
+    prompt: str,
+    options: Any,
+    *,
+    model: str,
+    mode: str,
+    usage_out: list[TokenUsage],
+) -> AsyncIterator[str]:
+    """Drive the SDK query loop.
+
+    Yields each assistant TextBlock as it arrives. On ResultMessage, parses
+    usage, logs it, and appends to ``usage_out``. Swallows the post-result
+    CLI exit (benign — SDK process exits cleanly after delivering the result).
+    """
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, query
+
+    t0 = time.monotonic()
+    got_result = False
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        yield block.text
+            elif isinstance(message, ResultMessage):
+                duration_ms = (time.monotonic() - t0) * 1000
+                usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
+                log.info("Token usage", extra=usage.to_log_dict())
+                usage_out.append(usage)
+                got_result = True
+    except Exception:
+        if got_result:
+            # SDK CLI process exited after delivering the result — benign
+            log.debug("SDK process exited after result (expected)")
+        else:
+            raise
+
+
 async def invoke_claude(
     prompt: str,
     model: str = "claude-sonnet-4-20250514",
@@ -97,22 +166,10 @@ async def invoke_claude(
     Returns:
         Tuple of (response_text, token_usage).
     """
-    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
-
-    options_kwargs: dict[str, Any] = dict(
-        model=model,
-        permission_mode="bypassPermissions",
-        max_turns=max_turns,
-        mcp_servers=mcp_servers or {},
-    )
-    if system_prompt:
-        options_kwargs["system_prompt"] = system_prompt
-    options = ClaudeAgentOptions(**options_kwargs)
-
-    async def _invoke() -> tuple[str, TokenUsage]:
-        text_parts: list[str] = []
-        usage = TokenUsage(model=model, mode=mode)
-        t0 = time.monotonic()
+    options = _build_options(model, max_turns, mcp_servers, system_prompt)
+    text_parts: list[str] = []
+    usage_box: list[TokenUsage] = []
+    async with _maybe_acquire(semaphore):
         log.info(
             "Invoking Claude",
             extra={
@@ -123,33 +180,12 @@ async def invoke_claude(
                 "mode": mode,
             },
         )
-        got_result = False
-        try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text_parts.append(block.text)
-                elif isinstance(message, ResultMessage):
-                    duration_ms = (time.monotonic() - t0) * 1000
-                    usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
-                    log.info("Token usage", extra=usage.to_log_dict())
-                    got_result = True
-        except Exception:
-            if got_result:
-                # SDK CLI process exited after delivering the result — benign
-                log.debug("SDK process exited after result (expected)")
-            else:
-                raise
-
-        result = "\n".join(text_parts)
-        log.info("Claude response received", extra={"response_len": len(result)})
-        return result, usage
-
-    if semaphore:
-        async with semaphore:
-            return await _invoke()
-    return await _invoke()
+        async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=usage_box):
+            text_parts.append(chunk)
+    result = "\n".join(text_parts)
+    log.info("Claude response received", extra={"response_len": len(result)})
+    usage = usage_box[0] if usage_box else TokenUsage(model=model, mode=mode)
+    return result, usage
 
 
 async def stream_claude(
@@ -174,48 +210,16 @@ async def stream_claude(
             separate from the human prompt so conversation history cannot bleed
             into the system context and vice versa.
     """
-    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query
-
-    options_kwargs: dict[str, Any] = dict(
-        model=model,
-        permission_mode="bypassPermissions",
-        max_turns=max_turns,
-        mcp_servers=mcp_servers or {},
-    )
-    if system_prompt:
-        options_kwargs["system_prompt"] = system_prompt
-    options = ClaudeAgentOptions(**options_kwargs)
-
-    async def _stream() -> AsyncIterator[str]:
-        t0 = time.monotonic()
-        extra = {"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode}
-        log.info("Streaming Claude", extra=extra)
-        got_result = False
-        try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            log.info("Stream chunk", extra={"chunk_len": len(block.text)})
-                            yield block.text
-                elif isinstance(message, ResultMessage):
-                    duration_ms = (time.monotonic() - t0) * 1000
-                    usage = _parse_usage(message, model=model, mode=mode, duration_ms=duration_ms)
-                    log.info("Token usage", extra=usage.to_log_dict())
-                    if usage_out is not None:
-                        usage_out.append(usage)
-                    got_result = True
-        except Exception:
-            if got_result:
-                log.debug("SDK process exited after result (expected)")
-            else:
-                raise
-        log.info("Stream complete")
-
-    if semaphore:
-        async with semaphore:
-            async for chunk in _stream():
-                yield chunk
-    else:
-        async for chunk in _stream():
+    options = _build_options(model, max_turns, mcp_servers, system_prompt)
+    local_usage: list[TokenUsage] = []
+    async with _maybe_acquire(semaphore):
+        log.info(
+            "Streaming Claude",
+            extra={"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode},
+        )
+        async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=local_usage):
+            log.info("Stream chunk", extra={"chunk_len": len(chunk)})
             yield chunk
+    if usage_out is not None and local_usage:
+        usage_out.append(local_usage[0])
+    log.info("Stream complete")
