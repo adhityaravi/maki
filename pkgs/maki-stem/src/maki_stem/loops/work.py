@@ -32,6 +32,17 @@ WORK_TURN_TIMEOUT = int(os.environ.get("WORK_TURN_TIMEOUT", "2700"))  # 45 minut
 
 WORK_SKIP_LABELS = {"draft", "human", UNKNOWN_ISSUER_LABEL}
 
+# Per-issue attempt tracking (issue #213) — prevents one wedged issue from
+# pinning the work loop forever. Records `(last_attempt_ts, failure_count)`
+# under ``stem.work.attempts.<issue_number>`` in the lock KV. Cooldown grows
+# exponentially with failure count, capped at 7 days. After
+# ``WORK_HUMAN_LABEL_THRESHOLD`` consecutive failures the issue is auto-tagged
+# ``human`` so the work loop stops considering it.
+WORK_ATTEMPTS_KEY_PREFIX = "stem.work.attempts."
+WORK_BACKOFF_BASE_SECONDS = 86400  # 1 day
+WORK_BACKOFF_MAX_SECONDS = 7 * 86400  # 7 days
+WORK_HUMAN_LABEL_THRESHOLD = 3  # auto-add `human` after this many consecutive failures
+
 # Work fires at 03:00 every day
 WORK_CRON = "0 3 * * *"
 
@@ -146,6 +157,150 @@ def _issue_has_skip_label(issue: dict) -> bool:
     return any(issue_has_label(issue, lbl) for lbl in WORK_SKIP_LABELS)
 
 
+# --- Per-issue attempt tracking (issue #213) ----------------------------------
+
+
+def _attempts_key(issue_number: int) -> str:
+    """KV key for storing attempt history of a single issue."""
+    return f"{WORK_ATTEMPTS_KEY_PREFIX}{issue_number}"
+
+
+def _backoff_seconds(failure_count: int) -> int:
+    """Return the cooldown window after *failure_count* consecutive failures.
+
+    Exponential schedule capped at :data:`WORK_BACKOFF_MAX_SECONDS`:
+
+        1 failure  → 1 day
+        2 failures → 2 days
+        3 failures → 4 days
+        4+ failures→ 7 days (cap)
+    """
+    if failure_count <= 0:
+        return 0
+    # 2 ** (n-1) days, but guard against absurd shifts for very large counts
+    exp = min(failure_count - 1, 30)
+    return min(WORK_BACKOFF_MAX_SECONDS, WORK_BACKOFF_BASE_SECONDS * (2**exp))
+
+
+async def _get_attempts(lock_kv, issue_number: int) -> tuple[float, int]:
+    """Read the attempt record for *issue_number*.
+
+    Returns ``(last_attempt_ts, failure_count)``. Both zero when no record
+    exists or the record is unreadable — a missing record means "never failed,
+    eligible to run".
+    """
+    try:
+        entry = await lock_kv.get(_attempts_key(issue_number))
+        data = json.loads(entry.value.decode())
+        return float(data.get("last_attempt_ts", 0)), int(data.get("failure_count", 0))
+    except Exception:
+        return 0.0, 0
+
+
+async def _set_attempts(lock_kv, issue_number: int, last_attempt_ts: float, failure_count: int) -> None:
+    """Write/overwrite the attempt record for *issue_number* (best-effort)."""
+    payload = json.dumps({"last_attempt_ts": last_attempt_ts, "failure_count": failure_count}).encode()
+    try:
+        await lock_kv.put(_attempts_key(issue_number), payload)
+    except Exception:
+        log.warning(
+            "Failed to write work attempt record",
+            extra={"issue": issue_number, "failure_count": failure_count},
+        )
+
+
+async def _clear_attempts(lock_kv, issue_number: int) -> None:
+    """Delete the attempt record for *issue_number* (best-effort)."""
+    try:
+        await lock_kv.delete(_attempts_key(issue_number))
+    except Exception:
+        # Missing keys are fine; any other failure is non-fatal — the worst
+        # case is the issue stays in cooldown a little longer than necessary.
+        pass
+
+
+def _is_in_cooldown(last_attempt_ts: float, failure_count: int, now: float) -> bool:
+    """Return True if the issue is still inside its exponential-backoff window."""
+    if failure_count <= 0:
+        return False
+    return (now - last_attempt_ts) < _backoff_seconds(failure_count)
+
+
+async def _select_next_issue(issues: list[dict], ctx: StemContext) -> dict | None:
+    """Pick the highest-priority issue not currently in failure cooldown.
+
+    *issues* is assumed to already be sorted by priority then created_at asc
+    (this is what :meth:`GitHubClient.list_issues` returns). We walk in order
+    and return the first one whose attempt record permits a retry. Issues with
+    an active cooldown are skipped — when *every* candidate is cooling down we
+    return ``None`` and the caller no-ops this cycle.
+
+    The natural side-effect is the bonus described in #213: if the top P2/P3
+    issues are all wedged in backoff, we transparently fall back to a fresh
+    P4/cleanup task instead of spinning on the broken one.
+    """
+    now = time.time()
+    for issue in issues:
+        number = issue.get("number")
+        if number is None:
+            continue
+        last_ts, fails = await _get_attempts(ctx.lock_kv, int(number))
+        if _is_in_cooldown(last_ts, fails, now):
+            log.info(
+                "Skipping issue in failure cooldown",
+                extra={
+                    "issue": number,
+                    "failure_count": fails,
+                    "cooldown_remaining_s": int(_backoff_seconds(fails) - (now - last_ts)),
+                },
+            )
+            continue
+        return issue
+    return None
+
+
+async def _record_work_failure(ctx: StemContext, issue_number: int, reason: str) -> int:
+    """Increment the failure counter for *issue_number* and escalate if needed.
+
+    Returns the new failure count. When the count hits
+    :data:`WORK_HUMAN_LABEL_THRESHOLD` we add the ``human`` label so the work
+    loop stops picking the issue at all (it's filtered out by
+    :data:`WORK_SKIP_LABELS`).
+    """
+    last_ts, fails = await _get_attempts(ctx.lock_kv, issue_number)
+    fails += 1
+    await _set_attempts(ctx.lock_kv, issue_number, time.time(), fails)
+    log.warning(
+        "Recorded work failure",
+        extra={"issue": issue_number, "failure_count": fails, "reason": reason},
+    )
+    if fails >= WORK_HUMAN_LABEL_THRESHOLD and ctx.github is not None:
+        try:
+            await ctx.github.add_label(issue_number, "human")
+            spawn_background(
+                ctx.github.comment_issue(
+                    issue_number,
+                    (
+                        f"🚧 **Auto-escalated to human review** after "
+                        f"{fails} consecutive work-loop failures "
+                        f"(latest: {reason}). Removing this from the autonomous "
+                        f"queue — Adi will take a look."
+                    ),
+                ),
+                name="work.human_escalation_comment",
+            )
+            log.warning(
+                "Auto-added `human` label after repeated work failures",
+                extra={"issue": issue_number, "failure_count": fails},
+            )
+        except Exception:
+            log.exception(
+                "Failed to auto-escalate issue to human",
+                extra={"issue": issue_number, "failure_count": fails},
+            )
+    return fails
+
+
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
     """Pre-claim guard for the work loop: only proceed when the cron window is open."""
     return cron_window(WORK_CRON)
@@ -183,7 +338,17 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         log.info("No verified-author issues remain after author check — skipping work cycle")
         return
 
-    issue = issues[0]  # Highest priority (list_issues sorts by P-label)
+    # Pick the highest-priority candidate not currently in failure cooldown
+    # (issue #213). Walking the priority-sorted list naturally falls back to
+    # P4/cleanup work when every higher-priority issue is in backoff.
+    issue = await _select_next_issue(issues, ctx)
+    if issue is None:
+        log.info(
+            "All eligible issues are in failure cooldown — skipping work cycle",
+            extra={"candidates": len(issues)},
+        )
+        return
+
     issue_number = issue["number"]
     issue_title = issue["title"]
     issue_body = issue.get("body", "") or ""
@@ -277,6 +442,10 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
                     name="work.close_issue",
                 )
 
+            # Successful run — clear the failure record so any prior cooldown
+            # is lifted (in case the previous failure was transient).
+            await _clear_attempts(ctx.lock_kv, issue_number)
+
     except TimeoutError:
         log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
         # Publish stuck signal for immune
@@ -292,10 +461,15 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ).encode(),
         )
 
+        new_count = await _record_work_failure(ctx, issue_number, "timeout")
         spawn_background(
             ctx.github.comment_issue(
                 issue_number,
-                f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s. Will retry next work session.",
+                (
+                    f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s "
+                    f"(failure {new_count}). Backing off — next eligible retry in "
+                    f"~{_backoff_seconds(new_count) // 3600}h."
+                ),
             ),
             name="work.timeout_comment",
         )
@@ -303,11 +477,16 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     except Exception:
         log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
 
-        # Comment on issue about failure (issue stays open for retry)
+        new_count = await _record_work_failure(ctx, issue_number, "exception")
+        # Comment on issue about failure (issue stays open for retry, but in cooldown)
         spawn_background(
             ctx.github.comment_issue(
                 issue_number,
-                "❌ **Work failed** due to an error. Will retry next work session.",
+                (
+                    f"❌ **Work failed** due to an error (failure {new_count}). "
+                    f"Backing off — next eligible retry in "
+                    f"~{_backoff_seconds(new_count) // 3600}h."
+                ),
             ),
             name="work.failure_comment",
         )
