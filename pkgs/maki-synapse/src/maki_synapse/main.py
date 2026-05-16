@@ -224,6 +224,32 @@ def _map_usage(token_usage: TokenUsage) -> Usage:
     )
 
 
+def _add_token_usages(a: TokenUsage, b: TokenUsage) -> TokenUsage:
+    """Sum two TokenUsage records across billable + additive fields.
+
+    Used when a single request triggers multiple Claude calls (e.g. JSON-mode
+    retry): both calls are billed, so both must be reflected in the usage we
+    return to OpenAI-compatible clients. Metadata fields (model, mode) are
+    kept from the first call since that defines the request's identity.
+    """
+    if a.total_cost_usd is None and b.total_cost_usd is None:
+        total_cost: float | None = None
+    else:
+        total_cost = (a.total_cost_usd or 0.0) + (b.total_cost_usd or 0.0)
+    return TokenUsage(
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cache_read_tokens=a.cache_read_tokens + b.cache_read_tokens,
+        cache_creation_tokens=a.cache_creation_tokens + b.cache_creation_tokens,
+        total_cost_usd=total_cost,
+        num_turns=a.num_turns + b.num_turns,
+        model=a.model,
+        mode=a.mode,
+        duration_ms=a.duration_ms + b.duration_ms,
+        model_usage={**a.model_usage, **b.model_usage},
+    )
+
+
 def _log_ignored_fields(req: ChatCompletionRequest) -> None:
     """Warn when callers set fields that invoke_claude cannot honor."""
     ignored: dict[str, Any] = {}
@@ -318,20 +344,33 @@ async def chat_completions(req: ChatCompletionRequest):
                     "Your previous response was not valid JSON. "
                     "Respond with ONLY the raw JSON object. No other text."
                 )
-                text, token_usage = await invoke_claude(
+                retry_text, retry_usage = await invoke_claude(
                     retry_prompt,
                     model=MODEL,
                     semaphore=_semaphore,
                     system_prompt=system_prompt or None,
                     mode="synapse_proxy_retry",
                 )
+                # Both calls were billed — accumulate so the OpenAI Usage we
+                # return reflects the real cost, not just the retry's.
+                token_usage = _add_token_usages(token_usage, retry_usage)
+                text = retry_text
                 log.info("Retry response", extra={"response_len": len(text)})
                 retry_raw = extract_json_str(text)
                 try:
                     json.loads(retry_raw)
                     text = retry_raw
                 except json.JSONDecodeError:
-                    log.error("JSON retry also failed, returning 502", extra={"raw_preview": text[:200]})
+                    # Log the accumulated cost so the wasted attempt is
+                    # visible in telemetry even though the 502 response body
+                    # carries no usage field.
+                    log.error(
+                        "JSON retry also failed, returning 502",
+                        extra={
+                            "raw_preview": text[:200],
+                            "token_usage": token_usage.to_log_dict(),
+                        },
+                    )
                     raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
     except HTTPException:
         raise
