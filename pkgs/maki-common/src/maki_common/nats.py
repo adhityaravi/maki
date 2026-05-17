@@ -177,6 +177,8 @@ async def subscribe_supervised(
     durable: str | None = None,
     deliver_policy: Any = None,
     auto_ack: bool | None = None,
+    ack_on_error: bool = False,
+    nak_delay: float | None = None,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     name: str | None = None,
@@ -195,6 +197,21 @@ async def subscribe_supervised(
     ``Task: result=None``s and the service goes blind to that subject with no
     log, no health flip, no restart. See issue #175.
 
+    Ack semantics (issue #221):
+
+    * Handler success → ``await msg.ack()`` when ``auto_ack`` is truthy. The
+      message is consumed and JetStream advances the consumer cursor.
+    * Handler exception → ``await msg.nak(delay=nak_delay)`` by default, so
+      JetStream redelivers per the consumer's ``max_deliver`` / ``ack_wait``
+      policy. This is the at-least-once contract durable consumers rely on:
+      a transient kubectl/Postgres/Discord hiccup must not silently consume
+      the message.
+    * Handler exception with ``ack_on_error=True`` → ``await msg.ack()``
+      anyway. Opt-in for fire-and-forget broadcasts where dropping a poison
+      message is better than redelivering forever.
+    * Core NATS (no ``js``) has no NAK concept — exceptions are logged and
+      the message moves on regardless.
+
     Args:
         nc: Core NATS client (used for non-JetStream subscriptions and as a
             connection-state probe).
@@ -205,11 +222,23 @@ async def subscribe_supervised(
             ``durable`` / ``deliver_policy`` kwargs apply.
         durable: JetStream durable consumer name (only with ``js``).
         deliver_policy: JetStream deliver policy (only with ``js``).
-        auto_ack: If True, ``await msg.ack()`` is called after the handler
-            returns (success or failure). Default: True for JetStream subs,
-            False for core NATS subs.
-        base_delay: Initial backoff delay in seconds (default 1.0).
-        max_delay: Maximum backoff delay in seconds (default 30.0).
+        auto_ack: If True, the supervisor ACKs on success and NAKs on
+            failure (subject to ``ack_on_error``). Default: True for
+            JetStream subs, False for core NATS subs.
+        ack_on_error: If True, ACK the message even when the handler raises
+            (legacy fire-and-forget behavior — exception is logged and the
+            message is permanently consumed). If False (default), the
+            message is NAK'd so JetStream redelivers per the consumer's
+            ``max_deliver`` policy. Set this only for non-durable broadcasts
+            where silently losing a message on transient errors is preferable
+            to indefinite redelivery.
+        nak_delay: Optional seconds to delay redelivery on NAK. If None,
+            JetStream uses the consumer's backoff / ``ack_wait`` default.
+        base_delay: Initial subscribe-retry backoff delay in seconds (default
+            1.0). Unrelated to ``nak_delay`` — this governs the supervisor's
+            re-subscribe loop, not per-message redelivery.
+        max_delay: Maximum subscribe-retry backoff delay in seconds (default
+            30.0).
         name: Optional human-readable label for logs (defaults to ``subject``).
 
     The coroutine never returns under normal operation — it loops forever and
@@ -241,24 +270,48 @@ async def subscribe_supervised(
             delay = base_delay  # reset backoff after a successful subscribe
 
             async for msg in sub.messages:
+                handler_failed = False
                 try:
                     await handler(msg)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    handler_failed = True
                     log.exception(
                         "Supervised handler error",
                         extra={"subject": subject, "sub_name": label},
                     )
-                finally:
-                    if auto_ack:
-                        try:
-                            await msg.ack()
-                        except Exception:
-                            log.exception(
-                                "Supervised ack failed",
-                                extra={"subject": subject, "sub_name": label},
-                            )
+
+                if not auto_ack:
+                    continue
+
+                # Settle the message. Success → ACK. Failure → NAK so JS
+                # redelivers (unless caller opted into ack_on_error). Core
+                # NATS messages lack ``nak`` entirely; in that case the
+                # failure is already logged and we just move on.
+                try:
+                    if handler_failed and not ack_on_error:
+                        nak = getattr(msg, "nak", None)
+                        if nak is None:
+                            # Core NATS: no redelivery primitive. Already
+                            # logged above; nothing else to do.
+                            continue
+                        if nak_delay is not None:
+                            await nak(delay=nak_delay)
+                        else:
+                            await nak()
+                    else:
+                        await msg.ack()
+                except Exception:
+                    log.exception(
+                        "Supervised ack/nak failed",
+                        extra={
+                            "subject": subject,
+                            "sub_name": label,
+                            "handler_failed": handler_failed,
+                            "ack_on_error": ack_on_error,
+                        },
+                    )
 
             # async for exited without raising — subscription drained or the
             # NATS client closed it. Loop and re-subscribe; this is the whole

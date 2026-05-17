@@ -553,7 +553,10 @@ async def _handle_vitals(msg) -> None:
     """Process one vitals digest and post to #maki-general.
 
     ``subscribe_supervised`` handles the ack on our behalf (auto_ack defaults
-    to True for JetStream subs), so no ``msg.ack()`` here.
+    to True for JetStream subs) — ACK on success, NAK on uncaught handler
+    exception so JS redelivers per the consumer's max_deliver (issue #221).
+    This handler currently swallows Discord errors internally; rework the
+    broad ``try/except`` below if at-least-once posting becomes load-bearing.
     """
     try:
         data = json.loads(msg.data.decode())
@@ -579,7 +582,8 @@ async def _vitals_listener():
 
     Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
     re-subscribes the durable consumer instead of silently terminating
-    (issue #175). auto_ack=True (JS default) handles message acks.
+    (issue #175). auto_ack=True (JS default) ACKs on success and NAKs
+    uncaught handler exceptions for redelivery (issue #221).
     """
     await subscribe_supervised(
         _nc,
@@ -619,7 +623,8 @@ async def _alert_listener():
 
     Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
     re-subscribes the durable consumer instead of silently terminating
-    (issue #175). auto_ack=True (JS default) handles message acks.
+    (issue #175). auto_ack=True (JS default) ACKs on success and NAKs
+    uncaught handler exceptions for redelivery (issue #221).
     """
     await subscribe_supervised(
         _nc,

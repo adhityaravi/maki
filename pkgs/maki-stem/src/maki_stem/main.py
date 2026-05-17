@@ -344,8 +344,11 @@ async def _init_conversation_stream():
 async def _handle_conversation_sync(msg) -> None:
     """Sync one conversation turn into _conversation_history.
 
-    ``subscribe_supervised`` handles JS acking (auto_ack=True), so no
-    ``msg.ack()`` here.
+    ``subscribe_supervised`` handles JS acking (auto_ack=True) — ACK on
+    success, NAK on uncaught handler exception so JS redelivers (issue
+    #221). This handler swallows all exceptions internally, so failures
+    are effectively fire-and-forget today; rework the broad ``try/except``
+    below if at-least-once delivery becomes load-bearing.
     """
     try:
         turn_doc = json.loads(msg.data.decode())

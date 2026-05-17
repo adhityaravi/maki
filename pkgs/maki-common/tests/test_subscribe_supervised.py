@@ -20,6 +20,30 @@ from maki_common.nats import subscribe_supervised
 
 
 class _FakeMessage:
+    """JetStream-like message: supports both ``ack`` and ``nak``."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.acked = False
+        self.nakd = False
+        self.nak_delay: float | None = None
+
+    async def ack(self) -> None:
+        self.acked = True
+
+    async def nak(self, delay: float | None = None) -> None:
+        self.nakd = True
+        self.nak_delay = delay
+
+
+class _FakeCoreMessage:
+    """Core-NATS-like message: ``ack`` only, no ``nak`` attribute.
+
+    The supervisor uses ``getattr(msg, "nak", None)`` to detect that the
+    message can't be redelivered and falls back to logging the error and
+    moving on. Used to verify that path explicitly.
+    """
+
     def __init__(self, data: bytes) -> None:
         self.data = data
         self.acked = False
@@ -175,24 +199,32 @@ def test_handler_exception_does_not_kill_loop(caplog) -> None:  # type: ignore[n
     assert any("Supervised handler error" in r.getMessage() for r in caplog.records)
 
 
-def test_auto_ack_acks_messages_for_jetstream() -> None:
-    """When ``auto_ack=True``, every dispatched message is acked even if the handler raises."""
+class _FakeJS:
+    """Minimal JetStream context double — returns a single scripted sub."""
 
-    class _FakeJS:
-        def __init__(self, sub: _FakeSubscription) -> None:
-            self._sub = sub
-            self.subscribe_calls = 0
+    def __init__(self, sub: _FakeSubscription) -> None:
+        self._sub: _FakeSubscription | None = sub
+        self.subscribe_calls = 0
 
-        async def subscribe(self, subject: str, **kwargs: object) -> _FakeSubscription:
-            self.subscribe_calls += 1
-            if self._sub is None:
-                await asyncio.Event().wait()
-                raise RuntimeError("unreachable")
-            sub = self._sub
-            self._sub = None  # type: ignore[assignment]
-            return sub
+    async def subscribe(self, subject: str, **kwargs: object) -> _FakeSubscription:
+        self.subscribe_calls += 1
+        if self._sub is None:
+            await asyncio.Event().wait()
+            raise RuntimeError("unreachable")
+        sub = self._sub
+        self._sub = None
+        return sub
 
-    async def scenario() -> tuple[bool, bool]:
+
+def test_auto_ack_acks_on_success_and_naks_on_failure() -> None:
+    """Default JetStream behavior (issue #221): ACK on success, NAK on handler exception.
+
+    Previous behavior swallowed handler failures by ACKing anyway, turning
+    every transient hiccup into a poison pill for durable consumers. The
+    supervisor now NAKs so JetStream redelivers per ``max_deliver``.
+    """
+
+    async def scenario() -> tuple[_FakeMessage, _FakeMessage]:
         ok_msg = _FakeMessage(b"ok")
         bad_msg = _FakeMessage(b"bad")
 
@@ -216,7 +248,7 @@ def test_auto_ack_acks_messages_for_jetstream() -> None:
             )
         )
         for _ in range(200):
-            if ok_msg.acked and bad_msg.acked:
+            if ok_msg.acked and bad_msg.nakd:
                 break
             await asyncio.sleep(0.01)
         task.cancel()
@@ -224,8 +256,151 @@ def test_auto_ack_acks_messages_for_jetstream() -> None:
             await task
         except asyncio.CancelledError:
             pass
-        return ok_msg.acked, bad_msg.acked
+        return ok_msg, bad_msg
 
-    ok_acked, bad_acked = _run(scenario())
-    assert ok_acked is True
-    assert bad_acked is True
+    ok_msg, bad_msg = _run(scenario())
+    # Success path: ACK, no NAK.
+    assert ok_msg.acked is True
+    assert ok_msg.nakd is False
+    # Failure path: NAK so JS redelivers; explicitly not ACKed.
+    assert bad_msg.nakd is True
+    assert bad_msg.acked is False
+    # Default nak_delay is None → caller didn't override JS consumer backoff.
+    assert bad_msg.nak_delay is None
+
+
+def test_nak_delay_is_forwarded_to_message() -> None:
+    """``nak_delay`` overrides JetStream's default redelivery backoff."""
+
+    async def scenario() -> _FakeMessage:
+        bad_msg = _FakeMessage(b"bad")
+
+        async def handler(msg: _FakeMessage) -> None:
+            raise RuntimeError("boom")
+
+        sub = _FakeSubscription([bad_msg])
+        js = _FakeJS(sub)
+        nc = _FakeNC([])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                js=js,
+                durable="test-durable",
+                nak_delay=2.5,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(200):
+            if bad_msg.nakd:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return bad_msg
+
+    bad_msg = _run(scenario())
+    assert bad_msg.nakd is True
+    assert bad_msg.nak_delay == 2.5
+
+
+def test_ack_on_error_acks_even_when_handler_raises() -> None:
+    """``ack_on_error=True`` opts back into legacy fire-and-forget behavior."""
+
+    async def scenario() -> _FakeMessage:
+        bad_msg = _FakeMessage(b"bad")
+
+        async def handler(msg: _FakeMessage) -> None:
+            raise RuntimeError("boom")
+
+        sub = _FakeSubscription([bad_msg])
+        js = _FakeJS(sub)
+        nc = _FakeNC([])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                js=js,
+                durable="test-durable",
+                ack_on_error=True,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(200):
+            if bad_msg.acked:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return bad_msg
+
+    bad_msg = _run(scenario())
+    # Opt-in: failure is swallowed and ACKed so JS doesn't redeliver.
+    assert bad_msg.acked is True
+    assert bad_msg.nakd is False
+
+
+def test_core_nats_message_without_nak_does_not_crash_supervisor(caplog) -> None:  # type: ignore[no-untyped-def]
+    """A handler exception on a core-NATS-style message (no ``nak``) is logged
+    and the loop keeps going — there's no redelivery primitive to call.
+
+    Order matters here: ``bad`` is delivered first so we can wait for the
+    follow-up ``ok`` ACK as proof that the failed message was fully settled
+    without crashing the supervisor.
+    """
+
+    async def scenario() -> tuple[_FakeCoreMessage, _FakeCoreMessage]:
+        bad_msg = _FakeCoreMessage(b"bad")
+        ok_msg = _FakeCoreMessage(b"ok")
+
+        async def handler(msg: _FakeCoreMessage) -> None:
+            if msg.data == b"bad":
+                raise RuntimeError("boom")
+
+        sub = _FakeSubscription([bad_msg, ok_msg])
+        # Force auto_ack=True so the ack/nak settle branch runs even though
+        # this is a core NATS path (no JS context).
+        nc = _FakeNC([sub])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                auto_ack=True,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(200):
+            if ok_msg.acked:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return ok_msg, bad_msg
+
+    with caplog.at_level(logging.ERROR, logger="maki_common.nats"):
+        ok_msg, bad_msg = _run(scenario())
+
+    # Subsequent success path still works → supervisor didn't crash on the
+    # missing ``nak`` attribute.
+    assert ok_msg.acked is True
+    # Failure: no nak attribute → supervisor logs and moves on without ACKing.
+    assert bad_msg.acked is False
+    assert any("Supervised handler error" in r.getMessage() for r in caplog.records)
