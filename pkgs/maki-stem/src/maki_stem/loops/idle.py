@@ -184,17 +184,15 @@ _IDLE_MEMORY_QUERIES = [
 
 
 async def _idle_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
-    """Pre-claim guard: only proceed when the cron window is open.
+    """Pre-claim guard: only proceed in the cron window when the user is idle.
 
     Must run before claiming the lock so the 4-hour TTL is not consumed
-    outside the scheduled window (which would cause the loop to drift
-    and never fire).
+    outside the scheduled window (or while the user is active), which would
+    cause the loop to drift and skip the entire window (issue #223).
     """
-    return cron_window(IDLE_CRON)
+    if not cron_window(IDLE_CRON):
+        return False
 
-
-async def _idle_should_run(config: dict, ctx: StemContext) -> bool:
-    """Post-claim guard: skip if user is recently active."""
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < RECENTLY_ACTIVE_THRESHOLD:
         return False
@@ -289,7 +287,6 @@ IDLE_LOOP_SPEC = LoopSpec(
     check_interval_getter=lambda: IDLE_CHECK_INTERVAL,
     execution_interval_getter=lambda config: 14400,  # 4h TTL — matches cron, prevents double-fire
     pre_claim_guard=_idle_pre_claim_guard,
-    should_run=_idle_should_run,
     body=_idle_body,
     model="claude-opus-4-7",
 )

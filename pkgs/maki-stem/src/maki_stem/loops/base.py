@@ -195,8 +195,8 @@ class StemContext:
 class LoopSpec:
     """Specification for a proactive background loop.
 
-    Each loop shares the same outer structure: sleep → load config → claim lock →
-    run guards → execute body. LoopSpec captures the per-loop variation so a single
+    Each loop shares the same outer structure: sleep → load config → run guard →
+    claim lock → execute body. LoopSpec captures the per-loop variation so a single
     generic runner (_run_loop) can drive all loops without duplicating that skeleton.
     """
 
@@ -209,17 +209,15 @@ class LoopSpec:
     execution_interval_getter: Callable[[dict], int]
     """Returns the minimum interval (seconds) between actual executions (claim TTL)."""
 
-    should_run: Callable[[dict, StemContext], Coroutine[None, None, bool]]  # type: ignore[type-arg]
-    """Async callable(config, ctx) → bool.  Return False to skip this cycle (guard check)."""
-
     body: Callable[[LoopSpec, dict, StemContext], Coroutine[None, None, None]]  # type: ignore[type-arg]
     """Async callable(spec, config, ctx) that performs the actual loop work for one cycle."""
 
     pre_claim_guard: Callable[[dict, StemContext], Coroutine[None, None, bool]] | None = None  # type: ignore[type-arg]
     """Optional async callable(config, ctx) → bool evaluated *before* claiming the lock.
 
-    Use this when a guard must run before the lock claim to preserve the original
-    loop ordering (e.g. the work loop checks work hours before claiming).
+    Return False to skip this cycle. Guards MUST run before the lock claim: a claim
+    consumes the execution_interval TTL even when no body runs, so a post-claim veto
+    would burn an entire interval on a skipped cycle (issue #223).
     """
 
     model: str | None = None
@@ -233,9 +231,8 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
     """Generic loop runner — drives any LoopSpec with the shared scheduling skeleton.
 
     Handles: periodic sleep, config loading, optional pre-claim guard, distributed
-    lock claiming, post-claim guard evaluation, and top-level exception isolation.
-    Per-loop variation lives entirely inside *spec.pre_claim_guard*, *spec.should_run*,
-    and *spec.body*.
+    lock claiming, and top-level exception isolation. Per-loop variation lives
+    entirely inside *spec.pre_claim_guard* and *spec.body*.
     """
     log.info(
         "Loop started",
@@ -251,8 +248,6 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
             execution_interval = spec.execution_interval_getter(config)
             lock_key = f"loop.stem.{spec.name}"
             if not await try_claim_loop(ctx.lock_kv, lock_key, execution_interval, ctx.instance_id):
-                continue
-            if not await spec.should_run(config, ctx):
                 continue
             await spec.body(spec, config, ctx)
             try:

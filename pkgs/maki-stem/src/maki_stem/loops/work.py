@@ -302,12 +302,15 @@ async def _record_work_failure(ctx: StemContext, issue_number: int, reason: str)
 
 
 async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
-    """Pre-claim guard for the work loop: only proceed when the cron window is open."""
-    return cron_window(WORK_CRON)
+    """Pre-claim guard for the work loop: cron window, user inactivity, GitHub availability.
 
+    Must run before claiming the lock so the 1-day TTL is not consumed when no work
+    will be done (e.g. user mid-conversation), which would skip the entire overnight
+    work cycle (issue #223).
+    """
+    if not cron_window(WORK_CRON):
+        return False
 
-async def _work_should_run(config: dict, ctx: StemContext) -> bool:
-    """Post-claim guard: user inactivity and GitHub availability."""
     # Only work if user has been inactive
     last_activity = await kv_get_float(ctx.lock_kv, "stem.last_activity", default=time.time())
     if time.time() - last_activity < USER_INACTIVE_THRESHOLD:
@@ -497,7 +500,6 @@ WORK_LOOP_SPEC = LoopSpec(
     check_interval_getter=lambda: WORK_CHECK_INTERVAL,
     execution_interval_getter=lambda config: 86400,  # once per day — lock TTL prevents double-fire
     pre_claim_guard=_work_pre_claim_guard,
-    should_run=_work_should_run,
     body=_work_body,
     model="claude-opus-4-7",
 )
