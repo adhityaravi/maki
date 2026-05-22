@@ -76,6 +76,11 @@ DEFAULT_CONFIG = {
     "reflex_restart_max": 3,
     "lock_ttl": 300,
     "passive_patrol_interval_seconds": 2700,
+    # Stuck-component escalation (#245): how long a pod may sit unhealthy in a
+    # non-Running/initializing phase with zero healthy replicas before immune
+    # escalates, and how often it re-alerts while still stuck.
+    "stuck_escalation_threshold_s": 600,
+    "stuck_realert_interval_s": 3600,
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {

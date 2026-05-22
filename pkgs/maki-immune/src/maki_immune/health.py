@@ -21,6 +21,27 @@ from maki_common.subjects import CORTEX_STUCK, CORTEX_TOKEN_USAGE, IMMUNE_ACTION
 # 1800s (30 min) leaves head-room above the cortex internal default. See #150.
 CORTEX_STUCK_THRESHOLD_S = int(os.environ.get("CORTEX_STUCK_THRESHOLD_S", "1800"))
 
+# Wall-clock seconds a component may sit unhealthy in a non-Running / initializing
+# phase with zero healthy replicas before immune classifies it as "stuck" and
+# escalates. This catches the gap the restart reflex misses: a pod that never
+# finishes initializing (phase=Pending, waiting_reason=PodInitializing, restarts=0)
+# produces no crash signal — it looks nothing like a CrashLoopBackOff — so it can
+# sit dead for days while only a monotonic failure counter ticks up and nobody
+# acts. See issue #245.
+#
+# This is deliberately distinct from #77 (suppress PodInitializing false-positives
+# on healthy rolling updates): the zero-healthy-replicas guard below means we only
+# escalate when NO replica is serving, so a routine multi-pod rollout — where other
+# replicas stay ready — never trips this.
+STUCK_ESCALATION_THRESHOLD_S = int(os.environ.get("STUCK_ESCALATION_THRESHOLD_S", "600"))
+
+# How often to re-fire a stuck escalation while the component stays stuck. The
+# first escalation fires once the threshold above is crossed; after that we
+# re-alert on this cadence so a single failed/ignored escalation doesn't leave
+# the system silently wedged for days (mirrors the cortex-stuck re-arm in #185),
+# while staying far coarser than the 30s health tick so Adi isn't spammed.
+STUCK_REALERT_INTERVAL_S = int(os.environ.get("STUCK_REALERT_INTERVAL_S", "3600"))
+
 log = logging.getLogger(__name__)
 
 # Set by init()
@@ -75,6 +96,13 @@ _cortex_stuck_alerted: dict[str, Any] = {
     "last_fired_at": 0.0,
     "fire_count": 0,
 }
+
+# Track which components we've raised a "stuck" escalation for. Keyed by component
+# name -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
+# ``last_state_change`` at the time we first escalated, so a fresh outage (new
+# state change) re-arms cleanly rather than being suppressed by a stale entry.
+# Entries are dropped the moment the component recovers or stops being stuck. See #245.
+_stuck_alerted: dict[str, dict[str, Any]] = {}
 
 
 def init(
@@ -506,6 +534,8 @@ async def health_monitor_loop():
                 if not state["healthy"] and state["consecutive_failures"] >= 2:
                     await _trigger_reflex(component, state, config)
 
+            await _check_stuck_components(config)
+
         except Exception:
             log.exception("Health monitor error")
 
@@ -593,6 +623,171 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         log.exception("Failed to restart pod", extra={"pod_name": pod_name})
     finally:
         await _release_lock("immune-reflex")
+
+
+# --- Stuck-Component Detection (Tier 1.5) ---
+
+
+def _healthy_replica_count(details: dict) -> tuple[int, int]:
+    """Return (healthy_replicas, total_replicas) for an unhealthy component.
+
+    The k8s pod check records ``total_pods``/``unhealthy_pods`` only when a
+    component has more than one pod. For a single-pod component those keys are
+    absent — and since this is only called for an *unhealthy* component, that
+    single pod is by definition not healthy, so we report (0, 1).
+    """
+    total = details.get("total_pods")
+    if total is None:
+        return 0, 1
+    unhealthy = details.get("unhealthy_pods") or 0
+    return max(total - unhealthy, 0), total
+
+
+async def _check_stuck_components(config: dict) -> None:
+    """Escalate components stuck unhealthy in a non-Running phase with no healthy replica.
+
+    The restart reflex (``_trigger_reflex``) handles pods that crash and restart,
+    but a pod that *never finishes initializing* (phase=Pending,
+    waiting_reason=PodInitializing, restarts=0) produces no crash signal and can
+    sit dead for days while only ``consecutive_failures`` ticks up — exactly the
+    autonomy gap in #245. Here we classify that as "stuck" off ``last_state_change``
+    (wall-clock duration, not failure count) and escalate:
+
+    - **Human escalation** — publish an ALERT, which reaches Adi via ears. This is
+      the path that was missing: a foundational component could be dead for days
+      with nobody notified.
+    - **Judgment-driven remediation** — hand the incident to immune's own Claude,
+      which can read logs/events and decide whether deleting the stuck pod is safe
+      (blindly deleting a single-replica secrets StatefulSet is risky), rather than
+      a blind reflex restart.
+
+    Guards that keep this from firing on healthy rollouts (#77) or localized
+    issues: we only escalate when the pod is in a non-Running/initializing phase,
+    has been stuck longer than the threshold, has **zero** healthy replicas, and
+    is not healthy on any other hive site.
+    """
+    if _nc is None:
+        return
+
+    threshold = config.get("stuck_escalation_threshold_s", STUCK_ESCALATION_THRESHOLD_S)
+    realert = config.get("stuck_realert_interval_s", STUCK_REALERT_INTERVAL_S)
+    now = time.time()
+
+    for component, state in list(_component_health.items()):
+        if component.endswith("-heartbeat"):
+            continue
+
+        if state["healthy"]:
+            _stuck_alerted.pop(component, None)
+            continue
+
+        details = state.get("details", {})
+        phase = details.get("phase")
+        waiting_reason = details.get("waiting_reason")
+
+        # Only the never-finishes-initializing / non-Running pod case. A pod that
+        # is Running+Ready but failing its HTTP health check is a different failure
+        # mode that the restart reflex already handles; escalating it here too would
+        # double up. Components with no phase at all (pure HTTP endpoints) are
+        # likewise left to the reflex path.
+        is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
+        if not is_pod_stuck:
+            _stuck_alerted.pop(component, None)
+            continue
+
+        stuck_for = now - state["last_state_change"]
+        if stuck_for < threshold:
+            continue
+
+        # #77 guard: only escalate when NO replica is serving. A healthy rolling
+        # update keeps other pods ready, so healthy_replicas > 0 and we bail.
+        healthy_replicas, total_replicas = _healthy_replica_count(details)
+        if healthy_replicas > 0:
+            _stuck_alerted.pop(component, None)
+            continue
+
+        # Hive guard: if the component is healthy on another site it's a local
+        # problem, not a system-wide outage — matches the reflex escalation policy.
+        if component_healthy_in_hive(component):
+            continue
+
+        # Re-arm tracking: fire once on first crossing for this incident, then every
+        # ``realert`` interval until it recovers — so a single ignored escalation
+        # doesn't go silent, without spamming on every 30s tick.
+        incident = state["last_state_change"]
+        tracker = _stuck_alerted.get(component)
+        if tracker is None or tracker.get("incident") != incident:
+            tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
+            _stuck_alerted[component] = tracker
+
+        last_fired = tracker.get("last_fired_at") or 0.0
+        first_fire = last_fired == 0.0
+        if not first_fire and (now - last_fired) < realert:
+            continue
+
+        fire_count = int(tracker.get("fire_count") or 0) + 1
+        tracker["last_fired_at"] = now
+        tracker["fire_count"] = fire_count
+
+        stuck_min = round(stuck_for / 60, 1)
+        pod_name = details.get("pod_name", "?")
+        restarts = details.get("restarts", 0)
+        replica_note = f"{healthy_replicas}/{total_replicas} replicas healthy"
+
+        log.error(
+            "Stuck component detected — escalating",
+            extra={
+                "component": component,
+                "pod_name": pod_name,
+                "stuck_for_min": stuck_min,
+                "phase": phase,
+                "waiting_reason": waiting_reason,
+                "restarts": restarts,
+                "fire_count": fire_count,
+            },
+        )
+
+        # Human escalation via ears (#245's missing piece).
+        await _publish_alert(
+            f"STUCK: {component} ({pod_name}) has been {phase or 'not Running'}"
+            f"/{waiting_reason or 'unhealthy'} for {stuck_min}min with {replica_note} — "
+            f"it never finished initializing (restarts={restarts}), no crash signal. "
+            f"Escalation #{fire_count}; needs attention."
+        )
+
+        # Audit the escalation as a recent action.
+        action = {
+            "type": "stuck_escalation",
+            "component": component,
+            "pod_name": pod_name,
+            "stuck_for_min": stuck_min,
+            "phase": phase,
+            "waiting_reason": waiting_reason,
+            "restarts": restarts,
+            "fire_count": fire_count,
+            "timestamp": now,
+        }
+        _recent_actions.append(action)
+        if len(_recent_actions) > _recent_actions_max:
+            _recent_actions.pop(0)
+        _schedule_persist()
+        try:
+            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+        except Exception:
+            log.exception("Failed to publish stuck escalation action")
+
+        # Judgment-driven remediation: only on the first fire per incident, so we
+        # don't spawn a Claude turn every re-alert. Claude can investigate and, if
+        # safe, restart the pod via its tools.
+        if first_fire and _escalate_to_claude is not None:
+            reason = (
+                f"Stuck classification: {component} ({pod_name}) has been unhealthy for "
+                f"{stuck_min}min in phase={phase}, waiting_reason={waiting_reason}, "
+                f"restarts={restarts}, with {replica_note}. No crash signal — it never "
+                f"finished initializing, so the restart reflex never fired. Investigate "
+                f"(logs, events, init containers, dependencies) and remediate if safe."
+            )
+            asyncio.create_task(_escalate_to_claude(component, state, reason))
 
 
 # --- Gossip Ring ---
