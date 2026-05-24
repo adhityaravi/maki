@@ -102,11 +102,18 @@ spec:
             timeoutSeconds: 10
             failureThreshold: 6
           resources:
+            # Bumped from 256Mi/512Mi after #251: mem0 fact-extraction runs
+            # the LLM add() path synchronously and accumulates messages +
+            # extracted facts in-process; at 512Mi a long conversation can
+            # OOM the pod mid-extract and CrashLoopBackOff. 512Mi/1Gi gives
+            # headroom for the in-flight extract without making recall a
+            # noticeably heavy tenant. Revisit if we move fact-extraction
+            # off the request thread.
             requests:
-              memory: 256Mi
+              memory: 512Mi
               cpu: 100m
             limits:
-              memory: 512Mi
+              memory: 1Gi
               cpu: 500m
           volumeMounts:
             - name: data
