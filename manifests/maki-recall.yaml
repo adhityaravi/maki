@@ -83,6 +83,29 @@ spec:
               value: nomic-embed-text
             - name: EMBEDDING_DIMS
               value: "768"
+          # Three-probe split per #253. Previously both readiness and
+          # liveness pointed at /health, which returns 503 while Mem0 is
+          # still initializing. A slow dep (pgvector/neo4j/synapse) during
+          # Memory.from_config would blow past the 240s liveness budget
+          # and kubelet would kill the pod mid-init → crashloop.
+          #
+          #   /live   — process-only; FastAPI loop responsive. Used by
+          #             livenessProbe. Never blocks on Mem0/deps.
+          #   /health — Mem0 + pgvector + neo4j probes. Used by
+          #             readinessProbe (routes traffic only when ready)
+          #             and startupProbe (gates liveness until init done).
+          startupProbe:
+            # 60 × 10s = 10min budget for Mem0 init. Once /health passes
+            # once, livenessProbe takes over. Generous because Memory.from_config
+            # blocks synchronously on pgvector + neo4j + synapse and any one
+            # being slow extends boot.
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /health
@@ -91,16 +114,16 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
           livenessProbe:
-            # Generous threshold: 6 × 30s = 3min of /health failure before
-            # kubelet restarts the pod. Lets transient backend hiccups ride
-            # through; only kills genuinely stuck pods.
+            # Process-only probe. Restarts the pod only when the FastAPI
+            # event loop itself stops responding — independent of Mem0
+            # init state or backend dep health.
             httpGet:
-              path: /health
+              path: /live
               port: 8000
-            initialDelaySeconds: 60
+            initialDelaySeconds: 0
             periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 6
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             # Bumped from 256Mi/512Mi after #251: mem0 fact-extraction runs
             # the LLM add() path synchronously and accumulates messages +

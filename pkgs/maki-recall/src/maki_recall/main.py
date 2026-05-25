@@ -319,14 +319,36 @@ def _probe_neo4j() -> str | None:
     return None
 
 
+@app.get("/live")
+def live():
+    """Liveness probe — process-only health check.
+
+    Returns 200 as long as the FastAPI event loop is responsive. Does NOT
+    touch Mem0, pgvector, Neo4j, the embedder, or the LLM. Used by k8s
+    ``livenessProbe`` so that slow dependency boots (Mem0's synchronous
+    ``Memory.from_config`` blocking on pgvector / neo4j / synapse) cannot
+    cause the kubelet to restart the pod mid-init.
+
+    Separated from ``/health`` per #253: previously both probes shared
+    ``/health``, which returns 503 during Mem0 init, so a slow init would
+    blow past the liveness budget and crashloop the pod just as it was
+    about to come up. ``/health`` remains the readiness/startup signal.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health():
-    """Liveness/readiness probe.
+    """Readiness/startup probe.
 
     Returns 503 with ``status: initializing`` while Mem0 hasn't finished
     booting (so k8s and maki-immune wait instead of crashlooping blind),
     200 when the stores are usable, and 503 ``status: degraded`` when one
-    of the backing stores fails its probe. See issues #135 and #169.
+    of the backing stores fails its probe. See issues #135, #169, #253.
+
+    Used by ``readinessProbe`` and ``startupProbe``. The ``livenessProbe``
+    points at ``/live`` instead so dependency slowness doesn't kill the
+    pod mid-init.
     """
     mem = memory
     if mem is None:
