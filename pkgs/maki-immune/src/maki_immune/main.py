@@ -81,6 +81,12 @@ DEFAULT_CONFIG = {
     # escalates, and how often it re-alerts while still stuck.
     "stuck_escalation_threshold_s": 600,
     "stuck_realert_interval_s": 3600,
+    # Long-unhealthy re-escalation (#260): once a component has been unhealthy
+    # for this many hours (in any shape, not just non-Running pods), re-fire
+    # the Claude escalation. Plugs the autonomy gap where the restart-reflex's
+    # single-shot escalation goes silent for days if not resolved (#259).
+    "long_unhealthy_re_escalate_hours": 6,
+    "long_unhealthy_realert_interval_s": 21600,
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {

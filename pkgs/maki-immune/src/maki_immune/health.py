@@ -42,6 +42,24 @@ STUCK_ESCALATION_THRESHOLD_S = int(os.environ.get("STUCK_ESCALATION_THRESHOLD_S"
 # while staying far coarser than the 30s health tick so Adi isn't spammed.
 STUCK_REALERT_INTERVAL_S = int(os.environ.get("STUCK_REALERT_INTERVAL_S", "3600"))
 
+# Wall-clock hours a component may sit unhealthy *in any shape* (HTTP probe
+# failing, CrashLoopBackOff, you name it) before immune re-fires the Claude
+# escalation. This is the generalised cousin of STUCK_ESCALATION_THRESHOLD_S:
+# the latter only catches non-Running/initializing pods, while this catches the
+# "Running+ready=False for days" silent-hang that the restart reflex's single-
+# shot escalation buries (see #259/#258 — maki-recall went 3.5 days with no
+# alert because consecutive_failures kept ticking up but escalation never
+# re-fired). 6h default trades "fast detection" against "don't page on a
+# 30-min outage that's already being handled". See #260.
+LONG_UNHEALTHY_RE_ESCALATE_HOURS = int(os.environ.get("LONG_UNHEALTHY_RE_ESCALATE_HOURS", "6"))
+
+# Cooldown between successive re-escalations for the same component while it
+# stays unhealthy. Without this, a stuck component would fire a Claude
+# escalation on every 30s health tick once it crosses the threshold. Default
+# matches the threshold (6h) so we get one alert per cooldown window — enough
+# that it doesn't go silent for days, infrequent enough that Adi isn't spammed.
+LONG_UNHEALTHY_REALERT_INTERVAL_S = int(os.environ.get("LONG_UNHEALTHY_REALERT_INTERVAL_S", "21600"))
+
 log = logging.getLogger(__name__)
 
 # Set by init()
@@ -103,6 +121,15 @@ _cortex_stuck_alerted: dict[str, Any] = {
 # state change) re-arms cleanly rather than being suppressed by a stale entry.
 # Entries are dropped the moment the component recovers or stops being stuck. See #245.
 _stuck_alerted: dict[str, dict[str, Any]] = {}
+
+# Track long-unhealthy re-escalations (#260). Same shape as ``_stuck_alerted``
+# but covers the broader case: any component unhealthy past
+# LONG_UNHEALTHY_RE_ESCALATE_HOURS, regardless of pod phase. Keyed by component
+# -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
+# ``last_state_change`` at the time we first re-escalated so a recover-and-
+# fail-again cycle re-arms cleanly. In-memory only — a restart of immune costs
+# at most one extra alert per stuck component, which is acceptable.
+_long_unhealthy_alerted: dict[str, dict[str, Any]] = {}
 
 
 def init(
@@ -535,6 +562,7 @@ async def health_monitor_loop():
                     await _trigger_reflex(component, state, config)
 
             await _check_stuck_components(config)
+            await _check_long_unhealthy_components(config)
 
         except Exception:
             log.exception("Health monitor error")
@@ -786,6 +814,139 @@ async def _check_stuck_components(config: dict) -> None:
                 f"restarts={restarts}, with {replica_note}. No crash signal — it never "
                 f"finished initializing, so the restart reflex never fired. Investigate "
                 f"(logs, events, init containers, dependencies) and remediate if safe."
+            )
+            asyncio.create_task(_escalate_to_claude(component, state, reason))
+
+
+async def _check_long_unhealthy_components(config: dict) -> None:
+    """Re-escalate components that have been unhealthy for a long time (#260).
+
+    Plugs the autonomy gap exposed by #259: the restart reflex (`_trigger_reflex`)
+    only fires ``_escalate_to_claude`` once per restart-budget exhaustion. After
+    that, ``consecutive_failures`` ticks up forever with no further alert. If the
+    resulting incident issue gets closed without a root-cause fix (or escalation
+    never reaches a human), the component can sit broken for days — exactly how
+    maki-recall went 3.5d silent in this incident series (#251 → #257 → #259).
+
+    Distinct from ``_check_stuck_components``: that one only fires for pods in a
+    non-Running / initializing phase. This catches the broader case — *anything*
+    immune classifies as unhealthy, whether it's an HTTP probe returning 503, a
+    CrashLoopBackOff, or anything else — once it has been unhealthy past
+    ``LONG_UNHEALTHY_RE_ESCALATE_HOURS`` since the last state change.
+
+    Cooldown via ``_long_unhealthy_alerted`` keyed by component ensures one alert
+    per ``long_unhealthy_realert_interval_s`` window, not one per 30s tick. The
+    tracker is keyed on the component's ``last_state_change`` so a recover-and-
+    fail-again cycle re-arms cleanly. Hive guard suppresses local-only outages
+    (matches the reflex/stuck-escalation policy).
+    """
+    if _nc is None:
+        return
+
+    threshold_s = config.get("long_unhealthy_re_escalate_hours", LONG_UNHEALTHY_RE_ESCALATE_HOURS) * 3600
+    realert_s = config.get("long_unhealthy_realert_interval_s", LONG_UNHEALTHY_REALERT_INTERVAL_S)
+    now = time.time()
+
+    for component, state in list(_component_health.items()):
+        # Heartbeat-derived components don't have pods to act on; their own
+        # alerting path (CORTEX_STUCK, cortex-rollback) handles the bad cases.
+        if component.endswith("-heartbeat"):
+            continue
+
+        if state["healthy"]:
+            _long_unhealthy_alerted.pop(component, None)
+            continue
+
+        stuck_for = now - state["last_state_change"]
+        if stuck_for < threshold_s:
+            continue
+
+        # Hive guard: if some other site has this component healthy, treat the
+        # local failure as a local-only problem rather than waking Adi up about
+        # a system-wide outage. Matches the policy in `_trigger_reflex` and
+        # `_check_stuck_components`.
+        if component_healthy_in_hive(component):
+            continue
+
+        incident = state["last_state_change"]
+        tracker = _long_unhealthy_alerted.get(component)
+        if tracker is None or tracker.get("incident") != incident:
+            tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
+            _long_unhealthy_alerted[component] = tracker
+
+        last_fired = tracker.get("last_fired_at") or 0.0
+        first_fire = last_fired == 0.0
+        if not first_fire and (now - last_fired) < realert_s:
+            continue
+
+        fire_count = int(tracker.get("fire_count") or 0) + 1
+        tracker["last_fired_at"] = now
+        tracker["fire_count"] = fire_count
+
+        stuck_hours = round(stuck_for / 3600, 1)
+        details = state.get("details", {})
+        pod_name = details.get("pod_name", "?")
+        phase = details.get("phase")
+        waiting_reason = details.get("waiting_reason")
+        restarts = details.get("restarts", 0)
+        consecutive_failures = state.get("consecutive_failures", 0)
+
+        log.error(
+            "Long-unhealthy component — re-escalating",
+            extra={
+                "component": component,
+                "pod_name": pod_name,
+                "stuck_for_hours": stuck_hours,
+                "consecutive_failures": consecutive_failures,
+                "phase": phase,
+                "waiting_reason": waiting_reason,
+                "restarts": restarts,
+                "fire_count": fire_count,
+            },
+        )
+
+        await _publish_alert(
+            f"LONG-UNHEALTHY: {component} ({pod_name}) has been unhealthy for {stuck_hours}h "
+            f"(consecutive_failures={consecutive_failures}, phase={phase}, "
+            f"waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
+            f"Re-escalation #{fire_count} — initial reflex/escalation did not resolve."
+        )
+
+        action = {
+            "type": "long_unhealthy_re_escalation",
+            "component": component,
+            "pod_name": pod_name,
+            "stuck_for_hours": stuck_hours,
+            "consecutive_failures": consecutive_failures,
+            "phase": phase,
+            "waiting_reason": waiting_reason,
+            "restarts": restarts,
+            "fire_count": fire_count,
+            "timestamp": now,
+        }
+        _recent_actions.append(action)
+        if len(_recent_actions) > _recent_actions_max:
+            _recent_actions.pop(0)
+        _schedule_persist()
+        try:
+            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+        except Exception:
+            log.exception("Failed to publish long-unhealthy re-escalation action")
+
+        # Hand back to Claude for a fresh investigation on every re-escalation —
+        # the whole point of this path is that the previous escalation did not
+        # resolve the underlying problem, so spawning one Claude turn per
+        # ``realert_s`` window is the desired cadence (not just first-fire-only).
+        # ``_escalate_to_claude`` is fire-and-forget; if Claude is busy the
+        # semaphore upstream will serialise the turn.
+        if _escalate_to_claude is not None:
+            reason = (
+                f"Long-unhealthy re-escalation: {component} ({pod_name}) has been unhealthy "
+                f"for {stuck_hours}h (consecutive_failures={consecutive_failures}, "
+                f"phase={phase}, waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
+                f"This is re-escalation #{fire_count} — earlier reflex/escalation did not fix "
+                f"the root cause. Investigate logs/events/dependencies and remediate. If the "
+                f"underlying issue is structural, file or revisit the relevant bug issue."
             )
             asyncio.create_task(_escalate_to_claude(component, state, reason))
 

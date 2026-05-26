@@ -7,6 +7,7 @@ using pgvector + Neo4j graph store + Ollama embeddings.
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote_plus
@@ -28,7 +29,31 @@ log = logging.getLogger(__name__)
 # once they do without hammering pgvector/embedder/neo4j while they're down.
 INIT_RETRY_SECONDS = 5
 INIT_RETRY_MAX_SECONDS = 60
-GRAPH_RETRY_INTERVAL_SECONDS = 60
+GRAPH_RETRY_INTERVAL_SECONDS = 5
+GRAPH_RETRY_MAX_SECONDS = 300  # cap graph backoff at 5 minutes — see #262
+
+# Number of failed init attempts after which we promote the per-failure log
+# from WARNING to ERROR so cluster paging dashboards (typically ERROR+) catch
+# a recall that's been stuck longer than a transient blip. Picked so a normal
+# multi-minute dependency hiccup stays at WARNING but anything pathological
+# (#258 saw 79h of WARNING-only logging) flips loud. See #258.
+INIT_ERROR_LOG_AFTER_ATTEMPTS = 5
+
+# Once stuck this long, /health body marks the init as "stuck" so immune (and
+# any human reading /health directly) can distinguish "warming up normally"
+# from "wedged on the same dependency for ages". See #258.
+INIT_STUCK_THRESHOLD_S = 300  # 5 minutes
+
+# Graph retry equivalent of INIT_ERROR_LOG_AFTER_ATTEMPTS. Same rationale —
+# silent log.debug retries left a graph-disabled "ok" state running for days
+# in #262. Default a touch higher than vector init because graph is non-fatal.
+GRAPH_ERROR_LOG_AFTER_ATTEMPTS = 5
+
+# Once graph init has been failing for this long, /health flips from ok to
+# degraded so immune notices the component is running but missing half its
+# brain. See #262 — graph_enabled=False stayed silent because graph is
+# optional, but in practice every cortex turn loses graph context.
+GRAPH_DEGRADED_AFTER_S = 600  # 10 minutes
 
 
 def _build_pg_uri() -> str:
@@ -105,6 +130,48 @@ _graph_retry_task: asyncio.Task[None] | None = None
 _neo4j_probe_driver: neo4j.Driver | None = None
 
 
+# Structured init telemetry, surfaced in /health body so a stuck-on-init pod
+# is diagnosable without pod logs. See #258 — three documented episodes of
+# silent multi-day hangs because the loop only emitted a WARNING per failure
+# with no cumulative state, init duration, or last-error type recorded.
+_init_state: dict[str, Any] = {
+    "attempts": 0,
+    "started_at": 0.0,  # wall-clock when init loop first entered, 0 until start
+    "last_error": None,  # "Type: message" or None on success
+    "last_error_at": 0.0,
+    "last_attempt_duration_s": 0.0,  # how long the most recent attempt took
+    "last_attempt_phase": None,  # "vector" | "graph" | None — which Memory.from_config call failed
+    "ready_at": 0.0,  # wall-clock when init completed; 0 until ready
+}
+
+
+# Same shape as _init_state but for the background graph-recovery retry loop.
+# Surfaced in /health so the silent #262 failure mode (debug-level logging,
+# graph stays false for hours, status still reads ok) becomes observable.
+_graph_state: dict[str, Any] = {
+    "requested": False,
+    "attempts": 0,
+    "started_at": 0.0,
+    "last_error": None,
+    "last_error_at": 0.0,
+    "last_attempt_duration_s": 0.0,
+    "recovered_at": 0.0,
+}
+
+
+def _format_exception(exc: BaseException) -> str:
+    """Format an exception for structured logging / /health body.
+
+    ``str(exc)`` alone flattens the type — useful to keep `httpx.ConnectError:
+    [Errno 111]` distinct from `psycopg.OperationalError: connection refused`.
+    Length-capped so a multi-line traceback doesn't blow up /health responses.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    if len(text) > 500:
+        text = text[:497] + "..."
+    return text
+
+
 async def _init_mem0() -> None:
     """Initialise Mem0 in the background, retrying on failure.
 
@@ -120,11 +187,22 @@ async def _init_mem0() -> None:
          ``_retry_graph_init`` to recover the graph in the background.
 
     On success, sets the module globals ``memory`` and ``graph_enabled``.
+
+    Telemetry: each attempt updates ``_init_state`` (attempts, last_error,
+    last_attempt_duration_s, last_attempt_phase) so /health and any external
+    observer can distinguish "warming up" from "wedged on the same error for
+    hours". After ``INIT_ERROR_LOG_AFTER_ATTEMPTS`` failed attempts the per-
+    failure log is promoted from WARNING to ERROR so cluster paging dashboards
+    (typically ERROR+) finally see it. See #258.
     """
     global memory, graph_enabled, _graph_retry_task
     backoff = INIT_RETRY_SECONDS
+    _init_state["started_at"] = time.time()
     while True:
         config, neo4j_requested = _build_config()
+        _graph_state["requested"] = neo4j_requested
+        _init_state["attempts"] += 1
+        attempt = _init_state["attempts"]
         log.info(
             "Initializing Mem0",
             extra={
@@ -133,19 +211,38 @@ async def _init_mem0() -> None:
                 "llm_provider": config["llm"]["provider"],
                 "llm_model": config["llm"]["config"]["model"],
                 "embedder_model": config["embedder"]["config"]["model"],
+                "attempt": attempt,
             },
         )
 
         vector_only_config = {k: v for k, v in config.items() if k != "graph_store"}
+        attempt_started = time.time()
         try:
             vector_mem = await asyncio.to_thread(Memory.from_config, vector_only_config)
         except Exception as vec_err:
             # Foundational backend down (pgvector / embedder / LLM). Do NOT
             # blame the graph store — that misattribution was #198.
-            log.warning(
-                "Mem0 vector-store init failed: %s — retrying in %ds",
-                vec_err,
-                backoff,
+            duration = time.time() - attempt_started
+            err_text = _format_exception(vec_err)
+            _init_state["last_error"] = err_text
+            _init_state["last_error_at"] = time.time()
+            _init_state["last_attempt_duration_s"] = round(duration, 3)
+            _init_state["last_attempt_phase"] = "vector"
+            stuck_for = time.time() - _init_state["started_at"]
+            # Escalate log level once we've been failing long enough that a
+            # paging dashboard should see it. First few failures stay WARNING
+            # so a normal 30s-during-rollout outage doesn't page.
+            log_fn = log.error if attempt >= INIT_ERROR_LOG_AFTER_ATTEMPTS else log.warning
+            log_fn(
+                "Mem0 vector-store init failed",
+                extra={
+                    "error": err_text,
+                    "attempt": attempt,
+                    "attempt_duration_s": round(duration, 3),
+                    "stuck_for_s": round(stuck_for, 1),
+                    "next_retry_in_s": backoff,
+                    "phase": "vector",
+                },
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, INIT_RETRY_MAX_SECONDS)
@@ -154,24 +251,56 @@ async def _init_mem0() -> None:
         if not neo4j_requested:
             memory = vector_mem
             graph_enabled = False
-            log.info("Mem0 ready", extra={"graph_enabled": False})
+            _init_state["last_error"] = None
+            _init_state["last_attempt_duration_s"] = round(time.time() - attempt_started, 3)
+            _init_state["last_attempt_phase"] = "vector"
+            _init_state["ready_at"] = time.time()
+            log.info(
+                "Mem0 ready",
+                extra={
+                    "graph_enabled": False,
+                    "attempts_to_ready": attempt,
+                    "init_duration_s": round(time.time() - _init_state["started_at"], 1),
+                },
+            )
             return
 
         # Vector-only is up; attempt the graph upgrade. Failure here is
         # genuinely graph-related — the warning text is finally accurate.
+        graph_started = time.time()
         try:
             graph_mem = await asyncio.to_thread(Memory.from_config, config)
             memory = graph_mem
             graph_enabled = True
-            log.info("Mem0 ready", extra={"graph_enabled": True})
+            _init_state["last_error"] = None
+            _init_state["last_attempt_duration_s"] = round(time.time() - attempt_started, 3)
+            _init_state["last_attempt_phase"] = "graph"
+            _init_state["ready_at"] = time.time()
+            log.info(
+                "Mem0 ready",
+                extra={
+                    "graph_enabled": True,
+                    "attempts_to_ready": attempt,
+                    "init_duration_s": round(time.time() - _init_state["started_at"], 1),
+                },
+            )
             return
         except Exception as graph_err:
+            err_text = _format_exception(graph_err)
+            _init_state["last_error"] = err_text
+            _init_state["last_error_at"] = time.time()
+            _init_state["last_attempt_duration_s"] = round(time.time() - graph_started, 3)
+            _init_state["last_attempt_phase"] = "graph"
             log.warning(
-                "Mem0 graph store unreachable (%s) — running vector-only; will retry graph init in background",
-                graph_err,
+                "Mem0 graph store unreachable — running vector-only; will retry graph init in background",
+                extra={
+                    "error": err_text,
+                    "graph_attempt_duration_s": round(time.time() - graph_started, 3),
+                },
             )
             memory = vector_mem
             graph_enabled = False
+            _init_state["ready_at"] = time.time()
             if _graph_retry_task is None or _graph_retry_task.done():
                 _graph_retry_task = asyncio.create_task(_retry_graph_init(), name="recall.graph_retry")
             return
@@ -183,23 +312,72 @@ async def _retry_graph_init() -> None:
     Runs only while ``graph_enabled`` is False but the env still asks for
     Neo4j. On success it atomically swaps in a new graph-enabled Memory
     instance so subsequent writes/searches include the graph store.
+
+    Fixed in #262: previously used a fixed 60s sleep and ``log.debug`` per
+    failure, which meant a Neo4j outage produced no visible signal at all —
+    /health stayed "ok" with ``graph: false`` and operators had no idea
+    cortex was losing graph context for hours. Now uses exponential backoff
+    capped at ``GRAPH_RETRY_MAX_SECONDS``, promotes the first failure per
+    streak to WARNING, and surfaces structured state in ``_graph_state`` for
+    /health to expose.
     """
     global memory, graph_enabled
+    _graph_state["started_at"] = time.time()
+    backoff = GRAPH_RETRY_INTERVAL_SECONDS
     while not graph_enabled:
-        await asyncio.sleep(GRAPH_RETRY_INTERVAL_SECONDS)
+        await asyncio.sleep(backoff)
         config, neo4j_requested = _build_config()
+        _graph_state["requested"] = neo4j_requested
         if not neo4j_requested:
             # Neo4j was removed from config — no graph to recover.
             log.info("Graph retry exiting: NEO4J_URI no longer set")
             return
+        _graph_state["attempts"] += 1
+        attempt = _graph_state["attempts"]
+        attempt_started = time.time()
         try:
             mem = await asyncio.to_thread(Memory.from_config, config)
             memory = mem
             graph_enabled = True
-            log.info("Mem0 graph store recovered; graph_enabled=True")
+            _graph_state["last_error"] = None
+            _graph_state["last_attempt_duration_s"] = round(time.time() - attempt_started, 3)
+            _graph_state["recovered_at"] = time.time()
+            log.info(
+                "Mem0 graph store recovered",
+                extra={
+                    "graph_enabled": True,
+                    "attempts_to_recover": attempt,
+                    "recover_duration_s": round(time.time() - _graph_state["started_at"], 1),
+                },
+            )
             return
         except Exception as e:
-            log.debug("Graph store still unreachable: %s", e)
+            duration = time.time() - attempt_started
+            err_text = _format_exception(e)
+            _graph_state["last_error"] = err_text
+            _graph_state["last_error_at"] = time.time()
+            _graph_state["last_attempt_duration_s"] = round(duration, 3)
+            stuck_for = time.time() - _graph_state["started_at"]
+            # First attempt per streak (or every Nth) gets WARNING — beyond
+            # that drop back to DEBUG to avoid spamming WARN every retry.
+            # After many attempts, escalate to ERROR so paging picks it up.
+            if attempt >= GRAPH_ERROR_LOG_AFTER_ATTEMPTS:
+                log_fn = log.error
+            elif attempt == 1 or attempt % 5 == 0:
+                log_fn = log.warning
+            else:
+                log_fn = log.debug
+            log_fn(
+                "Mem0 graph store still unreachable",
+                extra={
+                    "error": err_text,
+                    "attempt": attempt,
+                    "attempt_duration_s": round(duration, 3),
+                    "stuck_for_s": round(stuck_for, 1),
+                    "next_retry_in_s": backoff,
+                },
+            )
+            backoff = min(backoff * 2, GRAPH_RETRY_MAX_SECONDS)
 
 
 @asynccontextmanager
@@ -319,6 +497,48 @@ def _probe_neo4j() -> str | None:
     return None
 
 
+def _init_snapshot() -> dict[str, Any]:
+    """Snapshot of init telemetry for /health body.
+
+    Pure read of module state; safe to call from any handler. The point of
+    this snapshot is that #258's silent-hang mode can be diagnosed from a
+    single ``curl /health`` — last_init_error tells you which dependency,
+    init_duration_s tells you for how long.
+    """
+    now = time.time()
+    started = _init_state["started_at"] or 0.0
+    init_duration_s = round(now - started, 1) if started else 0.0
+    snap: dict[str, Any] = {
+        "init_attempts": _init_state["attempts"],
+        "init_duration_s": init_duration_s,
+        "last_init_error": _init_state["last_error"],
+        "last_init_phase": _init_state["last_attempt_phase"],
+        "last_attempt_duration_s": _init_state["last_attempt_duration_s"],
+    }
+    if _init_state["last_error"] is not None and _init_state["last_error_at"]:
+        snap["last_error_age_s"] = round(now - _init_state["last_error_at"], 1)
+    if memory is None and init_duration_s >= INIT_STUCK_THRESHOLD_S:
+        snap["init_stuck"] = True
+    return snap
+
+
+def _graph_snapshot() -> dict[str, Any]:
+    """Snapshot of graph-retry telemetry for /health body. See #262."""
+    now = time.time()
+    started = _graph_state["started_at"] or 0.0
+    retry_duration_s = round(now - started, 1) if started else 0.0
+    snap: dict[str, Any] = {
+        "graph_requested": _graph_state["requested"],
+        "graph_attempts": _graph_state["attempts"],
+        "graph_retry_duration_s": retry_duration_s,
+        "last_graph_error": _graph_state["last_error"],
+        "last_graph_attempt_duration_s": _graph_state["last_attempt_duration_s"],
+    }
+    if _graph_state["last_error"] is not None and _graph_state["last_error_at"]:
+        snap["last_graph_error_age_s"] = round(now - _graph_state["last_error_at"], 1)
+    return snap
+
+
 @app.get("/live")
 def live():
     """Liveness probe — process-only health check.
@@ -346,15 +566,24 @@ def health():
     200 when the stores are usable, and 503 ``status: degraded`` when one
     of the backing stores fails its probe. See issues #135, #169, #253.
 
+    Init/graph telemetry (#258, #262): the 503 init body and the 200
+    body both include the structured snapshots so a curl /health tells
+    you how many attempts have happened, how long the last one took,
+    the last error, and whether the pod is stuck. That's the diagnostic
+    surface the silent-hang incidents (#251, #257, #258, #259) needed.
+
     Used by ``readinessProbe`` and ``startupProbe``. The ``livenessProbe``
     points at ``/live`` instead so dependency slowness doesn't kill the
     pod mid-init.
     """
     mem = memory
     if mem is None:
-        return JSONResponse(status_code=503, content={"status": "initializing", "graph": False})
+        body: dict[str, Any] = {"status": "initializing", "graph": False}
+        body.update(_init_snapshot())
+        return JSONResponse(status_code=503, content=body)
 
     checks: dict[str, Any] = {"status": "ok", "graph": graph_enabled}
+    checks.update(_init_snapshot())
 
     pg_err = _probe_pgvector()
     if pg_err is not None:
@@ -368,6 +597,18 @@ def health():
             log.warning("recall /health neo4j probe failed: %s", neo_err)
             checks["status"] = "degraded"
             checks["neo4j"] = "down"
+
+    # Graph-retry surface (#262). Always include for observability; flip to
+    # degraded only when the retry has been failing past the threshold so a
+    # brief Neo4j hiccup during boot doesn't trip immune.
+    if _graph_state["requested"]:
+        checks.update(_graph_snapshot())
+        if not graph_enabled:
+            started = _graph_state["started_at"] or 0.0
+            stuck_for = time.time() - started if started else 0.0
+            if stuck_for >= GRAPH_DEGRADED_AFTER_S:
+                checks["status"] = "degraded"
+                checks["graph_stuck"] = True
 
     if checks["status"] != "ok":
         return JSONResponse(status_code=503, content=checks)
