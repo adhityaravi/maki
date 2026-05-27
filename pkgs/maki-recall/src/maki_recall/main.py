@@ -391,7 +391,20 @@ async def lifespan(app: FastAPI):
     Neo4j was briefly unreachable at boot.
     """
     global _init_task, _neo4j_probe_driver
-    log.info("maki-recall starting; scheduling Mem0 init")
+    # Log the actual HTTP endpoint inventory so a probe/image mismatch is
+    # diagnosable from `kubectl logs` alone. #263's root-cause hypothesis
+    # was specifically a manifest-pointed-at-missing-endpoint scenario;
+    # surfacing the live route table catches that class of bug instantly
+    # ("manifest says livenessProbe=/livez but image only exposes /live").
+    routes = sorted(
+        f"{','.join(sorted(r.methods))} {r.path}"
+        for r in app.routes
+        if hasattr(r, "methods") and hasattr(r, "path") and r.methods
+    )
+    log.info(
+        "maki-recall starting; scheduling Mem0 init",
+        extra={"http_routes": routes, "route_count": len(routes)},
+    )
     _init_task = asyncio.create_task(_init_mem0(), name="recall.mem0_init")
     try:
         yield
