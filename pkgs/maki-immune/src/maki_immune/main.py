@@ -87,6 +87,15 @@ DEFAULT_CONFIG = {
     # single-shot escalation goes silent for days if not resolved (#259).
     "long_unhealthy_re_escalate_hours": 6,
     "long_unhealthy_realert_interval_s": 21600,
+    # Tier-3 auto-recovery (#264): after this many seconds stuck in a non-
+    # Running / initializing phase, immune performs an automated `delete pod`
+    # to break out of a multi-day wedge that reflex restarts couldn't fix.
+    # Opt-in via allowlist, gated by a hive sanity check (act only if a peer
+    # has the component healthy — proves the recipe works). Single-replica
+    # secrets stores like maki-vault are the canonical case.
+    "stuck_recovery_threshold_s": 86400,
+    "stuck_recovery_cooldown_s": 21600,
+    "stuck_recovery_allowlist": "maki-vault",
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {

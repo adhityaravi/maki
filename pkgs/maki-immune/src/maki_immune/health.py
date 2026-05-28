@@ -60,6 +60,34 @@ LONG_UNHEALTHY_RE_ESCALATE_HOURS = int(os.environ.get("LONG_UNHEALTHY_RE_ESCALAT
 # that it doesn't go silent for days, infrequent enough that Adi isn't spammed.
 LONG_UNHEALTHY_REALERT_INTERVAL_S = int(os.environ.get("LONG_UNHEALTHY_REALERT_INTERVAL_S", "21600"))
 
+# Wall-clock seconds a component may sit stuck in a non-Running/initializing
+# phase before immune fires an automated ``delete pod`` recovery (Tier 3). See
+# issue #264: maki-vault sat PodInitializing for 8+ days because the hive guard
+# correctly suppressed pages ("local-only issue, system not down") but
+# "local-only" doesn't mean "ignore forever" — the broken local instance still
+# needs to recover. The restart reflex churns the pod every hour but never
+# fixes deeper issues (stuck PVC binding, image pull, init container failures),
+# so after enough hours of fruitless churn, a fresh ``delete pod`` is usually
+# the only safe autonomous move (kubelet recreates from spec, PVC data is
+# preserved). Default 24h is deliberately far beyond any normal recovery
+# window: by this point the restart reflex has tried ~72 times and got nowhere,
+# so the heavier delete-and-recreate is justified.
+STUCK_RECOVERY_THRESHOLD_S = int(os.environ.get("STUCK_RECOVERY_THRESHOLD_S", "86400"))
+
+# Minimum cooldown between successive auto-recovery deletes for the same
+# incident. Without this we'd fire the delete every health tick once the
+# threshold trips. 6h gives the rescheduled pod a full window to either
+# recover or get stuck the exact same way again before we try once more.
+STUCK_RECOVERY_COOLDOWN_S = int(os.environ.get("STUCK_RECOVERY_COOLDOWN_S", "21600"))
+
+# Per-component opt-in for Tier-3 auto-recovery. Comma-separated list of
+# component names. Default is "maki-vault" — the concrete case driving #264.
+# Other single-replica StatefulSets / secret stores can be added once we've
+# confirmed ``delete pod`` is safe for them; the allowlist is the deliberate
+# gate the issue asks for ("Single-replica secrets stores should require a
+# more deliberate gate than reflex restart").
+STUCK_RECOVERY_ALLOWLIST_DEFAULT = os.environ.get("STUCK_RECOVERY_ALLOWLIST", "maki-vault")
+
 log = logging.getLogger(__name__)
 
 # Set by init()
@@ -130,6 +158,14 @@ _stuck_alerted: dict[str, dict[str, Any]] = {}
 # fail-again cycle re-arms cleanly. In-memory only — a restart of immune costs
 # at most one extra alert per stuck component, which is acceptable.
 _long_unhealthy_alerted: dict[str, dict[str, Any]] = {}
+
+# Track Tier-3 auto-recovery attempts (#264). Keyed by component name ->
+# {incident, last_attempted_at, count}. ``incident`` is the component's
+# ``last_state_change`` so a fresh outage re-arms cleanly. Dropped when the
+# component recovers. In-memory only — if immune restarts mid-incident we
+# might fire one extra recovery, which is the safe direction (the whole point
+# is to unwedge a pod that's been dead for a day).
+_stuck_recovery_attempts: dict[str, dict[str, Any]] = {}
 
 
 def init(
@@ -563,6 +599,7 @@ async def health_monitor_loop():
 
             await _check_stuck_components(config)
             await _check_long_unhealthy_components(config)
+            await _check_stuck_recovery(config)
 
         except Exception:
             log.exception("Health monitor error")
@@ -949,6 +986,176 @@ async def _check_long_unhealthy_components(config: dict) -> None:
                 f"underlying issue is structural, file or revisit the relevant bug issue."
             )
             asyncio.create_task(_escalate_to_claude(component, state, reason))
+
+
+# --- Stuck-Component Auto-Recovery (Tier 3) ---
+
+
+async def _check_stuck_recovery(config: dict) -> None:
+    """Automated ``delete pod`` for components stuck initializing past the recovery threshold.
+
+    Plugs the autonomy gap exposed by #264: maki-vault sat PodInitializing for
+    8+ days while the hive guard correctly suppressed pages (other sites had
+    healthy vault, so "local-only issue"), but "local-only" is not the same as
+    "ignore forever" — the broken local instance still needs to recover. The
+    restart reflex churns the pod every hour but cannot fix deeper issues
+    (stuck PVC binding, image pull failures, init container hangs); after a
+    full day of fruitless reflex churn, a fresh ``delete pod`` is usually the
+    only safe autonomous move. Kubelet recreates the pod from spec, the PVC
+    survives, and the new pod typically re-binds cleanly.
+
+    Distinct from ``_trigger_reflex`` (which fires every few minutes once a
+    pod is unhealthy) and ``_check_stuck_components`` (which only escalates
+    via alert/Claude). This is the heavier, slower-fire safety net for the
+    case both of those have already failed to recover the pod.
+
+    Safety gates (the "more deliberate gate than reflex restart" the issue
+    asks for):
+
+    - **Opt-in allowlist** — only components in the allowlist participate.
+      Default is ``maki-vault``; other single-replica stateful components
+      can be added once we've confirmed ``delete pod`` is safe for them.
+    - **Long threshold** — default 24h, far beyond any normal recovery
+      window. By this point reflex has tried ~72 times and gotten nowhere.
+    - **Hive sanity check** — only act when at least one peer site has the
+      component healthy. That proves the recipe (image, config, manifest)
+      works, so this really is a local-only issue worth fixing autonomously.
+      A system-wide outage (no healthy peers) is left to human judgment.
+    - **Cooldown** — once we delete, we don't try again for
+      ``stuck_recovery_cooldown_s`` (default 6h), giving the rescheduled
+      pod a full window to either recover or re-wedge before another attempt.
+    - **Per-incident tracker** — re-arms cleanly when ``last_state_change``
+      advances, so a recover-and-fail-again cycle gets a fresh budget.
+    """
+    if _nc is None or _k8s_v1 is None:
+        return
+
+    threshold = config.get("stuck_recovery_threshold_s", STUCK_RECOVERY_THRESHOLD_S)
+    cooldown = config.get("stuck_recovery_cooldown_s", STUCK_RECOVERY_COOLDOWN_S)
+    allowlist_raw = config.get("stuck_recovery_allowlist", STUCK_RECOVERY_ALLOWLIST_DEFAULT)
+    allowlist = {c.strip() for c in (allowlist_raw or "").split(",") if c.strip()}
+
+    if not allowlist:
+        return
+
+    now = time.time()
+
+    for component, state in list(_component_health.items()):
+        if component not in allowlist:
+            continue
+
+        if state["healthy"]:
+            _stuck_recovery_attempts.pop(component, None)
+            continue
+
+        details = state.get("details", {})
+        phase = details.get("phase")
+        waiting_reason = details.get("waiting_reason")
+
+        # Same shape-check as ``_check_stuck_components``: only the never-
+        # finishes-initializing / non-Running pod case. A Running+ready=False
+        # pod is a different failure mode that should be handled by HTTP-level
+        # remediation, not a blind delete (the pod is at least up enough to
+        # answer probes — deleting it might destroy in-flight state).
+        is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
+        if not is_pod_stuck:
+            _stuck_recovery_attempts.pop(component, None)
+            continue
+
+        stuck_for = now - state["last_state_change"]
+        if stuck_for < threshold:
+            continue
+
+        # Hive sanity check: only act when at least one peer reports healthy.
+        # If no peer has this component working, this is either a system-wide
+        # outage or a brand-new component nobody's running yet — either way,
+        # blindly deleting our local pod is not the right autonomous move.
+        # Note the polarity flip vs ``_check_stuck_components``: that path
+        # *suppresses* on healthy peers (don't page about local-only issues);
+        # this path *requires* healthy peers (only act when we're confident
+        # the recipe works elsewhere).
+        healthy_peers = component_healthy_in_hive(component)
+        if not healthy_peers:
+            log.warning(
+                "Stuck recovery threshold crossed but no healthy peers — skipping (system-wide issue)",
+                extra={"component": component, "stuck_for_hours": round(stuck_for / 3600, 1)},
+            )
+            continue
+
+        incident = state["last_state_change"]
+        tracker = _stuck_recovery_attempts.get(component)
+        if tracker is None or tracker.get("incident") != incident:
+            tracker = {"incident": incident, "last_attempted_at": 0.0, "count": 0}
+            _stuck_recovery_attempts[component] = tracker
+
+        last_attempted = tracker.get("last_attempted_at") or 0.0
+        if last_attempted and (now - last_attempted) < cooldown:
+            continue
+
+        pod_name = details.get("pod_name")
+        if not pod_name:
+            continue
+
+        if not await _acquire_lock("immune-stuck-recovery", ttl=60):
+            log.warning("Cannot acquire lock for stuck recovery", extra={"component": component})
+            continue
+
+        stuck_hours = round(stuck_for / 3600, 1)
+        try:
+            await asyncio.to_thread(
+                _k8s_v1.delete_namespaced_pod,
+                name=pod_name,
+                namespace=_namespace,
+                grace_period_seconds=30,
+            )
+
+            count = int(tracker.get("count") or 0) + 1
+            tracker["last_attempted_at"] = now
+            tracker["count"] = count
+
+            log.error(
+                "Stuck-recovery pod delete fired",
+                extra={
+                    "component": component,
+                    "pod_name": pod_name,
+                    "stuck_for_hours": stuck_hours,
+                    "attempt_count": count,
+                    "healthy_peers": healthy_peers,
+                    "phase": phase,
+                    "waiting_reason": waiting_reason,
+                },
+            )
+
+            await _publish_alert(
+                f"AUTO-RECOVERY: deleted {pod_name} after {stuck_hours}h stuck in "
+                f"phase={phase}/{waiting_reason or 'unhealthy'}. Hive shows healthy "
+                f"peers on {healthy_peers} so this is a local-only wedge safe to act on. "
+                f"Attempt #{count}; kubelet will recreate from spec."
+            )
+
+            action = {
+                "type": "stuck_recovery_delete",
+                "component": component,
+                "pod_name": pod_name,
+                "stuck_for_hours": stuck_hours,
+                "attempt_count": count,
+                "healthy_peers": healthy_peers,
+                "phase": phase,
+                "waiting_reason": waiting_reason,
+                "timestamp": now,
+            }
+            _recent_actions.append(action)
+            if len(_recent_actions) > _recent_actions_max:
+                _recent_actions.pop(0)
+            _schedule_persist()
+            try:
+                await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish stuck-recovery action")
+        except Exception:
+            log.exception("Failed to delete stuck pod", extra={"pod_name": pod_name})
+        finally:
+            await _release_lock("immune-stuck-recovery")
 
 
 # --- Gossip Ring ---
