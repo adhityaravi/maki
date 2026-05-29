@@ -88,6 +88,25 @@ STUCK_RECOVERY_COOLDOWN_S = int(os.environ.get("STUCK_RECOVERY_COOLDOWN_S", "216
 # more deliberate gate than reflex restart").
 STUCK_RECOVERY_ALLOWLIST_DEFAULT = os.environ.get("STUCK_RECOVERY_ALLOWLIST", "maki-vault")
 
+# Multiplier on ``_check_interval`` after which a component's stale
+# ``last_check`` is treated as an immune-self-failure (#270). The motivating
+# case was the inverse of the usual outage: every reflection cycle ran
+# correctly, every Claude tick observed recall=False with consecutive_failures
+# climbing, but a one-shot probe from cortex got 200 OK from the same URL.
+# That divergence — monitor's view of reality vs. reality — has to be
+# self-correcting; without it the immune loop's state can drift for days with
+# nobody noticing. 2× gives one full poll's slack for transient delays
+# (scheduler hiccup, NATS reconnect) before treating it as a real wedge.
+SELF_HEALTH_STALE_MULTIPLIER = float(os.environ.get("SELF_HEALTH_STALE_MULTIPLIER", "2"))
+
+# Cooldown between successive self-health alerts for the same component. The
+# stale check runs every health tick (~30s); without a cooldown a single
+# wedged sub-task would fire an alert on every tick. 30 min default is long
+# enough to avoid spam, short enough that a real silent stop becomes visible
+# inside one nap. Matches the order-of-magnitude of the existing
+# stuck/long-unhealthy realert intervals.
+SELF_HEALTH_REALERT_INTERVAL_S = int(os.environ.get("SELF_HEALTH_REALERT_INTERVAL_S", "1800"))
+
 log = logging.getLogger(__name__)
 
 # Set by init()
@@ -166,6 +185,13 @@ _long_unhealthy_alerted: dict[str, dict[str, Any]] = {}
 # might fire one extra recovery, which is the safe direction (the whole point
 # is to unwedge a pod that's been dead for a day).
 _stuck_recovery_attempts: dict[str, dict[str, Any]] = {}
+
+# Track immune-self-failure alerts (#270). Keyed by component name ->
+# {first_seen_stale_at, last_fired_at, fire_count}. Cleared when the
+# component's ``last_check`` advances again. In-memory only; if immune
+# restarts during a wedge we'll re-fire one alert per stuck component, which
+# is fine — that's the whole point.
+_self_health_alerted: dict[str, dict[str, Any]] = {}
 
 
 def init(
@@ -279,18 +305,65 @@ def get_last_incident_time() -> float:
 
 
 async def _check_http_health():
-    """Check HTTP health endpoints for all components, including latency."""
+    """Check HTTP health endpoints for all components, including latency.
+
+    On a non-200 response we capture a truncated body excerpt and log it so the
+    actual failure mode is visible — this is the asking-the-server-what-it-said
+    fix from #270, where the immune monitor reported recall as 503-for-5-days
+    while a one-shot probe from cortex returned 200. Without the body we had no
+    way to distinguish "Mem0 graph init failed" from "Kubernetes routed the
+    probe at the wrong pod" — we just saw a number tick up.
+
+    On a transport exception (timeout, connection refused, DNS) we record the
+    exception class on details so the same investigation works for the
+    unreachable case.
+    """
     async with httpx.AsyncClient(timeout=5.0) as client:
         for component, url in _health_endpoints.items():
             try:
                 start = time.time()
                 resp = await client.get(f"{url}/health")
                 latency_ms = round((time.time() - start) * 1000, 1)
-                _update_health(
-                    component, resp.status_code == 200, {"latency_ms": latency_ms, "status_code": resp.status_code}
+                healthy = resp.status_code == 200
+                details: dict[str, Any] = {
+                    "latency_ms": latency_ms,
+                    "status_code": resp.status_code,
+                }
+                if not healthy:
+                    # Truncate to keep logs/state small; the failure mode is
+                    # usually obvious in the first ~200 chars (status string,
+                    # exception type). Body may be html, json, or plain text —
+                    # don't try to parse, just preserve verbatim.
+                    body = resp.text[:200]
+                    details["body_excerpt"] = body
+                    log.warning(
+                        "HTTP health probe failed",
+                        extra={
+                            "component": component,
+                            "url": f"{url}/health",
+                            "status_code": resp.status_code,
+                            "latency_ms": latency_ms,
+                            "body_excerpt": body,
+                        },
+                    )
+                _update_health(component, healthy, details)
+            except Exception as e:
+                err_type = type(e).__name__
+                err_msg = str(e)[:200]
+                log.warning(
+                    "HTTP health probe errored",
+                    extra={
+                        "component": component,
+                        "url": f"{url}/health",
+                        "error_type": err_type,
+                        "error": err_msg,
+                    },
                 )
-            except Exception:
-                _update_health(component, False, {"latency_ms": -1})
+                _update_health(
+                    component,
+                    False,
+                    {"latency_ms": -1, "error_type": err_type, "error": err_msg},
+                )
 
 
 async def _check_k8s_pods():
@@ -599,6 +672,7 @@ async def health_monitor_loop():
 
             await _check_stuck_components(config)
             await _check_long_unhealthy_components(config)
+            await _check_immune_self_health(config)
             await _check_stuck_recovery(config)
 
         except Exception:
@@ -986,6 +1060,124 @@ async def _check_long_unhealthy_components(config: dict) -> None:
                 f"underlying issue is structural, file or revisit the relevant bug issue."
             )
             asyncio.create_task(_escalate_to_claude(component, state, reason))
+
+
+# --- Immune Self-Health Watchdog ---
+
+
+async def _check_immune_self_health(config: dict) -> None:
+    """Detect when the monitor's own view of a component has gone stale (#270).
+
+    All the other escalation paths in this file trust ``_component_health`` —
+    they decide what to do based on ``healthy``, ``consecutive_failures``,
+    ``last_state_change`` etc. If the loop that *writes* that state silently
+    stops for one component (an unhandled exception in a per-component
+    sub-task, an asyncio.gather swallowing an error, a task cancelled and not
+    restarted), every downstream check keeps reading stale data and the rest
+    of the immune surface can't tell the difference between "component is
+    really still in this state" and "we stopped looking days ago".
+
+    This watchdog catches that. If ``now - last_check`` exceeds
+    ``SELF_HEALTH_STALE_MULTIPLIER × _check_interval`` for any component, we
+    classify it as an immune-self-failure: the monitor itself is the broken
+    thing, the component's apparent state is untrustworthy. We alert (with a
+    cooldown so a wedged sub-task doesn't fire every tick) so Adi sees it
+    quickly, and we record an action so the divergence is visible in the
+    hive/recent-actions audit trail.
+
+    Deliberately *only* alerts. No reflex restart of immune itself — if the
+    process is half-wedged we don't want it making things worse by hitting
+    K8s with delete calls. Recovery of the monitor is left to the kubelet
+    liveness probe and to Adi (or a future Claude turn) acting on the alert.
+    """
+    if _nc is None:
+        return
+
+    multiplier = config.get("self_health_stale_multiplier", SELF_HEALTH_STALE_MULTIPLIER)
+    realert_s = config.get("self_health_realert_interval_s", SELF_HEALTH_REALERT_INTERVAL_S)
+    threshold_s = max(multiplier * _check_interval, 1.0)
+    now = time.time()
+
+    for component, state in list(_component_health.items()):
+        last_check = state.get("last_check") or 0.0
+        if last_check == 0.0:
+            # Never been checked yet (e.g., during init). Not stale, just
+            # uninitialised; the regular path will fill it in.
+            _self_health_alerted.pop(component, None)
+            continue
+
+        stale_for = now - last_check
+        if stale_for < threshold_s:
+            # Healthy: monitor is actively writing state for this component.
+            # Drop any tracker so the next wedge re-arms cleanly.
+            _self_health_alerted.pop(component, None)
+            continue
+
+        tracker = _self_health_alerted.get(component)
+        if tracker is None:
+            tracker = {
+                "first_seen_stale_at": now,
+                "last_check_when_stale": last_check,
+                "last_fired_at": 0.0,
+                "fire_count": 0,
+            }
+            _self_health_alerted[component] = tracker
+
+        last_fired = tracker.get("last_fired_at") or 0.0
+        first_fire = last_fired == 0.0
+        if not first_fire and (now - last_fired) < realert_s:
+            continue
+
+        fire_count = int(tracker.get("fire_count") or 0) + 1
+        tracker["last_fired_at"] = now
+        tracker["fire_count"] = fire_count
+
+        stale_min = round(stale_for / 60, 1)
+        last_known_healthy = state.get("healthy")
+        consecutive_failures = state.get("consecutive_failures", 0)
+
+        log.error(
+            "Immune self-health: component check is stale",
+            extra={
+                "component": component,
+                "stale_for_s": round(stale_for, 1),
+                "threshold_s": round(threshold_s, 1),
+                "last_check_age_s": round(stale_for, 1),
+                "last_known_healthy": last_known_healthy,
+                "consecutive_failures": consecutive_failures,
+                "fire_count": fire_count,
+                "instance_id": _instance_id,
+            },
+        )
+
+        await _publish_alert(
+            f"IMMUNE-SELF-FAILURE: monitor stopped updating {component} {stale_min}min ago "
+            f"(threshold {round(threshold_s / 60, 1)}min = {multiplier}× poll interval "
+            f"{_check_interval}s). Last-known state: healthy={last_known_healthy}, "
+            f"consecutive_failures={consecutive_failures}. Treat that state as untrustworthy "
+            f"— a downstream task likely died silently. Alert #{fire_count} from "
+            f"instance {_instance_id}."
+        )
+
+        action = {
+            "type": "immune_self_failure",
+            "component": component,
+            "stale_for_s": round(stale_for, 1),
+            "threshold_s": round(threshold_s, 1),
+            "last_known_healthy": last_known_healthy,
+            "consecutive_failures": consecutive_failures,
+            "fire_count": fire_count,
+            "instance_id": _instance_id,
+            "timestamp": now,
+        }
+        _recent_actions.append(action)
+        if len(_recent_actions) > _recent_actions_max:
+            _recent_actions.pop(0)
+        _schedule_persist()
+        try:
+            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+        except Exception:
+            log.exception("Failed to publish immune self-failure action")
 
 
 # --- Stuck-Component Auto-Recovery (Tier 3) ---
