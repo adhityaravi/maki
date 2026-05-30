@@ -304,8 +304,16 @@ def get_last_incident_time() -> float:
 # --- Health Checks ---
 
 
-async def _check_http_health():
-    """Check HTTP health endpoints for all components, including latency.
+async def _check_http_health() -> dict[str, tuple[bool, dict[str, Any]]]:
+    """Check HTTP health endpoints and return per-component verdicts.
+
+    Returns ``{component: (healthy, details)}`` rather than writing to
+    ``_component_health`` directly. The monitor loop combines this with the
+    K8s pod verdict via :func:`_merge_and_update_health` before calling
+    :func:`_update_health` once per component — see #249. Previously both
+    checkers wrote to the same key and the one that fired last clobbered the
+    other's verdict, which kept ``consecutive_failures`` flapping at 1–2 and
+    silently suppressed the reflex engine when HTTP and K8s disagreed.
 
     On a non-200 response we capture a truncated body excerpt and log it so the
     actual failure mode is visible — this is the asking-the-server-what-it-said
@@ -318,6 +326,7 @@ async def _check_http_health():
     exception class on details so the same investigation works for the
     unreachable case.
     """
+    verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
     async with httpx.AsyncClient(timeout=5.0) as client:
         for component, url in _health_endpoints.items():
             try:
@@ -346,7 +355,7 @@ async def _check_http_health():
                             "body_excerpt": body,
                         },
                     )
-                _update_health(component, healthy, details)
+                verdicts[component] = (healthy, details)
             except Exception as e:
                 err_type = type(e).__name__
                 err_msg = str(e)[:200]
@@ -359,17 +368,29 @@ async def _check_http_health():
                         "error": err_msg,
                     },
                 )
-                _update_health(
-                    component,
+                verdicts[component] = (
                     False,
                     {"latency_ms": -1, "error_type": err_type, "error": err_msg},
                 )
+    return verdicts
 
 
-async def _check_k8s_pods():
-    """Check K8s pod status in maki namespace, including resource usage."""
+async def _check_k8s_pods() -> dict[str, tuple[bool, dict[str, Any]]]:
+    """Check K8s pod status in maki namespace and return per-app verdicts.
+
+    Returns ``{app_label: (healthy, details)}`` instead of mutating
+    ``_component_health`` directly. The monitor loop merges this with the HTTP
+    verdict via :func:`_merge_and_update_health` so a single composite call
+    decides each component's health per tick — see #249 for the race the old
+    direct-write pattern caused (consecutive_failures pinned to 1–2 when HTTP
+    and K8s disagreed, reflex engine silently suppressed).
+
+    ``_check_pod_metrics`` is still called serially at the end so the metrics
+    map stays fresh for whoever observes it.
+    """
+    verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
     if not _k8s_v1:
-        return
+        return verdicts
     try:
         pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=_namespace)
 
@@ -432,11 +453,62 @@ async def _check_k8s_pods():
                 details["total_pods"] = len(pod_list)
                 details["unhealthy_pods"] = len(unhealthy_pods)
 
-            _update_health(app_label, all_healthy, details)
+            verdicts[app_label] = (all_healthy, details)
     except Exception:
         log.exception("K8s pod check failed")
 
     await _check_pod_metrics()
+    return verdicts
+
+
+def _merge_and_update_health(
+    http_verdicts: dict[str, tuple[bool, dict[str, Any]]],
+    k8s_verdicts: dict[str, tuple[bool, dict[str, Any]]],
+) -> None:
+    """Fold HTTP and K8s verdicts into one ``_update_health`` call per component.
+
+    ``healthy`` is ``http_ok AND k8s_ok`` when both probes apply, otherwise
+    whichever single verdict exists. Details from both checkers are merged so
+    observers see the full picture even when the verdicts disagree (e.g.
+    ``status_code=200`` alongside ``waiting_reason=CrashLoopBackOff,
+    restarts=12``). HTTP keys take precedence on the rare overlap; in practice
+    the two detail sets are disjoint.
+
+    Background: previously ``_check_http_health`` and ``_check_k8s_pods`` each
+    called ``_update_health(component, ...)`` directly. When they disagreed —
+    HTTP 200 vs ``CrashLoopBackOff`` between restarts, transient mem0 503 on
+    an otherwise-healthy pod, kubelet readiness lag — whichever checker fired
+    last clobbered the other, ``consecutive_failures`` reset to 1 every tick,
+    and the reflex pipeline's ``>= 2`` gate never engaged. The composite
+    verdict here is the cleanest of the three fixes sketched in #249 because
+    a disagreement now produces an honest "unhealthy" with both signals
+    recorded — exactly what the reflex engine needs to act on, and what Claude
+    needs to read in :func:`claude.py`.
+    """
+    components = set(http_verdicts) | set(k8s_verdicts)
+    for component in components:
+        http = http_verdicts.get(component)
+        k8s = k8s_verdicts.get(component)
+        if http is not None and k8s is not None:
+            healthy = http[0] and k8s[0]
+            # k8s details first so HTTP keys (status_code, latency_ms,
+            # body_excerpt) override on the unlikely overlap and the pod_name
+            # the reflex engine needs is preserved.
+            details: dict[str, Any] = {**k8s[1], **http[1]}
+            if http[0] != k8s[0]:
+                # Surface the disagreement to whoever reads details (Claude
+                # via claude.py, the snapshot publisher). Without this the
+                # composite verdict hides which probe disagreed.
+                details["http_ok"] = http[0]
+                details["k8s_ok"] = k8s[0]
+        elif http is not None:
+            healthy, details = http
+        else:
+            # Mypy/ty: at least one of http/k8s is non-None because component
+            # came from the union of their keys.
+            assert k8s is not None
+            healthy, details = k8s
+        _update_health(component, healthy, details)
 
 
 async def _check_pod_metrics():
@@ -661,8 +733,13 @@ async def health_monitor_loop():
 
     while True:
         try:
-            await _check_http_health()
-            await _check_k8s_pods()
+            # Gather both verdicts before writing — see #249 and
+            # _merge_and_update_health for why the direct-write pattern was
+            # racy. Sequential for now; #231 tracks parallelising the HTTP
+            # fan-out separately.
+            http_verdicts = await _check_http_health()
+            k8s_verdicts = await _check_k8s_pods()
+            _merge_and_update_health(http_verdicts, k8s_verdicts)
             _check_cortex_heartbeat()
 
             config = await load_kv_config(_config_kv, _default_config)
