@@ -24,6 +24,7 @@ from maki_common.subjects import (
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
+    IMMUNE_LOGS_REQUEST,
     IMMUNE_SITE_QUERY,
     IMMUNE_STATE_REQUEST,
     RESTART_PROPAGATE,
@@ -429,6 +430,185 @@ async def _state_request_handler(msg):
         await msg.respond(b"{}")
 
 
+_LOG_REDACTION_PATTERNS: list = []
+
+
+def _build_log_redaction_patterns() -> list:
+    """Compile redaction regexes for pod-log responses.
+
+    Logs can leak DB DSNs, bearer tokens, and env-style secrets. Strip the
+    secret-bearing portion before handing the bytes back across NATS to cortex
+    so the reflection loop never sees the raw credential (#252).
+    """
+    import re
+
+    return [
+        # postgres://user:password@host -> postgres://user:***@host
+        (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^:\s/@]+:)([^@\s]+)(@)"), r"\1***\3"),
+        # Authorization: Bearer xxx / Authorization: Basic xxx
+        (re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)\S+"), r"\1***"),
+        # Bearer/Token <value> standalone
+        (re.compile(r"(?i)\b(bearer|token)\s+[A-Za-z0-9._\-]{12,}"), r"\1 ***"),
+        # KEY=value / KEY: value for sensitive-looking env names
+        (
+            re.compile(
+                r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|DSN))"
+                r"(\s*[:=]\s*)(['\"]?)([^\s'\"]+)"
+            ),
+            r"\1\2\3***",
+        ),
+    ]
+
+
+def _redact_log_text(text: str) -> str:
+    """Apply the compiled redaction patterns to a log blob."""
+    global _LOG_REDACTION_PATTERNS
+    if not _LOG_REDACTION_PATTERNS:
+        _LOG_REDACTION_PATTERNS = _build_log_redaction_patterns()
+    for pattern, replacement in _LOG_REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+async def _logs_request_handler(msg):
+    """Serve pod logs for a component to the reflection loop (#252).
+
+    Payload (JSON): ``{"component": str, "previous": bool, "tail_lines": int}``.
+    Resolves component → pod via ``app=<component>`` label, reads logs from the
+    kube-apiserver, redacts likely secrets, and replies with a JSON blob
+    containing ``pod``, ``logs``, ``previous``, ``truncated`` and (on failure)
+    ``error``.
+    """
+    try:
+        try:
+            payload = json.loads(msg.data.decode() or "{}")
+        except Exception:
+            payload = {}
+        component = (payload.get("component") or "").strip()
+        previous = bool(payload.get("previous", False))
+        try:
+            tail_lines = int(payload.get("tail_lines") or 200)
+        except (TypeError, ValueError):
+            tail_lines = 200
+        tail_lines = max(1, min(tail_lines, 1000))
+
+        if not component:
+            await msg.respond(json.dumps({"error": "component is required"}).encode())
+            return
+
+        if _k8s_v1 is None:
+            await msg.respond(json.dumps({"error": "K8s client unavailable on this immune instance"}).encode())
+            return
+
+        try:
+            pods = await asyncio.to_thread(
+                _k8s_v1.list_namespaced_pod,
+                namespace=NAMESPACE,
+                label_selector=f"app={component}",
+            )
+        except Exception as e:
+            log.exception("logs request: pod lookup failed", extra={"component": component})
+            await msg.respond(json.dumps({"error": f"pod lookup failed: {e}"}).encode())
+            return
+
+        if not pods.items:
+            try:
+                all_pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=NAMESPACE)
+                available = sorted(
+                    {
+                        p.metadata.labels.get("app")
+                        for p in all_pods.items
+                        if p.metadata.labels and p.metadata.labels.get("app")
+                    }
+                )
+            except Exception:
+                available = []
+            await msg.respond(
+                json.dumps(
+                    {
+                        "error": (
+                            f"No pods found with app={component}. "
+                            f"Available components: {', '.join(available) or '(none)'}"
+                        )
+                    }
+                ).encode()
+            )
+            return
+
+        # Prefer a Running pod for current logs; for --previous any pod with
+        # a terminated previous container will do.
+        def _pod_rank(p):
+            phase_priority = {"Running": 0, "Pending": 1, "Failed": 2, "Succeeded": 3, "Unknown": 4}
+            created_ts = p.metadata.creation_timestamp.timestamp() if p.metadata.creation_timestamp else 0
+            return (phase_priority.get(p.status.phase, 5), -created_ts)
+
+        pod = sorted(pods.items, key=_pod_rank)[0]
+        pod_name = pod.metadata.name
+
+        try:
+            logs = await asyncio.to_thread(
+                _k8s_v1.read_namespaced_pod_log,
+                name=pod_name,
+                namespace=NAMESPACE,
+                tail_lines=tail_lines,
+                previous=previous,
+            )
+        except Exception as e:
+            log.warning(
+                "logs request: read failed",
+                extra={"component": component, "pod": pod_name, "previous": previous, "err": str(e)},
+            )
+            await msg.respond(
+                json.dumps(
+                    {
+                        "pod": pod_name,
+                        "component": component,
+                        "previous": previous,
+                        "error": f"failed to read logs: {e}",
+                    }
+                ).encode()
+            )
+            return
+
+        logs = _redact_log_text(logs or "")
+        # NATS request/reply has a default 1MB cap; keep payloads bounded.
+        max_chars = 60_000
+        truncated = False
+        if len(logs) > max_chars:
+            logs = logs[-max_chars:]
+            truncated = True
+
+        await msg.respond(
+            json.dumps(
+                {
+                    "pod": pod_name,
+                    "component": component,
+                    "previous": previous,
+                    "tail_lines": tail_lines,
+                    "truncated": truncated,
+                    "logs": logs,
+                }
+            ).encode()
+        )
+        log.info(
+            "Logs request served",
+            extra={
+                "component": component,
+                "pod": pod_name,
+                "previous": previous,
+                "tail_lines": tail_lines,
+                "chars": len(logs),
+                "truncated": truncated,
+            },
+        )
+    except Exception:
+        log.exception("Failed to serve logs request")
+        try:
+            await msg.respond(json.dumps({"error": "internal error"}).encode())
+        except Exception:
+            pass
+
+
 async def _site_query_handler(msg):
     """Handle rich site query from a remote immune's Claude."""
     try:
@@ -629,6 +809,12 @@ async def main():
     site_query_subject = f"{IMMUNE_SITE_QUERY}.{SITE_NAME}"
     await _nc.subscribe(site_query_subject, cb=_site_query_handler)
     log.info("Subscribed", extra={"subject": site_query_subject})
+
+    # Pod logs proxy for cortex / reflection loop (#252). Queue-grouped so any
+    # immune instance in the hive can answer — they all have the same RBAC and
+    # can read pods/log via the in-cluster ServiceAccount.
+    await _nc.subscribe(IMMUNE_LOGS_REQUEST, queue="maki-immune", cb=_logs_request_handler)
+    log.info("Subscribed", extra={"subject": IMMUNE_LOGS_REQUEST})
 
     await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})

@@ -88,6 +88,7 @@ CRON_WINDOW_SECONDS = 1800  # 30 minutes
 # Lives here so all loops stay in sync — edit once, affects all.
 TOOLS_PROMPT = """## Tools
 Memory: search_memories, get_all_memories, add_memory, get_system_health, check_component, \
+get_pod_logs (live kubectl logs via immune — use previous=true for CrashLoopBackOff stack traces), \
 get_config, update_config
 Code: search_code (use FIRST — scopes: symbol/callers/callees/references/definition/file/path), \
 read_file, write_file, list_directory, search_text, rebuild_code_graph

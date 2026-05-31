@@ -22,6 +22,7 @@ IMMUNE_ALERT = "maki.immune.alert"
 IMMUNE_STATE_REQUEST = "maki.immune.state"
 IMMUNE_COMMAND = "maki.immune.command"
 IMMUNE_SITE_QUERY = "maki.immune.site"  # append .{site_name} at runtime
+IMMUNE_LOGS_REQUEST = "maki.immune.logs"  # pod log retrieval for reflection loop (#252)
 
 # Deploy coordination
 DEPLOY_REQUEST = "maki.deploy.request"
