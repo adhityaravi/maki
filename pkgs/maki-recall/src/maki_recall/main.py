@@ -5,6 +5,7 @@ using pgvector + Neo4j graph store + Ollama embeddings.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -16,12 +17,16 @@ import neo4j
 import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from maki_common import configure_logging
+from maki_common import configure_logging, connect_nats
+from maki_common.subjects import IMMUNE_ALERT
 from mem0 import Memory
 from pydantic import BaseModel, Field
 
 configure_logging()
 log = logging.getLogger(__name__)
+
+NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
+NATS_TOKEN = os.environ.get("NATS_TOKEN")
 
 
 # Background init/retry tunables. Conservative — the dependency outages we've
@@ -54,6 +59,25 @@ GRAPH_ERROR_LOG_AFTER_ATTEMPTS = 5
 # brain. See #262 — graph_enabled=False stayed silent because graph is
 # optional, but in practice every cortex turn loses graph context.
 GRAPH_DEGRADED_AFTER_S = 600  # 10 minutes
+
+# Once vector init has been stuck this long, fire a NATS alert on the same
+# subject immune uses for component escalations. Default 5 min — long enough
+# that a normal boot doesn't page, short enough that a wedged init is loudly
+# visible from #maki-general within minutes instead of after 79h. See #258.
+INIT_NATS_ALERT_AFTER_S = int(os.environ.get("RECALL_INIT_NATS_ALERT_AFTER_S", "300"))
+
+# How often to re-publish the "recall is still stuck" alert while the init
+# loop continues to fail. Spacing this out avoids spamming #maki-general
+# every retry, but keeps a periodic poke so the channel doesn't go silent
+# after the first alert and let the incident scroll off. See #258.
+INIT_NATS_REALERT_INTERVAL_S = int(os.environ.get("RECALL_INIT_NATS_REALERT_INTERVAL_S", "1800"))
+
+# Suggested step 5 in #258: after a very-long-stuck threshold, deliberately
+# exit so k8s reschedules the pod — sometimes the right answer is "give up,
+# get a fresh pod, hope it sticks". Default 2h — long enough that legitimate
+# slow boots survive but well short of the multi-day silent hangs the issue
+# was written about. Set the env var to 0 to disable.
+INIT_FATAL_EXIT_AFTER_S = int(os.environ.get("RECALL_INIT_FATAL_EXIT_AFTER_S", "7200"))
 
 
 def _build_pg_uri() -> str:
@@ -129,6 +153,12 @@ _graph_retry_task: asyncio.Task[None] | None = None
 # driver per probe (every ~10s) burns sockets and DNS lookups. See #176.
 _neo4j_probe_driver: neo4j.Driver | None = None
 
+# NATS handle used by the init loop to escalate "still stuck" alerts onto
+# the same subject immune publishes component escalations to (#258). Kept
+# optional — if NATS itself is the dependency that's down, init must still
+# log/retry and not crash on a None ``_nc``. Set by ``lifespan``.
+_nc: Any = None
+
 
 # Structured init telemetry, surfaced in /health body so a stuck-on-init pod
 # is diagnosable without pod logs. See #258 — three documented episodes of
@@ -142,6 +172,8 @@ _init_state: dict[str, Any] = {
     "last_attempt_duration_s": 0.0,  # how long the most recent attempt took
     "last_attempt_phase": None,  # "vector" | "graph" | None — which Memory.from_config call failed
     "ready_at": 0.0,  # wall-clock when init completed; 0 until ready
+    "last_alert_at": 0.0,  # wall-clock of last NATS alert published; 0 until first alert (#258)
+    "alert_count": 0,  # cumulative number of "stuck" alerts published this lifetime (#258)
 }
 
 
@@ -170,6 +202,115 @@ def _format_exception(exc: BaseException) -> str:
     if len(text) > 500:
         text = text[:497] + "..."
     return text
+
+
+def _likely_dependency(err_text: str, phase: str | None) -> str:
+    """Best-effort attribution of an init error to a specific dependency.
+
+    ``_build_config`` knows which URL each dependency lives at (pgvector,
+    embedder, synapse, neo4j); the error string usually contains the host
+    or a recognisable backend name. This gives the NATS alert and /health
+    a useful "looks like X is down" hint without parsing tracebacks. See
+    #258 — the bare `%s` format used to flatten this away.
+    """
+    if phase == "graph":
+        return "neo4j"
+    lower = err_text.lower()
+    # Order matters: synapse is an OpenAI-compatible LLM proxy so "openai"
+    # tokens point there; embedder uses ollama; pg is the catch-all backend.
+    if "neo4j" in lower:
+        return "neo4j"
+    if "ollama" in lower or "embed" in lower or "11434" in lower:
+        return "embedder"
+    if "synapse" in lower or "openai" in lower or "completion" in lower:
+        return "synapse"
+    if "psycopg" in lower or "postgres" in lower or "pgvector" in lower or "5432" in lower:
+        return "pgvector"
+    return "unknown"
+
+
+async def _publish_init_alert(alert_text: str, payload_extra: dict[str, Any]) -> None:
+    """Publish a structured init-stuck alert to the immune alert subject.
+
+    Best-effort and crash-safe: if NATS itself is unreachable (e.g. it's the
+    dependency that's also wedged), we swallow the publish error so the
+    retry loop keeps trying the actual init. Publishes core NATS (not JS)
+    so we don't accidentally block on stream creation racing with immune's
+    own bootstrap; the ears alert consumer already listens both ways via
+    the same subject.
+
+    See #258 — the whole point of this channel is that stem/cortex/ears can
+    observe "recall is wedged" without having to read immune's internal
+    state dict.
+    """
+    nc = _nc
+    if nc is None:
+        log.debug("Cannot publish recall init alert — NATS not connected yet")
+        return
+    payload = {"alert": alert_text, "timestamp": time.time(), **payload_extra}
+    try:
+        await nc.publish(IMMUNE_ALERT, json.dumps(payload).encode())
+        _init_state["last_alert_at"] = time.time()
+        _init_state["alert_count"] += 1
+        log.info(
+            "recall init-stuck alert published",
+            extra={
+                "alert_preview": alert_text[:120],
+                "alert_count": _init_state["alert_count"],
+                "subject": IMMUNE_ALERT,
+            },
+        )
+    except Exception as e:
+        # NATS itself is unhappy — don't let a broken alert path mask the
+        # underlying init failure. Just log and continue retrying init.
+        log.warning("Failed to publish recall init-stuck alert", extra={"error": _format_exception(e)})
+
+
+async def _maybe_alert_init_stuck(
+    *,
+    err_text: str,
+    attempt: int,
+    stuck_for_s: float,
+    phase: str,
+    backoff_s: int,
+) -> None:
+    """Fire (or re-fire) a NATS alert if the init has been stuck long enough.
+
+    Gated by two thresholds so a fast-recovering boot stays silent and a
+    multi-hour wedge keeps a periodic alert flowing to ears:
+      * first alert only once cumulative stuck time ≥ ``INIT_NATS_ALERT_AFTER_S``
+      * subsequent alerts spaced by ``INIT_NATS_REALERT_INTERVAL_S``
+
+    The published text deliberately uses the same "STUCK: ..." prefix
+    convention immune uses for stuck-pod escalations so ears' formatting
+    and human pattern-matching carry over.
+    """
+    if stuck_for_s < INIT_NATS_ALERT_AFTER_S:
+        return
+    last = _init_state["last_alert_at"] or 0.0
+    if last and (time.time() - last) < INIT_NATS_REALERT_INTERVAL_S:
+        return
+    dep = _likely_dependency(err_text, phase)
+    stuck_min = round(stuck_for_s / 60, 1)
+    alert_text = (
+        f"STUCK: maki-recall init has been failing for {stuck_min}min "
+        f"(attempts={attempt}, phase={phase}, likely_dependency={dep}). "
+        f"Last error: {err_text}. Retrying every ≤{backoff_s}s. "
+        f"/health returns 503 status=initializing; data endpoints are 503."
+    )
+    await _publish_init_alert(
+        alert_text,
+        {
+            "component": "maki-recall",
+            "kind": "init_stuck",
+            "phase": phase,
+            "attempts": attempt,
+            "stuck_for_s": round(stuck_for_s, 1),
+            "likely_dependency": dep,
+            "last_error": err_text,
+            "next_retry_in_s": backoff_s,
+        },
+    )
 
 
 async def _init_mem0() -> None:
@@ -229,6 +370,7 @@ async def _init_mem0() -> None:
             _init_state["last_attempt_duration_s"] = round(duration, 3)
             _init_state["last_attempt_phase"] = "vector"
             stuck_for = time.time() - _init_state["started_at"]
+            likely_dep = _likely_dependency(err_text, "vector")
             # Escalate log level once we've been failing long enough that a
             # paging dashboard should see it. First few failures stay WARNING
             # so a normal 30s-during-rollout outage doesn't page.
@@ -242,8 +384,64 @@ async def _init_mem0() -> None:
                     "stuck_for_s": round(stuck_for, 1),
                     "next_retry_in_s": backoff,
                     "phase": "vector",
+                    "likely_dependency": likely_dep,
                 },
             )
+            # NATS escalation (#258): once we've been stuck past the alert
+            # threshold, periodically publish to the same subject ears reads
+            # so a recall-wedge is visible from #maki-general without anyone
+            # having to read immune's internal state.
+            await _maybe_alert_init_stuck(
+                err_text=err_text,
+                attempt=attempt,
+                stuck_for_s=stuck_for,
+                phase="vector",
+                backoff_s=backoff,
+            )
+            # Last-resort safety net (#258 step 5): if init has been wedged
+            # past the fatal threshold, deliberately exit so k8s reschedules
+            # the pod. The 79h silent-hang incident only ended when someone
+            # manually deleted the pod; a fresh container is sometimes the
+            # difference between "stays stuck" and "comes up clean".
+            if INIT_FATAL_EXIT_AFTER_S > 0 and stuck_for >= INIT_FATAL_EXIT_AFTER_S:
+                log.critical(
+                    "Mem0 init stuck past fatal threshold — exiting for k8s to reschedule",
+                    extra={
+                        "stuck_for_s": round(stuck_for, 1),
+                        "fatal_threshold_s": INIT_FATAL_EXIT_AFTER_S,
+                        "attempts": attempt,
+                        "last_error": err_text,
+                        "likely_dependency": likely_dep,
+                    },
+                )
+                # Best-effort goodbye alert before we die, with a short
+                # timeout so a broken NATS doesn't keep us hanging here too.
+                try:
+                    await asyncio.wait_for(
+                        _publish_init_alert(
+                            f"FATAL: maki-recall init stuck for "
+                            f"{round(stuck_for / 60, 1)}min; exiting for k8s to reschedule. "
+                            f"Last error: {err_text} (likely_dependency={likely_dep})",
+                            {
+                                "component": "maki-recall",
+                                "kind": "init_fatal_exit",
+                                "stuck_for_s": round(stuck_for, 1),
+                                "attempts": attempt,
+                                "likely_dependency": likely_dep,
+                                "last_error": err_text,
+                            },
+                        ),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
+                # ``os._exit`` rather than ``sys.exit`` — we're inside an
+                # asyncio task, and SystemExit raised here would be swallowed
+                # by the task boundary (the old #258 failure mode would just
+                # continue silently). os._exit unconditionally tears the
+                # process down so the kubelet sees a fresh start. The pod's
+                # RestartPolicy=Always handles the reschedule.
+                os._exit(1)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, INIT_RETRY_MAX_SECONDS)
             continue
@@ -390,7 +588,7 @@ async def lifespan(app: FastAPI):
     k8s crashloops with no readiness signal whenever pgvector / embedder /
     Neo4j was briefly unreachable at boot.
     """
-    global _init_task, _neo4j_probe_driver
+    global _init_task, _neo4j_probe_driver, _nc
     # Log the actual HTTP endpoint inventory so a probe/image mismatch is
     # diagnosable from `kubectl logs` alone. #263's root-cause hypothesis
     # was specifically a manifest-pointed-at-missing-endpoint scenario;
@@ -405,6 +603,20 @@ async def lifespan(app: FastAPI):
         "maki-recall starting; scheduling Mem0 init",
         extra={"http_routes": routes, "route_count": len(routes)},
     )
+    # Best-effort NATS connection so the init loop can publish stuck-init
+    # alerts (#258). We do NOT block startup on this — if NATS itself is
+    # the dependency that's down, recall must still come up far enough to
+    # report 503 status=initializing via /health. ``_publish_init_alert``
+    # tolerates ``_nc is None`` and skips publishing in that case.
+    try:
+        _nc = await connect_nats(NATS_URL, token=NATS_TOKEN, max_retries=3, base_delay=1.0, max_delay=5.0)
+    except Exception as e:
+        # Don't crash the lifespan — the init loop must still run.
+        log.warning(
+            "NATS connection failed at startup; init-stuck alerts disabled",
+            extra={"nats_url": NATS_URL, "error": _format_exception(e)},
+        )
+        _nc = None
     _init_task = asyncio.create_task(_init_mem0(), name="recall.mem0_init")
     try:
         yield
@@ -418,6 +630,12 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
             _neo4j_probe_driver = None
+        if _nc is not None:
+            try:
+                await _nc.close()
+            except Exception:
+                pass
+            _nc = None
 
 
 app = FastAPI(title="maki-recall", version="0.0.1", lifespan=lifespan)
@@ -527,11 +745,19 @@ def _init_snapshot() -> dict[str, Any]:
         "last_init_error": _init_state["last_error"],
         "last_init_phase": _init_state["last_attempt_phase"],
         "last_attempt_duration_s": _init_state["last_attempt_duration_s"],
+        # #258: number of "stuck" NATS alerts published this lifetime so a
+        # human eyeballing /health knows whether the channel has already
+        # been told, and how loud the situation has been.
+        "init_alert_count": _init_state["alert_count"],
     }
     if _init_state["last_error"] is not None and _init_state["last_error_at"]:
         snap["last_error_age_s"] = round(now - _init_state["last_error_at"], 1)
     if memory is None and init_duration_s >= INIT_STUCK_THRESHOLD_S:
         snap["init_stuck"] = True
+        # Surface the inferred dependency so a curl /health gives the same
+        # "looks like X is down" hint the NATS alert carries.
+        if _init_state["last_error"]:
+            snap["likely_dependency"] = _likely_dependency(_init_state["last_error"], _init_state["last_attempt_phase"])
     return snap
 
 
