@@ -755,6 +755,7 @@ async def main():
         component_health=_component_health,
         pod_metrics=_pod_metrics,
         recent_actions=_recent_actions,
+        recent_actions_max=RECENT_ACTIONS_MAX,
         running_images=_running_images,
         hive_state=_hive_state,
         cortex_state=_cortex_state,
@@ -768,6 +769,7 @@ async def main():
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         publish_immune_response=_publish_immune_response,
+        schedule_persist_recent_actions=_schedule_persist_recent_actions,
         k8s_v1=_k8s_v1,
         lock_kv=_lock_kv,
     )

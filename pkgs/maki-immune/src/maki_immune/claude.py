@@ -12,6 +12,7 @@ from maki_common import load_kv_config, parse_config_tags
 from maki_common.claude import invoke_claude
 from maki_common.config import apply_config_updates, parse_tagged
 from maki_common.nats import try_claim_loop
+from maki_common.subjects import IMMUNE_ACTION
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ _check_interval: int = 30
 _component_health: Any = None
 _pod_metrics: Any = None
 _recent_actions: Any = None
+_recent_actions_max: int = 100
 _running_images: Any = None
 _hive_state: Any = None
 _cortex_state: Any = None
@@ -40,9 +42,18 @@ _system_prompt: str = ""
 _publish_alert: Any = None
 _publish_vitals: Any = None
 _publish_immune_response: Any = None
+_schedule_persist: Any = None
 _k8s_v1: Any = None
 _lock_kv: Any = None
 _loop_heartbeats: dict[str, float] = {}  # name -> last successful run timestamp
+
+# How many recent escalation rows to render into the Claude system prompt. The
+# durable trail itself lives in _recent_actions (persisted to KV, gossiped via
+# hive_state) — this just caps the rendered slice.
+_ESCALATION_PROMPT_WINDOW = 10
+# Truncate Claude's response / the exception message before stuffing it into
+# the durable action record so the KV blob stays bounded.
+_ESCALATION_SUMMARY_MAX = 400
 
 # Error signatures for passive log monitoring
 _ERROR_SIGNATURES = re.compile(r"ERROR|EXCEPTION|Traceback|panic|FATAL|RuntimeError|CrashLoopBackOff")
@@ -71,14 +82,17 @@ def init(
     publish_alert,
     publish_vitals,
     publish_immune_response,
+    recent_actions_max=100,
+    schedule_persist_recent_actions=None,
     k8s_v1=None,
     lock_kv=None,
 ):
     global _nc, _namespace, _instance_id, _site_name, _check_interval
-    global _component_health, _pod_metrics, _recent_actions, _running_images, _hive_state
+    global _component_health, _pod_metrics, _recent_actions, _recent_actions_max
+    global _running_images, _hive_state
     global _cortex_state, _failed_image_blacklist
     global _config_kv, _default_config, _config_validators, _mcp_server, _semaphore, _system_prompt
-    global _publish_alert, _publish_vitals, _publish_immune_response
+    global _publish_alert, _publish_vitals, _publish_immune_response, _schedule_persist
     global _k8s_v1, _lock_kv
     _nc = nc
     _namespace = namespace
@@ -88,6 +102,7 @@ def init(
     _component_health = component_health
     _pod_metrics = pod_metrics
     _recent_actions = recent_actions
+    _recent_actions_max = recent_actions_max
     _running_images = running_images
     _hive_state = hive_state
     _cortex_state = cortex_state
@@ -101,6 +116,7 @@ def init(
     _publish_alert = publish_alert
     _publish_vitals = publish_vitals
     _publish_immune_response = publish_immune_response
+    _schedule_persist = schedule_persist_recent_actions
     _k8s_v1 = k8s_v1
     _lock_kv = lock_kv
 
@@ -190,27 +206,142 @@ def _build_system_state() -> str:
     else:
         lines.append("\n## Loop Heartbeats\n- No heartbeats recorded yet (loops haven't fired or pod restarted)")
 
+    escalation_block = _render_recent_escalations()
+    if escalation_block:
+        lines.append("\n" + escalation_block)
+
     return "\n".join(lines)
+
+
+def _render_recent_escalations() -> str:
+    """Render the recent Claude-escalation trail for the system-state prompt (#299).
+
+    The full event stream lives in ``_recent_actions`` (persisted to KV +
+    gossiped via hive_state). Here we just filter for the escalation entries
+    and pair started/finished rows so Claude can see, at a glance, whether the
+    last N escalations actually completed or vanished into ``log.exception``.
+    A run of "started" rows with no matching "complete"/"failed" is the exact
+    smoking gun the #299 incident exposed.
+    """
+    if not _recent_actions:
+        return ""
+
+    escalation_types = {
+        "claude_escalation_started",
+        "claude_escalation_complete",
+        "claude_escalation_failed",
+    }
+    escalations = [a for a in _recent_actions if a.get("type") in escalation_types]
+    if not escalations:
+        return ""
+
+    escalations = escalations[-_ESCALATION_PROMPT_WINDOW:]
+    now = time.time()
+    lines = [f"## Recent Claude Escalations (last {len(escalations)})"]
+    for action in escalations:
+        kind = action.get("type", "")
+        component = action.get("component", "?")
+        ts = action.get("timestamp") or 0.0
+        age_min = round((now - ts) / 60, 1) if ts else "?"
+        eid = action.get("escalation_id", "")
+        eid_str = f" id={eid}" if eid else ""
+
+        if kind == "claude_escalation_started":
+            reason = (action.get("reason") or "")[:160]
+            lines.append(f"- STARTED {component}{eid_str} ({age_min}min ago): {reason}")
+        elif kind == "claude_escalation_complete":
+            summary = (action.get("summary") or "")[:160]
+            lines.append(f"- COMPLETE {component}{eid_str} ({age_min}min ago): {summary}")
+        elif kind == "claude_escalation_failed":
+            err = (action.get("error") or "")[:160]
+            lines.append(f"- FAILED {component}{eid_str} ({age_min}min ago): {err}")
+
+    return "\n".join(lines)
+
+
+def _record_action(action: dict) -> None:
+    """Append a structured action to _recent_actions and persist (#299).
+
+    Mirrors the pattern in health.py: append, trim, schedule persist, publish
+    to ``IMMUNE_ACTION`` so hive peers see it too. Wrapped here so the claude
+    module doesn't have to know about the persistence wiring at every call
+    site.
+    """
+    if _recent_actions is None:
+        return
+    _recent_actions.append(action)
+    if len(_recent_actions) > _recent_actions_max:
+        _recent_actions.pop(0)
+    if _schedule_persist is not None:
+        try:
+            _schedule_persist()
+        except Exception:
+            log.exception("Failed to schedule recent_actions persist")
+    if _nc is not None:
+        try:
+            asyncio.create_task(_nc.publish(IMMUNE_ACTION, json.dumps(action, default=str).encode()))
+        except Exception:
+            log.exception("Failed to publish escalation action")
 
 
 # --- Claude Escalation ---
 
 
 async def escalate_to_claude(component: str, state: dict, reason: str):
-    """Escalate a problem to Claude for deeper investigation and remediation."""
-    log.info("Escalating to Claude", extra={"component": component, "reason": reason})
+    """Escalate a problem to Claude for deeper investigation and remediation.
 
-    system_state = _build_system_state()
-    recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
-    config = await load_kv_config(_config_kv, _default_config)
-    config_str = json.dumps(config, indent=2)
-
-    prompt = _system_prompt.format(
-        system_state=system_state,
-        recent_actions=recent_actions_str,
-        config=config_str,
+    Durability contract (#299): every call leaves at least two structured
+    entries in ``_recent_actions`` — a ``claude_escalation_started`` row
+    written *before* the first ``await``, and a ``claude_escalation_complete``
+    or ``claude_escalation_failed`` row written in ``finally``. Even if the
+    LLM call hangs, errors, or the MCP tools silently no-op, the trail is
+    guaranteed and is surfaced in ``_build_system_state`` so the next
+    reflection/escalation can see the pattern (e.g., "we've tried 38 times,
+    every one failed at the same step").
+    """
+    started_at = time.time()
+    escalation_id = f"{component}:{int(started_at)}"
+    log.info(
+        "Escalating to Claude",
+        extra={"component": component, "reason": reason, "escalation_id": escalation_id},
     )
-    prompt += f"""
+
+    # Durable start record — written before any await so even if everything
+    # below explodes, the attempt is visible in the action trail / hive state.
+    _record_action(
+        {
+            "type": "claude_escalation_started",
+            "component": component,
+            "escalation_id": escalation_id,
+            "reason": reason[:_ESCALATION_SUMMARY_MAX],
+            "timestamp": started_at,
+            "instance_id": _instance_id,
+            "site": _site_name,
+        }
+    )
+
+    outcome: dict[str, Any] = {
+        "type": "claude_escalation_failed",
+        "component": component,
+        "escalation_id": escalation_id,
+        "started_at": started_at,
+        "error": "unknown — neither success nor exception was recorded",
+        "instance_id": _instance_id,
+        "site": _site_name,
+    }
+
+    try:
+        system_state = _build_system_state()
+        recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
+        config = await load_kv_config(_config_kv, _default_config)
+        config_str = json.dumps(config, indent=2)
+
+        prompt = _system_prompt.format(
+            system_state=system_state,
+            recent_actions=recent_actions_str,
+            config=config_str,
+        )
+        prompt += f"""
 
 ## ESCALATION
 
@@ -222,7 +353,6 @@ Investigate this problem using your tools. Read logs, check events, examine the 
 Determine root cause and take corrective action if possible.
 Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...]."""
 
-    try:
         response, _usage = await invoke_claude(
             prompt,
             model=MODEL,
@@ -236,16 +366,70 @@ Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...
             _config_kv, config_updates, allowed_keys=set(_default_config.keys()), validators=_config_validators
         )
 
-        for digest in parse_tagged(response, "DIGEST"):
+        digests = parse_tagged(response, "DIGEST")
+        for digest in digests:
             await _publish_vitals(digest)
 
-        for alert in parse_tagged(response, "ALERT"):
+        alerts = parse_tagged(response, "ALERT")
+        for alert in alerts:
             await _publish_alert(alert)
 
-        log.info("Claude escalation complete", extra={"component": component})
+        summary_source = "\n".join(digests + alerts) if (digests or alerts) else response
+        outcome = {
+            "type": "claude_escalation_complete",
+            "component": component,
+            "escalation_id": escalation_id,
+            "started_at": started_at,
+            "duration_s": round(time.time() - started_at, 1),
+            "summary": (summary_source or "").strip()[:_ESCALATION_SUMMARY_MAX],
+            "digests": len(digests),
+            "alerts": len(alerts),
+            "instance_id": _instance_id,
+            "site": _site_name,
+        }
+        log.info(
+            "Claude escalation complete",
+            extra={
+                "component": component,
+                "escalation_id": escalation_id,
+                "duration_s": outcome["duration_s"],
+                "digests": len(digests),
+                "alerts": len(alerts),
+            },
+        )
 
-    except Exception:
-        log.exception("Claude escalation failed", extra={"component": component})
+    except Exception as exc:
+        err_summary = f"{type(exc).__name__}: {exc}"[:_ESCALATION_SUMMARY_MAX]
+        outcome = {
+            "type": "claude_escalation_failed",
+            "component": component,
+            "escalation_id": escalation_id,
+            "started_at": started_at,
+            "duration_s": round(time.time() - started_at, 1),
+            "error": err_summary,
+            "instance_id": _instance_id,
+            "site": _site_name,
+        }
+        log.exception(
+            "Claude escalation failed",
+            extra={"component": component, "escalation_id": escalation_id},
+        )
+        # The whole point of #299: when the LLM path explodes, the *failure*
+        # itself becomes the alert. Otherwise the escalation pipeline can sit
+        # silently broken (as it did here for 9.5 days). Wrapped in its own
+        # try/except so a publish failure can't suppress the durable record.
+        try:
+            if _publish_alert is not None:
+                await _publish_alert(
+                    f"ESCALATION-FAILED: claude escalation for {component} crashed "
+                    f"({err_summary}). Reason was: {reason[:160]}. "
+                    f"escalation_id={escalation_id}. No remediation ran — manual review needed."
+                )
+        except Exception:
+            log.exception("Failed to publish escalation-failed alert")
+
+    finally:
+        _record_action(outcome)
 
 
 # --- Immune Command Handler ---
