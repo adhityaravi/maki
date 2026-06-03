@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -11,6 +12,32 @@ import httpx
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
+
+
+def _name_variants(name: str) -> tuple[str, str]:
+    """Return (bare, prefixed) name variants.
+
+    The three drifting copies of ``HEALTH_ENDPOINTS`` use different conventions
+    (cortex/stem use bare ``"recall"``, immune uses ``"maki-recall"``) and
+    immune's ``component_health`` keys come from k8s ``app=`` labels which are
+    always ``maki-*``. Accept either form from the caller and try both against
+    each registry — see #265.
+    """
+    bare = name[len("maki-") :] if name.startswith("maki-") else name
+    prefixed = name if name.startswith("maki-") else f"maki-{name}"
+    return bare, prefixed
+
+
+def _lookup(registry: dict[str, Any], name: str) -> Any:
+    """Best-effort lookup that tolerates ``maki-`` prefix mismatch."""
+    if name in registry:
+        return registry[name]
+    bare, prefixed = _name_variants(name)
+    if prefixed in registry:
+        return registry[prefixed]
+    if bare in registry:
+        return registry[bare]
+    return None
 
 
 def make_health_tools(
@@ -30,19 +57,91 @@ def make_health_tools(
             return mcp_result(f"Failed to get system health: {e}")
 
     async def check_component(args: dict[str, Any]) -> dict[str, Any]:
-        """Check a specific component's health endpoint."""
-        name = args.get("name", "")
+        """Check a specific component's health.
+
+        Sources, in priority order:
+
+        1. **Immune's view** (always queried) — covers every component
+           ``component_health`` knows about, which is the k8s pod scan plus the
+           HTTP endpoints immune itself probes. That's how ``maki-vault``,
+           ``maki-ears``, ``maki-embed``, ``maki-finbert``, ``maki-immune`` and
+           anything else with an ``app=maki-*`` label become visible to this
+           tool — the local ``health_endpoints`` registry only has four names
+           and was a self-diagnosis blind spot (#265).
+        2. **Local HTTP probe** — if the caller's process happens to have a URL
+           for this component in its ``HEALTH_ENDPOINTS`` dict, we hit
+           ``/health`` directly for a fresh single-shot reading. Useful when
+           you want to compare immune's monitor-loop verdict against the
+           component's own current answer.
+        """
+        name = (args.get("name") or "").strip()
         log.info("Tool: check_component", extra={"component": name})
-        url = health_endpoints.get(name)
-        if not url:
-            available = ", ".join(sorted(health_endpoints.keys()))
-            return mcp_result(f"Unknown component '{name}'. Available: {available}")
+        if not name:
+            return mcp_result("name is required (e.g. 'maki-vault', 'recall', 'cortex').")
+
+        # 1) Immune's view — the source of truth for the full component set.
+        immune_line: str
+        immune_state: dict[str, Any] | None = None
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{url}/health")
-                return mcp_result(f"{name}: status={resp.status_code}, body={resp.text}")
+            resp = await nc.request(IMMUNE_STATE_REQUEST, b"", timeout=5.0)
+            immune_state = json.loads(resp.data.decode() or "{}")
         except Exception as e:
-            return mcp_result(f"{name}: unreachable ({e})")
+            immune_line = f"immune view: failed to query ({e})"
+
+        component_info: dict[str, Any] | None = None
+        if immune_state is not None:
+            component_health = immune_state.get("component_health") or {}
+            component_info = _lookup(component_health, name)
+            if component_info is None:
+                available = ", ".join(sorted(component_health.keys()))
+                immune_line = (
+                    f"immune view: '{name}' not in component_health. Known to immune: {available or '(empty)'}"
+                )
+            else:
+                healthy = "HEALTHY" if component_info.get("healthy") else "UNHEALTHY"
+                failures = component_info.get("consecutive_failures", 0)
+                last_change = component_info.get("last_state_change")
+                age_s = (
+                    round(time.time() - last_change, 1)
+                    if isinstance(last_change, (int, float)) and last_change
+                    else None
+                )
+                details = component_info.get("details") or {}
+                try:
+                    details_str = json.dumps(details, default=str, sort_keys=True)
+                except Exception:
+                    details_str = str(details)
+                immune_line = (
+                    f"immune view: {healthy}, consecutive_failures={failures}, "
+                    f"state_age_s={age_s}, details={details_str}"
+                )
+
+        # 2) Optional local HTTP probe — fresh single-shot reading when we
+        #    happen to have an endpoint configured.
+        url = _lookup(health_endpoints, name)
+        http_line: str | None = None
+        if url:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    probe = await client.get(f"{url}/health")
+                    body = probe.text[:500]
+                    http_line = f"http probe ({url}/health): status={probe.status_code}, body={body}"
+            except Exception as e:
+                http_line = f"http probe ({url}/health): unreachable ({e})"
+
+        # If neither source produced anything actionable, say so explicitly.
+        if component_info is None and http_line is None:
+            local_known = ", ".join(sorted(health_endpoints.keys())) or "(none)"
+            return mcp_result(
+                f"{name}: no immune entry and no local /health endpoint.\n"
+                f"  {immune_line}\n"
+                f"  local endpoints: {local_known}"
+            )
+
+        parts = [f"{name}:", f"  {immune_line}"]
+        if http_line is not None:
+            parts.append(f"  {http_line}")
+        return mcp_result("\n".join(parts))
 
     async def get_pod_logs(args: dict[str, Any]) -> dict[str, Any]:
         """Fetch live Kubernetes pod logs for a component via immune (#252).
@@ -101,7 +200,12 @@ def make_health_tools(
         ),
         (
             "check_component",
-            "Check a specific component's health endpoint directly.",
+            "Check a specific component's health. Always queries immune for its "
+            "current view (covers every component immune sees via k8s pod scan "
+            "plus HTTP probes — vault, ears, embed, finbert, immune itself, etc.) "
+            "and additionally hits /health directly if this process has a local "
+            "URL for the component. Accepts both bare ('vault', 'recall') and "
+            "prefixed ('maki-vault', 'maki-recall') names.",
             {"name": str},
             check_component,
         ),
