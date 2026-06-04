@@ -60,6 +60,20 @@ resource "kubernetes_deployment" "finbert" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          # Liveness points at /live (process-only) per #276. /health 503s
+          # while the FinBERT ONNX model is loading (tens of seconds on cold
+          # start), so reusing it for liveness would kubelet-kill the pod
+          # mid-load. /live answers as soon as the FastAPI event loop is up.
+          liveness_probe {
+            http_get {
+              path = "/live"
+              port = 8080
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 30
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
           resources {
             requests = {
               memory = "512Mi"

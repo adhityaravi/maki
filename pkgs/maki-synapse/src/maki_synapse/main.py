@@ -268,6 +268,18 @@ def _log_ignored_fields(req: ChatCompletionRequest) -> None:
 # --- Endpoints ---
 
 
+@app.get("/live")
+def live():
+    """Liveness probe — process-only signal.
+
+    Always 200; deliberately does NOT touch any upstream. The kubelet uses
+    this to decide whether to SIGKILL the pod, so coupling it to dependency
+    state would re-create the #253 crashloop pattern that motivated the
+    fleet-wide ``/live`` rollout in #276.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
