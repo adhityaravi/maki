@@ -56,6 +56,19 @@ class ScoreResponse(BaseModel):
     results: list[SentimentResult]
 
 
+@app.get("/live")
+def live() -> dict[str, Any]:
+    """Liveness probe — process-only signal.
+
+    Returns 200 as long as the FastAPI event loop is responsive. Does NOT
+    check whether the finbert pipeline is loaded — model load can take
+    tens of seconds on cold start and a liveness fail there would crashloop
+    the pod just as it's coming up (the #253 pattern, fixed fleet-wide in
+    #276). Model-load state is reported via ``/health`` (readiness) only.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     if _pipe is None:

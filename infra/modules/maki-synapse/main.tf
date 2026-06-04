@@ -77,6 +77,21 @@ resource "kubernetes_deployment" "synapse" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          # Liveness points at /live (process-only) per #276. Synapse's
+          # /health currently always returns 200, but the split is wired in
+          # the manifest so future readiness-check additions (Claude SDK
+          # health, queue depth, etc.) can return 503 without taking the
+          # pod down via kubelet.
+          liveness_probe {
+            http_get {
+              path = "/live"
+              port = 8080
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 30
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
           resources {
             requests = {
               memory = "256Mi"

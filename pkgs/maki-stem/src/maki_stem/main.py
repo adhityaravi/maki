@@ -1368,6 +1368,22 @@ async def _pattern_write_listener():
     )
 
 
+@app.get("/live")
+def live():
+    """Liveness probe — process-only signal.
+
+    Returns 200 as long as the FastAPI event loop is responsive. Deliberately
+    does NOT touch NATS, listener tasks, or active turns. Used by k8s
+    ``livenessProbe`` so a transient dependency outage (NATS reconnect,
+    stuck turn) cannot cause the kubelet to SIGKILL the pod.
+
+    Mirrors the ``/live`` route shipped on maki-recall per #253 / #276 —
+    every long-running service now exposes liveness as a separate signal from
+    readiness so the readiness 503 window doesn't double as a liveness fail.
+    """
+    return {"status": "alive"}
+
+
 @app.get("/health")
 def health():
     if not _nc or not _nc.is_connected:

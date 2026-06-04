@@ -130,6 +130,23 @@ resource "kubernetes_deployment" "recall" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          # Liveness points at /live (not /health) per #253 / #276. /health
+          # returns 503 during Mem0's synchronous init (pgvector / neo4j /
+          # synapse boot), which is normal startup state — wiring liveness
+          # to it crashloops the pod just as it's about to come up. /live
+          # is process-only: 200 as long as the event loop is responsive,
+          # never consults Mem0. initial_delay covers the lifespan's NATS
+          # connect (up to ~15s with retries) plus pod schedule jitter.
+          liveness_probe {
+            http_get {
+              path = "/live"
+              port = 8000
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 30
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
           resources {
             requests = {
               memory = "256Mi"

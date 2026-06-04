@@ -230,6 +230,21 @@ resource "kubernetes_deployment" "stem" {
             period_seconds  = 10
             timeout_seconds = 5
           }
+          # Liveness points at /live (process-only, per #276) so a transient
+          # NATS reconnect or stuck turn — both of which legitimately flip
+          # /health to 503 — cannot cause kubelet to SIGKILL the pod. The
+          # startup_probe above already gates "is it up yet"; this probe is
+          # the catch for "is the event loop wedged after the fact".
+          liveness_probe {
+            http_get {
+              path = "/live"
+              port = 8000
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 30
+            timeout_seconds       = 3
+            failure_threshold     = 3
+          }
           resources {
             requests = {
               memory = "128Mi"
