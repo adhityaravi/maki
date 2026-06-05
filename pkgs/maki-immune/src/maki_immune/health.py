@@ -60,6 +60,21 @@ LONG_UNHEALTHY_RE_ESCALATE_HOURS = int(os.environ.get("LONG_UNHEALTHY_RE_ESCALAT
 # that it doesn't go silent for days, infrequent enough that Adi isn't spammed.
 LONG_UNHEALTHY_REALERT_INTERVAL_S = int(os.environ.get("LONG_UNHEALTHY_REALERT_INTERVAL_S", "21600"))
 
+# Tier-2 hive-guard breakthrough (#311): once a component has been unhealthy
+# for *this* many hours, escalate even if some peer site has it healthy. The
+# normal hive guard ("don't page about local-only issues") is correct for
+# hour-scale incidents — a peer covering for us means the system as a whole
+# is fine — but its implicit assumption is that *something* else will fix the
+# local instance. For non-allowlisted components there is no autonomous
+# recovery path, so a "local-only" outage can sit silent for weeks (recall
+# was 13 days CrashLoopBackOff before this gap was closed). Past this longer
+# threshold we treat the silence itself as the bug worth paging on, and the
+# alert/action are tagged ``LOCAL-ONLY-LONG-UNHEALTHY`` so the policy is
+# visible in the incident trail. Default 72h: well beyond any "give the
+# reflex / hive a chance to fix it" window, well short of "another week of
+# nothing".
+LONG_UNHEALTHY_LOCAL_ONLY_ESCALATE_HOURS = int(os.environ.get("LONG_UNHEALTHY_LOCAL_ONLY_ESCALATE_HOURS", "72"))
+
 # Wall-clock seconds a component may sit stuck in a non-Running/initializing
 # phase before immune fires an automated ``delete pod`` recovery (Tier 3). See
 # issue #264: maki-vault sat PodInitializing for 8+ days because the hive guard
@@ -81,12 +96,23 @@ STUCK_RECOVERY_THRESHOLD_S = int(os.environ.get("STUCK_RECOVERY_THRESHOLD_S", "8
 STUCK_RECOVERY_COOLDOWN_S = int(os.environ.get("STUCK_RECOVERY_COOLDOWN_S", "21600"))
 
 # Per-component opt-in for Tier-3 auto-recovery. Comma-separated list of
-# component names. Default is "maki-vault" — the concrete case driving #264.
-# Other single-replica StatefulSets / secret stores can be added once we've
-# confirmed ``delete pod`` is safe for them; the allowlist is the deliberate
-# gate the issue asks for ("Single-replica secrets stores should require a
-# more deliberate gate than reflex restart").
-STUCK_RECOVERY_ALLOWLIST_DEFAULT = os.environ.get("STUCK_RECOVERY_ALLOWLIST", "maki-vault")
+# component names. Originally defaulted to just "maki-vault" (#264 driver),
+# but #311 exposed the cost of keeping it that narrow: maki-recall sat in
+# CrashLoopBackOff locally for 13 days while the hive guard suppressed
+# pages ("other site has recall healthy, local-only issue") and the narrow
+# allowlist excluded recall from the autonomous pod-delete safety net —
+# a dead zone where neither human nor autonomous recovery could reach it.
+# We widen the default to the stateless application services where
+# ``delete pod`` is safe (kubelet recreates from spec, no PVC concerns):
+# the cortex/recall/stem/ears/synapse loop. We keep ``maki-vault`` for the
+# original #264 case. We deliberately omit ``maki-immune`` itself —
+# immune self-deleting mid-loop is a sharp corner that the kubelet liveness
+# probe already covers, and we don't want the watcher killing itself
+# inside its own delete syscall.
+STUCK_RECOVERY_ALLOWLIST_DEFAULT = os.environ.get(
+    "STUCK_RECOVERY_ALLOWLIST",
+    "maki-vault,maki-recall,maki-cortex,maki-stem,maki-ears,maki-synapse",
+)
 
 # Multiplier on ``_check_interval`` after which a component's stale
 # ``last_check`` is treated as an immune-self-failure (#270). The motivating
@@ -1025,14 +1051,30 @@ async def _check_long_unhealthy_components(config: dict) -> None:
     Cooldown via ``_long_unhealthy_alerted`` keyed by component ensures one alert
     per ``long_unhealthy_realert_interval_s`` window, not one per 30s tick. The
     tracker is keyed on the component's ``last_state_change`` so a recover-and-
-    fail-again cycle re-arms cleanly. Hive guard suppresses local-only outages
-    (matches the reflex/stuck-escalation policy).
+    fail-again cycle re-arms cleanly.
+
+    Hive guard is tiered (#311). For the first
+    ``long_unhealthy_local_only_escalate_hours`` (default 72h) we suppress when
+    a peer site has the component healthy — matches the reflex/stuck-escalation
+    "local-only, don't page" policy. Past that, we escalate anyway with a
+    distinct ``LOCAL-ONLY-LONG-UNHEALTHY`` label, because the original
+    suppression implicitly assumed *something* else would heal the local
+    instance; for components without an autonomous recovery path nothing ever
+    does, and the silence itself becomes the bug (recall sat in CrashLoopBackOff
+    locally for 13 days before this gap was closed).
     """
     if _nc is None:
         return
 
     threshold_s = config.get("long_unhealthy_re_escalate_hours", LONG_UNHEALTHY_RE_ESCALATE_HOURS) * 3600
     realert_s = config.get("long_unhealthy_realert_interval_s", LONG_UNHEALTHY_REALERT_INTERVAL_S)
+    local_only_threshold_s = (
+        config.get(
+            "long_unhealthy_local_only_escalate_hours",
+            LONG_UNHEALTHY_LOCAL_ONLY_ESCALATE_HOURS,
+        )
+        * 3600
+    )
     now = time.time()
 
     for component, state in list(_component_health.items()):
@@ -1049,12 +1091,27 @@ async def _check_long_unhealthy_components(config: dict) -> None:
         if stuck_for < threshold_s:
             continue
 
-        # Hive guard: if some other site has this component healthy, treat the
-        # local failure as a local-only problem rather than waking Adi up about
-        # a system-wide outage. Matches the policy in `_trigger_reflex` and
-        # `_check_stuck_components`.
-        if component_healthy_in_hive(component):
-            continue
+        # Tiered hive guard (#311): if some other site has this component
+        # healthy, the system as a whole is fine and we don't want to wake
+        # Adi up for what looks like a local-only outage — but only up to a
+        # point. The original "always suppress on healthy peers" policy
+        # implicitly assumed *something* else would heal the local instance;
+        # for components without an autonomous recovery path (not on the
+        # stuck-recovery allowlist, or with a failure mode it doesn't fit)
+        # nothing ever does, and the silence becomes the bug. So:
+        #
+        # - Under ``local_only_threshold_s`` (default 72h): suppress as
+        #   before. Matches `_trigger_reflex` / `_check_stuck_components`.
+        # - Past it: escalate anyway, but tag the alert and action with
+        #   ``LOCAL-ONLY-LONG-UNHEALTHY`` so the policy is legible in the
+        #   audit trail and Adi can tell at a glance that this isn't a
+        #   system-wide outage — it's a hive dead-zone breakthrough.
+        healthy_in_hive = component_healthy_in_hive(component)
+        local_only_breakthrough = False
+        if healthy_in_hive:
+            if stuck_for < local_only_threshold_s:
+                continue
+            local_only_breakthrough = True
 
         incident = state["last_state_change"]
         tracker = _long_unhealthy_alerted.get(component)
@@ -1079,6 +1136,8 @@ async def _check_long_unhealthy_components(config: dict) -> None:
         restarts = details.get("restarts", 0)
         consecutive_failures = state.get("consecutive_failures", 0)
 
+        alert_label = "LOCAL-ONLY-LONG-UNHEALTHY" if local_only_breakthrough else "LONG-UNHEALTHY"
+
         log.error(
             "Long-unhealthy component — re-escalating",
             extra={
@@ -1090,14 +1149,26 @@ async def _check_long_unhealthy_components(config: dict) -> None:
                 "waiting_reason": waiting_reason,
                 "restarts": restarts,
                 "fire_count": fire_count,
+                "alert_label": alert_label,
+                "healthy_in_hive": healthy_in_hive,
             },
         )
 
+        if local_only_breakthrough:
+            local_only_note = (
+                f" Hive shows healthy peers on {healthy_in_hive} — this is a "
+                f"local-only outage that has slipped past the normal hive-guard "
+                f"suppression (>{round(local_only_threshold_s / 3600, 1)}h)."
+            )
+        else:
+            local_only_note = ""
+
         await _publish_alert(
-            f"LONG-UNHEALTHY: {component} ({pod_name}) has been unhealthy for {stuck_hours}h "
+            f"{alert_label}: {component} ({pod_name}) has been unhealthy for {stuck_hours}h "
             f"(consecutive_failures={consecutive_failures}, phase={phase}, "
             f"waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
             f"Re-escalation #{fire_count} — initial reflex/escalation did not resolve."
+            f"{local_only_note}"
         )
 
         action = {
@@ -1110,6 +1181,8 @@ async def _check_long_unhealthy_components(config: dict) -> None:
             "waiting_reason": waiting_reason,
             "restarts": restarts,
             "fire_count": fire_count,
+            "alert_label": alert_label,
+            "healthy_in_hive": healthy_in_hive,
             "timestamp": now,
         }
         _recent_actions.append(action)
@@ -1128,13 +1201,23 @@ async def _check_long_unhealthy_components(config: dict) -> None:
         # ``_escalate_to_claude`` is fire-and-forget; if Claude is busy the
         # semaphore upstream will serialise the turn.
         if _escalate_to_claude is not None:
+            local_only_reason = (
+                f" Hive peers {healthy_in_hive} have this component healthy, so the "
+                f"normal hive-guard suppression has been holding back the alert; this "
+                f"escalation breaks through after {round(local_only_threshold_s / 3600, 1)}h "
+                f"because a local-only outage that nothing autonomous can fix is still an "
+                f"outage worth investigating."
+                if local_only_breakthrough
+                else ""
+            )
             reason = (
-                f"Long-unhealthy re-escalation: {component} ({pod_name}) has been unhealthy "
+                f"{alert_label} re-escalation: {component} ({pod_name}) has been unhealthy "
                 f"for {stuck_hours}h (consecutive_failures={consecutive_failures}, "
                 f"phase={phase}, waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
                 f"This is re-escalation #{fire_count} — earlier reflex/escalation did not fix "
-                f"the root cause. Investigate logs/events/dependencies and remediate. If the "
-                f"underlying issue is structural, file or revisit the relevant bug issue."
+                f"the root cause.{local_only_reason} Investigate logs/events/dependencies and "
+                f"remediate. If the underlying issue is structural, file or revisit the "
+                f"relevant bug issue."
             )
             asyncio.create_task(_escalate_to_claude(component, state, reason))
 

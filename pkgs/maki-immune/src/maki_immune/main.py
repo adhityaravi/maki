@@ -88,15 +88,28 @@ DEFAULT_CONFIG = {
     # single-shot escalation goes silent for days if not resolved (#259).
     "long_unhealthy_re_escalate_hours": 6,
     "long_unhealthy_realert_interval_s": 21600,
-    # Tier-3 auto-recovery (#264): after this many seconds stuck in a non-
-    # Running / initializing phase, immune performs an automated `delete pod`
-    # to break out of a multi-day wedge that reflex restarts couldn't fix.
-    # Opt-in via allowlist, gated by a hive sanity check (act only if a peer
-    # has the component healthy — proves the recipe works). Single-replica
-    # secrets stores like maki-vault are the canonical case.
+    # Tier-2 hive-guard breakthrough (#311): past this many hours of being
+    # unhealthy, _check_long_unhealthy_components escalates even if a peer
+    # has the component healthy. The default hive guard ("local-only, don't
+    # page") is correct for hour-scale incidents but became a dead-zone at
+    # week-scale: recall crashlooped silently for 13 days because hive
+    # suppression + a narrow stuck-recovery allowlist left it with no path
+    # back to human or autonomous attention. The breakthrough alert is
+    # labelled LOCAL-ONLY-LONG-UNHEALTHY so the policy is visible.
+    "long_unhealthy_local_only_escalate_hours": 72,
+    # Tier-3 auto-recovery (#264, widened in #311): after this many seconds
+    # stuck in a non-Running / initializing phase (or CrashLoopBackOff —
+    # ``is_pod_stuck`` matches both), immune performs an automated
+    # `delete pod` to break out of a multi-day wedge that reflex restarts
+    # couldn't fix. Opt-in via allowlist, gated by a hive sanity check
+    # (act only if a peer has the component healthy — proves the recipe
+    # works). #311 widened the default from just ``maki-vault`` to also
+    # cover the stateless application services (recall/cortex/stem/
+    # ears/synapse) where ``delete pod`` is safe (kubelet recreates from
+    # spec, no PVC concerns).
     "stuck_recovery_threshold_s": 86400,
     "stuck_recovery_cooldown_s": 21600,
-    "stuck_recovery_allowlist": "maki-vault",
+    "stuck_recovery_allowlist": "maki-vault,maki-recall,maki-cortex,maki-stem,maki-ears,maki-synapse",
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
