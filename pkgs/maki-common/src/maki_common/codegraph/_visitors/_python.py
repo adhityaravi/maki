@@ -59,11 +59,7 @@ class PythonVisitor:
             if child.type == "function_definition":
                 self._extract_function(child, parent_id, relative_path, nodes, edges)
             elif child.type == "decorated_definition":
-                for inner in child.children:
-                    if inner.type == "function_definition":
-                        self._extract_function(inner, parent_id, relative_path, nodes, edges)
-                    elif inner.type == "class_definition":
-                        self._extract_class(inner, parent_id, relative_path, nodes, edges)
+                self._extract_decorated(child, parent_id, relative_path, nodes, edges)
             elif child.type == "class_definition":
                 self._extract_class(child, parent_id, relative_path, nodes, edges)
             elif child.type == "import_statement":
@@ -166,6 +162,89 @@ class PythonVisitor:
         body = child_by_type(node, "block")
         if body:
             self._walk(body, class_id, relative_path, nodes, edges)
+
+    def _extract_decorated(
+        self,
+        node: TSNode,
+        parent_id: str,
+        relative_path: str,
+        nodes: list[Node],
+        edges: list[Edge],
+    ) -> None:
+        """Extract a decorated function or class.
+
+        Emits `calls` edges from the decorated function/class to each decorator
+        target (the callable being applied), then delegates to the appropriate
+        extractor for the inner definition.
+
+        Without this, decorator usage (FastAPI routes, dependency injection,
+        validators, `@dataclass`, etc.) would produce zero edges and be invisible
+        to "who uses X?" queries.
+        """
+        # Locate the inner function/class definition first so we know what id
+        # owns the decorator edges.
+        inner: TSNode | None = None
+        for ch in node.children:
+            if ch.type in ("function_definition", "class_definition"):
+                inner = ch
+                break
+
+        if inner is None:
+            return
+
+        name_node = child_by_type(inner, "identifier")
+        owner_id = f"{parent_id}::{text(name_node)}" if name_node else parent_id
+
+        # Emit a `calls` edge for each decorator.
+        for ch in node.children:
+            if ch.type == "decorator":
+                self._extract_decorator(ch, owner_id, edges)
+
+        if inner.type == "function_definition":
+            self._extract_function(inner, parent_id, relative_path, nodes, edges)
+        else:
+            self._extract_class(inner, parent_id, relative_path, nodes, edges)
+
+    def _extract_decorator(
+        self,
+        node: TSNode,
+        owner_id: str,
+        edges: list[Edge],
+    ) -> None:
+        """Emit a `calls` edge for a single decorator.
+
+        Handles bare decorators (`@foo`, `@a.b`) and parametrized decorators
+        (`@foo(...)`, `@app.get("/path")`).
+        """
+        # The decorator's payload is the first non-`@` child.
+        expr: TSNode | None = None
+        for ch in node.children:
+            if ch.type == "@":
+                continue
+            expr = ch
+            break
+
+        if expr is None:
+            return
+
+        if expr.type == "call":
+            func = expr.children[0] if expr.children else None
+            if func is None or func.type not in ("identifier", "attribute"):
+                return
+            target = text(func)
+        elif expr.type in ("identifier", "attribute"):
+            target = text(expr)
+        else:
+            return
+
+        edges.append(
+            Edge(
+                source=owner_id,
+                target=target,
+                kind="calls",
+                line=node.start_point[0] + 1,
+            )
+        )
 
     def _extract_import(
         self,
