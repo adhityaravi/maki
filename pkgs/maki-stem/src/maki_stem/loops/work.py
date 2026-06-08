@@ -408,12 +408,92 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         **({"model": spec.model} if spec.model else {}),
     }
 
+    # Failure-counting boundary (issue #284)
+    # ---------------------------------------
+    # Only failures inside the cortex-turn boundary itself — i.e. cortex
+    # actually attempted the work and either errored or hung — should
+    # increment the per-issue failure counter. Infra failures (NATS publish,
+    # pending-session setup, post-completion GitHub refresh) mean the issue
+    # was never really attempted; counting them would silently quarantine the
+    # top-priority issue behind a `human` label after three NATS hiccups,
+    # which is exactly when the system most needs to keep running.
     try:
         async with ctx.pending.session(turn_id) as queue:
-            await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
+            # --- Phase 1: publish (INFRA) ---
+            # A failure here means NATS itself is unhappy; the cortex turn
+            # never started, so don't penalise the issue.
+            try:
+                await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
+            except Exception:
+                log.exception(
+                    "Work turn publish failed — infra issue, not counting against issue",
+                    extra={"turn_id": turn_id, "issue": issue_number},
+                )
+                return
             log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
 
-            response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
+            # --- Phase 2: wait for cortex (ISSUE-SPECIFIC boundary) ---
+            # Anything that surfaces between `publish` returning and
+            # `queue.get()` returning is treated as a real attempt at the
+            # issue. TimeoutError is kept on its own branch because we also
+            # need to signal CORTEX_STUCK to immune.
+            try:
+                response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
+            except TimeoutError:
+                log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
+                # Publish stuck signal for immune (best-effort — if NATS is down
+                # we still want to record the issue-side timeout).
+                try:
+                    await ctx.nc.publish(
+                        CORTEX_STUCK,
+                        json.dumps(
+                            {
+                                "turn_id": turn_id,
+                                "mode": "work",
+                                "timeout_seconds": WORK_TURN_TIMEOUT,
+                                "user_waiting": False,
+                            }
+                        ).encode(),
+                    )
+                except Exception:
+                    log.warning(
+                        "Failed to publish CORTEX_STUCK after work timeout",
+                        extra={"turn_id": turn_id, "issue": issue_number},
+                        exc_info=True,
+                    )
+
+                new_count = await _record_work_failure(ctx, issue_number, "timeout")
+                spawn_background(
+                    ctx.github.comment_issue(
+                        issue_number,
+                        (
+                            f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s "
+                            f"(failure {new_count}). Backing off — next eligible retry in "
+                            f"~{_backoff_seconds(new_count) // 3600}h."
+                        ),
+                    ),
+                    name="work.timeout_comment",
+                )
+                return
+            except Exception:
+                log.exception(
+                    "Work turn failed while awaiting cortex response",
+                    extra={"turn_id": turn_id, "issue": issue_number},
+                )
+                new_count = await _record_work_failure(ctx, issue_number, "exception")
+                spawn_background(
+                    ctx.github.comment_issue(
+                        issue_number,
+                        (
+                            f"❌ **Work failed** due to an error (failure {new_count}). "
+                            f"Backing off — next eligible retry in "
+                            f"~{_backoff_seconds(new_count) // 3600}h."
+                        ),
+                    ),
+                    name="work.failure_comment",
+                )
+                return
+
             result_text = response_data.get("response", "")
             clean_result = strip_tags(result_text or "")
             log.info(
@@ -429,10 +509,25 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
                 name="work.feed_memories",
             )
 
-            # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
-            # for infra changes and left it open for Adi to review). If so, skip auto-close.
-            refreshed = await ctx.github.get_issue(issue_number)
-            if refreshed and _issue_has_skip_label(refreshed):
+            # --- Phase 3: post-processing (INFRA) ---
+            # Re-fetch issue to check if cortex added the "human" label (e.g.
+            # opened a PR for infra changes and left it open for Adi to
+            # review). If the refresh itself flakes, skip auto-close rather
+            # than counting it against the issue — cortex already ran.
+            try:
+                refreshed = await ctx.github.get_issue(issue_number)
+            except Exception:
+                log.warning(
+                    "Failed to refresh issue after work — skipping auto-close",
+                    extra={"issue": issue_number},
+                    exc_info=True,
+                )
+                refreshed = None
+
+            if refreshed is None:
+                # Couldn't determine current state; leave the issue alone.
+                pass
+            elif _issue_has_skip_label(refreshed):
                 log.info(
                     "Issue has human/draft label after work — skipping auto-close",
                     extra={"issue": issue_number},
@@ -449,49 +544,14 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             # is lifted (in case the previous failure was transient).
             await _clear_attempts(ctx.lock_kv, issue_number)
 
-    except TimeoutError:
-        log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
-        # Publish stuck signal for immune
-        await ctx.nc.publish(
-            CORTEX_STUCK,
-            json.dumps(
-                {
-                    "turn_id": turn_id,
-                    "mode": "work",
-                    "timeout_seconds": WORK_TURN_TIMEOUT,
-                    "user_waiting": False,
-                }
-            ).encode(),
-        )
-
-        new_count = await _record_work_failure(ctx, issue_number, "timeout")
-        spawn_background(
-            ctx.github.comment_issue(
-                issue_number,
-                (
-                    f"⏱️ **Work timed out** after {WORK_TURN_TIMEOUT}s "
-                    f"(failure {new_count}). Backing off — next eligible retry in "
-                    f"~{_backoff_seconds(new_count) // 3600}h."
-                ),
-            ),
-            name="work.timeout_comment",
-        )
-
     except Exception:
-        log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
-
-        new_count = await _record_work_failure(ctx, issue_number, "exception")
-        # Comment on issue about failure (issue stays open for retry, but in cooldown)
-        spawn_background(
-            ctx.github.comment_issue(
-                issue_number,
-                (
-                    f"❌ **Work failed** due to an error (failure {new_count}). "
-                    f"Backing off — next eligible retry in "
-                    f"~{_backoff_seconds(new_count) // 3600}h."
-                ),
-            ),
-            name="work.failure_comment",
+        # Reaching here means the pending-session context manager itself
+        # raised on entry/exit — pure infra (NATS / JetStream consumer
+        # didn't materialise). The cortex turn never started, so this must
+        # NOT increment the per-issue failure counter.
+        log.exception(
+            "Work loop infra failure (pending session) — not counting against issue",
+            extra={"turn_id": turn_id, "issue": issue_number},
         )
 
 
