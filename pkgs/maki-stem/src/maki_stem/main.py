@@ -1134,17 +1134,32 @@ async def _config_sync_listener():
 
 
 async def _handle_db_query(msg) -> None:
-    """Run one DB query and respond via NATS request/reply."""
+    """Run one DB query and respond via NATS request/reply.
+
+    Safety: only SELECT/WITH (CTE) queries pass the first-word check, then the
+    query is executed inside a Postgres ``READ ONLY`` transaction so any DML
+    smuggled inside a CTE (``WITH x AS (DELETE ... RETURNING *) SELECT ...``)
+    is rejected by the server at execution time. See issue #288.
+    """
     from maki_common.tools.utils import mcp_result
 
     try:
         data = json.loads(msg.data.decode())
         sql = data.get("sql", "").strip()
 
-        # Validate: SELECT or WITH only
+        # Validate: SELECT or WITH only (first-word check is a cheap reject,
+        # the READ ONLY transaction below is the real safety boundary).
         first_word = sql.split()[0].upper() if sql.split() else ""
         if first_word not in ("SELECT", "WITH"):
-            await msg.respond(json.dumps(mcp_result("Only SELECT/WITH queries are allowed.")).encode())
+            await msg.respond(
+                json.dumps(
+                    mcp_result(
+                        "Only SELECT and WITH (CTE) queries are allowed — "
+                        "executed inside a READ ONLY transaction, so any DML "
+                        "(INSERT/UPDATE/DELETE) nested in a CTE will be rejected."
+                    )
+                ).encode()
+            )
             return
 
         # Reject multi-statement queries
@@ -1161,7 +1176,12 @@ async def _handle_db_query(msg) -> None:
         log.info("Executing DB query", extra={"sql": sql[:200]})
 
         async with _db_pool.acquire() as conn:
-            rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
+            # READ ONLY transaction: Postgres rejects DML at execution time even
+            # when the statement starts with WITH and hides INSERT/UPDATE/DELETE
+            # inside a CTE. Without this, the first-word check is bypassable
+            # (issue #288).
+            async with conn.transaction(readonly=True):
+                rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
 
         if not rows:
             await msg.respond(json.dumps(mcp_result("Query returned 0 rows.")).encode())
@@ -1194,7 +1214,9 @@ async def _handle_db_query(msg) -> None:
 async def _db_query_listener():
     """Handle generic DB query requests from cortex via NATS request/reply.
 
-    Safety: only SELECT/WITH queries are allowed, LIMIT 50 is injected if
+    Safety: only SELECT/WITH queries pass the first-word check, the query
+    runs inside a Postgres READ ONLY transaction (so DML hidden in a CTE
+    is rejected by the server — issue #288), LIMIT 50 is injected if
     missing, and a 10s query timeout is enforced.
 
     Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
