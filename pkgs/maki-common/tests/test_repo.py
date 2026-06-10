@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest import mock
 
-from maki_common.repo import RepoEntry, RepoRegistry, redact_token
+from maki_common.repo import RepoEntry, RepoRegistry, SyncError, hard_sync, redact_token
 
 
 def test_redact_token_strips_url_form() -> None:
@@ -160,3 +161,192 @@ def test_repo_entry_explicit_clone_url_overrides() -> None:
         clone_url="https://example.invalid/x.git",
     )
     assert entry.resolved_clone_url() == "https://example.invalid/x.git"
+
+
+# ---------------------------------------------------------------------------
+# hard_sync — the abort-on-first-failure replacement for cortex's inline
+# fetch/reset/clean pipeline. The original bug (#290) was that a failed
+# `git fetch` only logged a warning and the loop kept going to
+# `git reset --hard origin/main`, silently running the turn against stale
+# code. These tests pin down the new "raise SyncError, do nothing more"
+# contract by stubbing out `_run_git` and asserting both the call order and
+# the failure semantics.
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_git(*results: tuple[int, str, str]):
+    """Return an async stub for `_run_git` that yields `results` in order.
+
+    Also records every call so tests can assert that hard_sync stops at the
+    first non-zero step (no `reset --hard` after a failed `fetch`).
+    """
+    calls: list[tuple[str, ...]] = []
+    iterator = iter(results)
+
+    async def stub(repo_path: str, *args: str) -> tuple[int, str, str]:
+        calls.append(args)
+        try:
+            return next(iterator)
+        except StopIteration:  # pragma: no cover — defensive
+            raise AssertionError(f"_run_git called more times than stubbed: {args}") from None
+
+    return stub, calls
+
+
+def test_hard_sync_success_runs_fetch_reset_clean_in_order() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(hard_sync("/repo/maki"))
+    assert calls == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+        ("clean", "-fd"),
+    ]
+
+
+def test_hard_sync_aborts_on_fetch_failure_does_not_reset() -> None:
+    """The whole point: a failed fetch must NOT proceed to reset/clean."""
+    stub, calls = _fake_run_git(
+        (1, "", "fatal: unable to access remote: connection refused"),
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "fetch"
+            assert exc.returncode == 1
+            assert "connection refused" in exc.stderr
+        else:  # pragma: no cover — should have raised
+            raise AssertionError("hard_sync should have raised SyncError on fetch failure")
+    # Critical assertion for issue #290: no reset --hard ran after the failed fetch.
+    assert calls == [("fetch", "origin", "main")]
+
+
+def test_hard_sync_aborts_on_reset_failure_does_not_clean() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # fetch OK
+        (128, "", "fatal: reset failed"),  # reset fails
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "reset"
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on reset failure")
+    assert calls == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+    ]
+
+
+def test_hard_sync_aborts_on_clean_failure() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),
+        (0, "", ""),
+        (1, "", "could not unlink working tree file"),
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "clean"
+            assert "unlink" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on clean failure")
+    assert len(calls) == 3
+
+
+class _FakeAuth:
+    def __init__(self, token: str = "ghs_test_token_xxxxxxxxxxxxxxxxxxxx") -> None:
+        self._token = token
+
+    async def get_token(self) -> str:
+        return self._token
+
+
+def test_hard_sync_with_auth_sets_remote_url_first_then_fetch() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # remote set-url
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(
+            hard_sync(
+                "/repo/maki",
+                github_auth=_FakeAuth(),
+                owner="adhityaravi",
+                name="maki",
+            )
+        )
+    assert calls[0][:3] == ("remote", "set-url", "origin")
+    # URL embeds the token; verify the call ran (the actual token is opaque here).
+    assert "x-access-token:" in calls[0][3]
+    assert "github.com/adhityaravi/maki.git" in calls[0][3]
+    assert calls[1:] == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+        ("clean", "-fd"),
+    ]
+
+
+def test_hard_sync_aborts_on_set_url_failure_does_not_fetch() -> None:
+    """A silent set-url failure was a sub-bug of #290 — make it loud."""
+    stub, calls = _fake_run_git(
+        (1, "", "fatal: bad remote"),  # set-url fails
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_FakeAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "remote set-url"
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on set-url failure")
+    # Critical: no fetch ran after the failed set-url.
+    assert calls == [("remote", "set-url", "origin", calls[0][3])]
+
+
+def test_hard_sync_with_auth_requires_url_or_owner_name() -> None:
+    try:
+        asyncio.run(hard_sync("/repo/maki", github_auth=_FakeAuth()))
+    except ValueError as exc:
+        assert "clone_url" in str(exc) or "owner" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("hard_sync should require owner/name or clone_url with github_auth")
+
+
+def test_hard_sync_token_mint_failure_surfaces_as_sync_error() -> None:
+    class _BrokenAuth:
+        async def get_token(self) -> str:
+            raise RuntimeError("installation revoked")
+
+    stub, calls = _fake_run_git()  # no git calls expected
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_BrokenAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "token"
+            assert "installation revoked" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap token-mint failure in SyncError")
+    assert calls == []

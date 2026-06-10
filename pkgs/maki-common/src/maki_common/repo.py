@@ -72,6 +72,86 @@ async def _run_git_no_cwd(*args: str) -> tuple[int, str, str]:
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
+class SyncError(Exception):
+    """Raised when ``hard_sync`` cannot reset the working tree to ``origin/main``.
+
+    Callers MUST treat the working tree as stale on this exception — the
+    previous inline pipeline in cortex (`fetch` → `reset --hard` → `clean`)
+    only logged a warning on the failing step and silently continued, so a
+    transient ``fetch`` failure would still run ``reset --hard origin/main``
+    against whatever was last fetched (potentially hours or days stale). See
+    issue #290.
+
+    The ``stderr`` field is pre-redacted via ``_run_git`` and therefore safe
+    to forward into logs and NATS payloads.
+    """
+
+    def __init__(self, step: str, returncode: int | None, stderr: str) -> None:
+        self.step = step
+        self.returncode = returncode
+        self.stderr = stderr
+        snippet = (stderr or "").strip().splitlines()
+        head = snippet[0] if snippet else ""
+        super().__init__(f"git {step} failed (rc={returncode}): {head[:200]}")
+
+
+async def hard_sync(
+    repo_path: str,
+    *,
+    github_auth: Any | None = None,
+    owner: str | None = None,
+    name: str | None = None,
+    clone_url: str | None = None,
+) -> None:
+    """Hard-reset *repo_path* to ``origin/main`` with abort-on-first-failure semantics.
+
+    Pipeline (each step aborts on non-zero returncode by raising ``SyncError``):
+
+      1. optional ``git remote set-url origin <token-url>`` — only when
+         *github_auth* is supplied, so the working tree gets a freshly minted
+         installation token. Requires either *clone_url* or both *owner* and
+         *name* so the URL can be constructed.
+      2. ``git fetch origin main``
+      3. ``git reset --hard origin/main``
+      4. ``git clean -fd``
+
+    This replaces the inline pipeline in ``maki_cortex._process_turn`` whose
+    bug — log-and-continue on failure — let cortex reason about stale code
+    with only one buried warning line as a signal. By raising on the first
+    non-zero returncode this function makes the silent-stale-code path
+    impossible: the caller either succeeds in landing on the latest
+    ``origin/main`` or sees a clear failure.
+
+    All stderr surfaced via ``SyncError.stderr`` is pre-redacted by
+    ``_run_git`` (no installation tokens leak).
+    """
+    if github_auth is not None:
+        if not clone_url and not (owner and name):
+            raise ValueError(
+                "hard_sync: github_auth requires either clone_url or (owner, name) to construct the auth URL"
+            )
+        try:
+            token = await github_auth.get_token()
+        except Exception as exc:  # noqa: BLE001 — surface as a typed sync failure
+            raise SyncError("token", None, f"failed to mint installation token: {exc}") from exc
+        if clone_url:
+            auth_url = clone_url.replace("https://", f"https://x-access-token:{token}@")
+        else:
+            auth_url = f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
+        rc, _, stderr = await _run_git(repo_path, "remote", "set-url", "origin", auth_url)
+        if rc != 0:
+            raise SyncError("remote set-url", rc, stderr)
+
+    for step, args in (
+        ("fetch", ("fetch", "origin", "main")),
+        ("reset", ("reset", "--hard", "origin/main")),
+        ("clean", ("clean", "-fd")),
+    ):
+        rc, _, stderr = await _run_git(repo_path, *args)
+        if rc != 0:
+            raise SyncError(step, rc, stderr)
+
+
 async def init_repo(
     repo_path: str,
     clone_url: str,

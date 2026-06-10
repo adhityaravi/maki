@@ -17,7 +17,7 @@ import uuid
 from maki_common import configure_logging, connect_nats, init_kv, subscribe_supervised
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
-from maki_common.repo import redact_token
+from maki_common.repo import SyncError, hard_sync, redact_token
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
@@ -325,57 +325,87 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
     max_turns = turn.get("max_turns", MAX_TURNS)
     git_pull = turn.get("git_pull", True)
 
-    # Auto-pull latest code if requested by the loop
+    # Auto-pull latest code if requested by the loop.
+    #
+    # Abort-on-failure semantics: if ANY step of the hard sync fails (token
+    # mint, remote set-url, fetch, reset, clean) we publish a `done=True,
+    # cancelled=True, reason="cortex_auto_sync_failed"` signal and return.
+    # We do NOT proceed against whatever was last fetched.
+    #
+    # The previous inline pipeline (`fetch` → `reset --hard` → `clean`) only
+    # logged a warning on the failing step and kept going, which meant a
+    # transient fetch failure still ran `reset --hard origin/main` against a
+    # stale `origin/main`. Work turns then edited stale files, idle/care turns
+    # reflected on stale code, and the only signal was one buried WARNING.
+    # The "Auto-sync before turn" log line was unconditional too — it lied
+    # whenever sync silently failed. See issue #290.
     if git_pull and os.path.exists(REPO_PATH):
+        auth = None
+        if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
+            from maki_common.tools.github import GitHubAuth
+
+            auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
         try:
-            if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
-                from maki_common.tools.github import GitHubAuth
-
-                _auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
-                _token = await _auth.get_token()
-                _url = f"https://x-access-token:{_token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-                proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    REPO_PATH,
-                    "remote",
-                    "set-url",
-                    "origin",
-                    _url,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+            await hard_sync(REPO_PATH, github_auth=auth, owner=REPO_OWNER, name=REPO_NAME)
+        except SyncError as exc:
+            # stderr is pre-redacted inside hard_sync — safe to log and publish.
+            log.error(
+                "Auto-sync failed — aborting turn to avoid running against stale code",
+                extra={
+                    "turn_id": turn_id,
+                    "mode": mode,
+                    "step": exc.step,
+                    "returncode": exc.returncode,
+                    "stderr": (exc.stderr or "")[:500],
+                },
+            )
+            done_msg = {
+                "turn_id": turn_id,
+                "response": "",
+                "done": True,
+                "cancelled": True,
+                "reason": "cortex_auto_sync_failed",
+                "error": f"git {exc.step} failed (rc={exc.returncode})",
+            }
+            try:
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            except Exception:
+                log.exception(
+                    "Failed to publish auto-sync-failure done signal",
+                    extra={"turn_id": turn_id},
                 )
-                await proc.communicate()
-            # Hard reset to origin/main — no rebase, no merge conflicts.
-            # Any local-only state is stale (work turns commit+push everything).
-            for git_cmd in (
-                ["git", "-C", REPO_PATH, "fetch", "origin", "main"],
-                ["git", "-C", REPO_PATH, "reset", "--hard", "origin/main"],
-                ["git", "-C", REPO_PATH, "clean", "-fd"],
-            ):
-                proc = await asyncio.create_subprocess_exec(
-                    *git_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _stdout, _stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    # Redact: git error messages echo the full remote URL,
-                    # which contains the installation token.
-                    log.warning(
-                        "Auto-sync git command failed",
-                        extra={
-                            "cmd": git_cmd[3:],
-                            "stderr": redact_token(_stderr.decode(errors="replace")),
-                        },
-                    )
-            log.info("Auto-sync before turn", extra={"turn_id": turn_id})
-            # Invalidate code graph cache — files on disk changed
-            from maki_common.tools.codegraph_tools import invalidate_graph_cache
-
-            invalidate_graph_cache(REPO_PATH)
+            return
         except Exception:
-            log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
+            # Anything not caught as SyncError (programming error in the
+            # caller path, asyncio cancellation propagation, etc.) is also a
+            # reason to abort — running with stale code is worse than failing
+            # loudly.
+            log.error(
+                "Auto-sync raised unexpectedly — aborting turn",
+                exc_info=True,
+                extra={"turn_id": turn_id, "mode": mode},
+            )
+            done_msg = {
+                "turn_id": turn_id,
+                "response": "",
+                "done": True,
+                "cancelled": True,
+                "reason": "cortex_auto_sync_failed",
+            }
+            try:
+                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+            except Exception:
+                log.exception(
+                    "Failed to publish auto-sync-failure done signal",
+                    extra={"turn_id": turn_id},
+                )
+            return
+
+        log.info("Auto-sync before turn", extra={"turn_id": turn_id})
+        # Invalidate code graph cache — files on disk changed
+        from maki_common.tools.codegraph_tools import invalidate_graph_cache
+
+        invalidate_graph_cache(REPO_PATH)
 
     static_context = build_system_prompt(turn)
     conv_context = build_conversation_prompt(turn)
