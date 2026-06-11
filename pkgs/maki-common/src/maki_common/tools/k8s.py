@@ -213,6 +213,33 @@ def make_k8s_tools(
         except Exception:
             log.exception("Failed to publish action")
 
+    def _check_rate_limit(
+        key: str,
+        max_per_hour: int,
+        subject: str,
+    ) -> str | None:
+        """Enforce a per-key hourly cap on a mutation.
+
+        Trims `restart_history[key]` to the last hour, denies if at the cap,
+        otherwise records the current timestamp and returns None.
+
+        `subject` is the human-readable label used in the DENIED message
+        (e.g. "pod foo" or "deployment bar scale").
+        """
+        now = time.time()
+        hour_ago = now - 3600
+        history = [t for t in restart_history.get(key, []) if t > hour_ago]
+        if len(history) >= max_per_hour:
+            restart_history[key] = history
+            return (
+                f"DENIED: {subject} already had {len(history)} matching actions "
+                f"in the last hour (limit: {max_per_hour}). "
+                f"Try a different remediation approach."
+            )
+        history.append(now)
+        restart_history[key] = history
+        return None
+
     async def restart_pod(args: dict[str, Any]) -> dict[str, Any]:
         """Delete a pod so its deployment recreates it."""
         pod_name = args.get("pod_name", "")
@@ -221,22 +248,15 @@ def make_k8s_tools(
 
         config = await config_getter()
         max_restarts = config.get("reflex_restart_max", 3)
-        now = time.time()
-        hour_ago = now - 3600
-        history = restart_history.get(pod_name, [])
-        history = [t for t in history if t > hour_ago]
-        restart_history[pod_name] = history
 
-        if len(history) >= max_restarts:
-            return mcp_result(
-                f"DENIED: {pod_name} already restarted {len(history)} times "
-                f"in the last hour (limit: {max_restarts}). "
-                f"Try a different remediation approach."
-            )
+        denied = _check_rate_limit(pod_name, max_restarts, f"pod {pod_name}")
+        if denied:
+            return mcp_result(denied)
 
         if not await acquire_lock("immune-claude", ttl=60):
             return mcp_result("DENIED: infrastructure lock held by another process. Try again shortly.")
 
+        now = time.time()
         try:
             await asyncio.to_thread(
                 k8s_v1.delete_namespaced_pod,
@@ -244,8 +264,6 @@ def make_k8s_tools(
                 namespace=namespace,
                 grace_period_seconds=10,
             )
-            history.append(now)
-            restart_history[pod_name] = history
 
             await _record_action(
                 {
@@ -273,6 +291,10 @@ def make_k8s_tools(
 
         if replicas < 0 or replicas > 5:
             return mcp_result(f"DENIED: replicas must be between 0 and 5 (requested {replicas})")
+
+        denied = _check_rate_limit(f"scale:{deployment_name}", 3, f"deployment {deployment_name} scale")
+        if denied:
+            return mcp_result(denied)
 
         if not await acquire_lock("immune-claude", ttl=60):
             return mcp_result("DENIED: infrastructure lock held by another process.")
@@ -305,6 +327,14 @@ def make_k8s_tools(
         """Trigger a rolling restart of a deployment (recreates pods with same image)."""
         deployment_name = args.get("deployment_name", "")
         log.info("Tool: restart_deployment", extra={"deployment": deployment_name})
+
+        denied = _check_rate_limit(
+            f"restart_deployment:{deployment_name}",
+            3,
+            f"deployment {deployment_name} restart",
+        )
+        if denied:
+            return mcp_result(denied)
 
         if not await acquire_lock("immune-claude", ttl=60):
             return mcp_result("DENIED: infrastructure lock held by another process.")
@@ -358,6 +388,14 @@ def make_k8s_tools(
                 f"Cannot rollback — no deploy history available. "
                 f"Use get_deployment_status to check current state."
             )
+
+        denied = _check_rate_limit(
+            f"rollback:{deployment_name}",
+            1,
+            f"deployment {deployment_name} rollback",
+        )
+        if denied:
+            return mcp_result(denied)
 
         if not await acquire_lock("immune-claude", ttl=60):
             return mcp_result("DENIED: infrastructure lock held by another process.")
@@ -454,21 +492,23 @@ def make_k8s_tools(
         ),
         (
             "scale_deployment",
-            "Scale a deployment to a specific number of replicas (0-5).",
+            "Scale a deployment to a specific number of replicas (0-5). Rate-limited to 3/hour per deployment.",
             {"deployment_name": str, "replicas": str},
             scale_deployment,
         ),
         (
             "restart_deployment",
             "Trigger a rolling restart of a deployment — recreates all pods with the same image. "
-            "Use this for config changes or stuck pods, NOT for reverting bad deploys.",
+            "Use this for config changes or stuck pods, NOT for reverting bad deploys. "
+            "Rate-limited to 3/hour per deployment.",
             {"deployment_name": str},
             restart_deployment,
         ),
         (
             "rollback_deployment",
             "Rollback a deployment to its previous image version. Only works if a deploy was "
-            "previously tracked. For rolling restarts (same image), use restart_deployment instead.",
+            "previously tracked. For rolling restarts (same image), use restart_deployment instead. "
+            "Rate-limited to 1/hour per deployment — flapping rollbacks indicate a deeper issue.",
             {"deployment_name": str},
             rollback_deployment,
         ),
