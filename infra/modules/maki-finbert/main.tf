@@ -60,6 +60,15 @@ resource "kubernetes_deployment" "finbert" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          liveness_probe {
+            http_get {
+              path = "/health"
+              port = 8080
+            }
+            initial_delay_seconds = 60
+            period_seconds        = 30
+            timeout_seconds       = 5
+          }
           resources {
             requests = {
               memory = "512Mi"
