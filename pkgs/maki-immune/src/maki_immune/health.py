@@ -426,6 +426,31 @@ async def _check_k8s_pods() -> dict[str, tuple[bool, dict[str, Any]]]:
             if not app_label:
                 continue
 
+            # Skip pods that aren't part of the live serving set so the verdict
+            # tracks the same reality the Service routes to (#297). Without this,
+            # stuck Terminating pods (finalizer wedge, kubelet GC lag) and old
+            # ReplicaSet leftovers in Succeeded/Failed keep appearing as
+            # "unhealthy" replicas of the app long after the current live pod
+            # has taken over. The motivating case: maki-recall reported
+            # ``phase=Running, ready=False, waiting_reason=CrashLoopBackOff,
+            # total_pods=2, unhealthy_pods=2`` for 22 days while ``/health``
+            # returned 200 from the actual live pod — immune was merging the
+            # live pod with a stale one whose containers had been wedged in
+            # CrashLoopBackOff since the previous rollout, picking the stale
+            # one as the "report pod" (first unhealthy), and the composite
+            # ``http_ok AND k8s_ok`` verdict came out False on every tick.
+            #
+            # ``deletion_timestamp`` covers Terminating pods (even ones stuck
+            # for days); phase ``Succeeded``/``Failed`` covers terminally
+            # completed pods that haven't been GC'd yet. Pods still in flight
+            # (Pending/PodInitializing/Running) stay — the existing
+            # ``_check_stuck_components`` path already handles the case of a
+            # legitimately-stuck Pending pod.
+            if pod.metadata.deletion_timestamp is not None:
+                continue
+            if pod.status.phase in ("Succeeded", "Failed"):
+                continue
+
             phase = pod.status.phase
             ready = True
             restarts = 0
