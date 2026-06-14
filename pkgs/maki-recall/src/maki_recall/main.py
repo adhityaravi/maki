@@ -79,6 +79,23 @@ INIT_NATS_REALERT_INTERVAL_S = int(os.environ.get("RECALL_INIT_NATS_REALERT_INTE
 # was written about. Set the env var to 0 to disable.
 INIT_FATAL_EXIT_AFTER_S = int(os.environ.get("RECALL_INIT_FATAL_EXIT_AFTER_S", "7200"))
 
+# Per-attempt timeout for ``Memory.from_config`` (#312). Without this, a
+# half-open TCP socket / DNS wedge / "accepted but never replies" backend
+# can hang the to_thread call forever — the except branch never runs, so
+# none of the safety nets (NATS stuck alert, INIT_FATAL_EXIT_AFTER_S,
+# telemetry counters) ever engage. Default 120s: comfortably larger than
+# a healthy boot (typically <30s) so a slow-but-recovering dependency
+# doesn't flap, but well under INIT_FATAL_EXIT_AFTER_S so multiple
+# timed-out attempts roll up into the fatal-exit window. Set to 0 to
+# disable (kept for emergency-revert; not recommended).
+INIT_ATTEMPT_TIMEOUT_S = int(os.environ.get("RECALL_INIT_ATTEMPT_TIMEOUT_S", "120"))
+
+# Connect-timeout passed through to the pgvector libpq connection string so
+# a wedged Postgres also fails fast at the driver layer instead of relying
+# solely on the asyncio.wait_for wrapper above. See #312. Bounded small —
+# every retry pays this cost on top of the normal backoff.
+PG_CONNECT_TIMEOUT_S = int(os.environ.get("RECALL_PG_CONNECT_TIMEOUT_S", "10"))
+
 
 def _build_pg_uri() -> str:
     user = quote_plus(os.environ.get("POSTGRES_USER", "maki"))
@@ -87,7 +104,14 @@ def _build_pg_uri() -> str:
     port = os.environ.get("POSTGRES_PORT", "5432")
     db = os.environ.get("POSTGRES_DB", "maki")
     host_port = ",".join(f"{h}:{port}" for h in hosts.split(","))
-    return f"postgresql://{user}:{password}@{host_port}/{db}?target_session_attrs=read-write"
+    # connect_timeout is a libpq URI parameter — applies to both psycopg
+    # (used by mem0's pgvector backend) and any other libpq client built
+    # from this URI. See #312 — without it, a half-open TCP socket to
+    # Postgres hung Memory.from_config indefinitely.
+    return (
+        f"postgresql://{user}:{password}@{host_port}/{db}"
+        f"?target_session_attrs=read-write&connect_timeout={PG_CONNECT_TIMEOUT_S}"
+    )
 
 
 def _build_config() -> tuple[dict[str, Any], bool]:
@@ -359,12 +383,33 @@ async def _init_mem0() -> None:
         vector_only_config = {k: v for k, v in config.items() if k != "graph_store"}
         attempt_started = time.time()
         try:
-            vector_mem = await asyncio.to_thread(Memory.from_config, vector_only_config)
+            # Per-attempt timeout (#312): without this wrapper a hang inside
+            # Memory.from_config (half-open TCP socket, DNS wedge, server in
+            # a state that accepts the connection but never replies) never
+            # raises, so the except branch — and with it the NATS stuck
+            # alert and INIT_FATAL_EXIT_AFTER_S safety net — never fires.
+            if INIT_ATTEMPT_TIMEOUT_S > 0:
+                vector_mem = await asyncio.wait_for(
+                    asyncio.to_thread(Memory.from_config, vector_only_config),
+                    timeout=INIT_ATTEMPT_TIMEOUT_S,
+                )
+            else:
+                vector_mem = await asyncio.to_thread(Memory.from_config, vector_only_config)
         except Exception as vec_err:
             # Foundational backend down (pgvector / embedder / LLM). Do NOT
             # blame the graph store — that misattribution was #198.
+            # asyncio.wait_for raises bare TimeoutError on timeout; format
+            # it with the per-attempt budget so /health, NATS alerts, and
+            # logs distinguish a hang from a synchronous backend exception.
             duration = time.time() - attempt_started
-            err_text = _format_exception(vec_err)
+            if isinstance(vec_err, asyncio.TimeoutError):
+                err_text = (
+                    f"TimeoutError: Memory.from_config (vector) exceeded per-attempt "
+                    f"timeout of {INIT_ATTEMPT_TIMEOUT_S}s "
+                    f"(RECALL_INIT_ATTEMPT_TIMEOUT_S) — backend hung, see #312"
+                )
+            else:
+                err_text = _format_exception(vec_err)
             _init_state["last_error"] = err_text
             _init_state["last_error_at"] = time.time()
             _init_state["last_attempt_duration_s"] = round(duration, 3)
@@ -467,7 +512,16 @@ async def _init_mem0() -> None:
         # genuinely graph-related — the warning text is finally accurate.
         graph_started = time.time()
         try:
-            graph_mem = await asyncio.to_thread(Memory.from_config, config)
+            # Same per-attempt timeout protection as the vector phase (#312).
+            # A neo4j server that accepts the TCP connection but never
+            # responds to bolt handshake would otherwise hang here forever.
+            if INIT_ATTEMPT_TIMEOUT_S > 0:
+                graph_mem = await asyncio.wait_for(
+                    asyncio.to_thread(Memory.from_config, config),
+                    timeout=INIT_ATTEMPT_TIMEOUT_S,
+                )
+            else:
+                graph_mem = await asyncio.to_thread(Memory.from_config, config)
             memory = graph_mem
             graph_enabled = True
             _init_state["last_error"] = None
@@ -484,7 +538,14 @@ async def _init_mem0() -> None:
             )
             return
         except Exception as graph_err:
-            err_text = _format_exception(graph_err)
+            if isinstance(graph_err, asyncio.TimeoutError):
+                err_text = (
+                    f"TimeoutError: Memory.from_config (graph) exceeded per-attempt "
+                    f"timeout of {INIT_ATTEMPT_TIMEOUT_S}s "
+                    f"(RECALL_INIT_ATTEMPT_TIMEOUT_S) — neo4j hung, see #312"
+                )
+            else:
+                err_text = _format_exception(graph_err)
             _init_state["last_error"] = err_text
             _init_state["last_error_at"] = time.time()
             _init_state["last_attempt_duration_s"] = round(time.time() - graph_started, 3)
@@ -534,7 +595,15 @@ async def _retry_graph_init() -> None:
         attempt = _graph_state["attempts"]
         attempt_started = time.time()
         try:
-            mem = await asyncio.to_thread(Memory.from_config, config)
+            # Same per-attempt timeout (#312) — a hung neo4j here would
+            # otherwise wedge the recovery loop indefinitely with no signal.
+            if INIT_ATTEMPT_TIMEOUT_S > 0:
+                mem = await asyncio.wait_for(
+                    asyncio.to_thread(Memory.from_config, config),
+                    timeout=INIT_ATTEMPT_TIMEOUT_S,
+                )
+            else:
+                mem = await asyncio.to_thread(Memory.from_config, config)
             memory = mem
             graph_enabled = True
             _graph_state["last_error"] = None
@@ -551,7 +620,14 @@ async def _retry_graph_init() -> None:
             return
         except Exception as e:
             duration = time.time() - attempt_started
-            err_text = _format_exception(e)
+            if isinstance(e, asyncio.TimeoutError):
+                err_text = (
+                    f"TimeoutError: Memory.from_config (graph retry) exceeded "
+                    f"per-attempt timeout of {INIT_ATTEMPT_TIMEOUT_S}s "
+                    f"(RECALL_INIT_ATTEMPT_TIMEOUT_S) — neo4j hung, see #312"
+                )
+            else:
+                err_text = _format_exception(e)
             _graph_state["last_error"] = err_text
             _graph_state["last_error_at"] = time.time()
             _graph_state["last_attempt_duration_s"] = round(duration, 3)
