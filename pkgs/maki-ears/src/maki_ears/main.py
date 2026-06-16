@@ -456,7 +456,13 @@ async def _handle_ears_out(msg) -> None:
                 symbol = data.get("symbol", "")
                 entry_price = float(data.get("entry_price") or 0.0)
                 view = TradeProposalView(proposal_id, symbol, direction, entry_price)
+                channel_kind = "trading" if _trading_channel_ids else "general"
                 target_ids = _trading_channel_ids or _general_channel_ids
+                if not target_ids:
+                    log.warning(
+                        "No trading/general channel available, trade proposal dropped",
+                        extra={"proposal_id": proposal_id, "channel": channel_kind},
+                    )
                 for channel_id in target_ids:
                     channel = _bot.get_channel(channel_id)
                     if channel:
@@ -491,6 +497,11 @@ async def _handle_ears_out(msg) -> None:
                 extra={"channel": channel_kind, "turn_id": turn_id},
             )
             target_ids = _general_channel_ids
+        if not target_ids:
+            log.warning(
+                "No channel available, loop output dropped",
+                extra={"channel": channel_kind, "turn_id": turn_id},
+            )
         for channel_id in target_ids:
             channel = _bot.get_channel(channel_id)
             if channel:
