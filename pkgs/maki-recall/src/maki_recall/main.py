@@ -96,6 +96,31 @@ INIT_ATTEMPT_TIMEOUT_S = int(os.environ.get("RECALL_INIT_ATTEMPT_TIMEOUT_S", "12
 # every retry pays this cost on top of the normal backoff.
 PG_CONNECT_TIMEOUT_S = int(os.environ.get("RECALL_PG_CONNECT_TIMEOUT_S", "10"))
 
+# Per-query bound on the pgvector /health probe. ``connect_timeout`` only
+# bounds the libpq handshake — once the TCP+TLS is established, the cursor
+# ``execute``/``fetchone`` can block until kernel TCP retransmit gives up
+# (typically 60–120s). That's exactly the failure mode that hung /health
+# while curl-by-hand sometimes returned 200, splitting recall vs. immune
+# health perception (#297). Statement timeout is enforced server-side via
+# libpq's ``options`` startup parameter. See #337.
+PG_PROBE_STATEMENT_TIMEOUT_MS = int(os.environ.get("RECALL_PG_PROBE_STATEMENT_TIMEOUT_MS", "3000"))
+
+# Per-tx bound on the Neo4j /health probe. The probe driver is cached in
+# a module global to avoid re-handshaking per /health call — so a Neo4j
+# that wedges *after* the driver warmed up never trips the constructor's
+# ``connection_timeout`` again. Setting a tx-level timeout makes the
+# server itself kill the RETURN 1 if it doesn't complete in this many
+# seconds. See #337.
+NEO4J_PROBE_TX_TIMEOUT_S = float(os.environ.get("RECALL_NEO4J_PROBE_TX_TIMEOUT_S", "3.0"))
+
+# Outer wall-clock deadline for each probe inside /health. Backstop in
+# case a future probe forgets its own per-call timeout or the wedge sits
+# below the SQL/cypher layer (kernel TCP retransmit, driver bug). Keeps
+# /health from inheriting the kernel TCP-timeout window. Picked a touch
+# larger than the per-probe layer-specific timeouts so the SQL/cypher
+# kill path runs first when both could fire. See #337.
+PROBE_DEADLINE_S = float(os.environ.get("RECALL_PROBE_DEADLINE_S", "5.0"))
+
 
 def _build_pg_uri() -> str:
     user = quote_plus(os.environ.get("POSTGRES_USER", "maki"))
@@ -755,9 +780,21 @@ def _probe_pgvector() -> str | None:
     failure won't show up here — but the data endpoints fail loud on the
     next real request, and a stable public probe is preferable to a
     private-API tripwire that breaks on dependency upgrades.
+
+    Per-query bound (#337): ``connect_timeout=3`` only caps the libpq
+    handshake. Once the connection is up, ``execute``/``fetchone`` can
+    block on a server-side wedge until kernel TCP retransmit gives up
+    (~60–120s) — which is the exact /health hang we were eating. The
+    ``options="-c statement_timeout=..."`` startup parameter caps every
+    statement on this connection server-side, so the SELECT 1 cannot
+    outrun the deadline regardless of what the driver does locally.
     """
     try:
-        with psycopg.connect(_build_pg_uri(), connect_timeout=3) as conn:
+        with psycopg.connect(
+            _build_pg_uri(),
+            connect_timeout=3,
+            options=f"-c statement_timeout={PG_PROBE_STATEMENT_TIMEOUT_MS}",
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 cur.fetchone()
@@ -774,6 +811,19 @@ def _probe_neo4j() -> str | None:
     private chain ``mem.graph.graph.query`` (#176). A neo4j minor bump
     that renames langchain's internal attributes would otherwise wedge our
     liveness probe even though the database is fine.
+
+    Per-call bound (#337): the cached driver means ``connection_timeout``
+    only fires on the *first* probe — subsequent probes skip the connect
+    path entirely. A Neo4j that goes wedged after the driver warmed up
+    has nothing to time out, so ``session.run(...).consume()`` could
+    hang until OS-level TCP keepalives fired (which produces exactly the
+    "consecutive failures climbing while curl sometimes returns 200"
+    split between recall and immune we observed in #297). The fix:
+    bound the transaction at the server with ``begin_transaction(
+    timeout=...)``, and additionally cap connection-pool acquisition so
+    a wedged-pool case can't sit forever waiting for a free conn either.
+    The outer /health ``asyncio.wait_for`` in :func:`_run_probe_with_deadline`
+    handles wedges below the bolt-protocol layer.
     """
     global _neo4j_probe_driver
     uri = os.environ.get("NEO4J_URI", "")
@@ -788,9 +838,14 @@ def _probe_neo4j() -> str | None:
                     os.environ.get("NEO4J_PASSWORD", ""),
                 ),
                 connection_timeout=3,
+                # Cap how long acquiring a pooled connection can wait —
+                # without this, a wedged pool can swallow the entire
+                # outer probe deadline before we even see a tx start.
+                connection_acquisition_timeout=NEO4J_PROBE_TX_TIMEOUT_S,
             )
         with _neo4j_probe_driver.session() as session:
-            session.run("RETURN 1 AS ok").consume()
+            with session.begin_transaction(timeout=NEO4J_PROBE_TX_TIMEOUT_S) as tx:
+                tx.run("RETURN 1 AS ok").consume()
     except Exception as e:
         # Drop the driver on failure so a transient outage doesn't poison
         # the cached connection for the rest of the pod's life.
@@ -802,6 +857,43 @@ def _probe_neo4j() -> str | None:
             _neo4j_probe_driver = None
         return f"{type(e).__name__}: {e}"
     return None
+
+
+async def _run_probe_with_deadline(probe: Any, name: str) -> str | None:
+    """Run a sync reachability probe under an outer asyncio deadline.
+
+    The per-driver SQL/cypher timeouts (PG_PROBE_STATEMENT_TIMEOUT_MS,
+    NEO4J_PROBE_TX_TIMEOUT_S) are the primary defense — they kill a
+    wedged query server-side. This wrapper is the backstop for wedges
+    that sit *below* the SQL/cypher layer (kernel TCP retransmit, a
+    driver-internal lock, future probe code that forgets its own
+    timeout). Without it, /health inherits the kernel TCP-timeout
+    window (~60–120s), which is what produced the recall↔immune
+    split-perception incident in #297. See #337.
+
+    On a neo4j timeout we drop the cached driver — the existing except
+    branch in :func:`_probe_neo4j` already does that on
+    ``Exception``, but a hung ``session.run`` never reaches its except.
+    pgvector opens a fresh psycopg.connect per call so there's no
+    cached state to invalidate there.
+
+    Note: ``asyncio.to_thread`` cannot cancel the underlying OS thread
+    on timeout — the thread keeps running until its server-side timeout
+    fires (or the kernel gives up on the socket). That's an acceptable
+    leak: the next /health call sees ``_neo4j_probe_driver is None``
+    and reconnects, and the orphaned thread eventually unwinds.
+    """
+    global _neo4j_probe_driver
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(probe), timeout=PROBE_DEADLINE_S)
+    except TimeoutError:
+        if name == "neo4j" and _neo4j_probe_driver is not None:
+            try:
+                _neo4j_probe_driver.close()
+            except Exception:
+                pass
+            _neo4j_probe_driver = None
+        return f"TimeoutError: {name} probe exceeded {PROBE_DEADLINE_S}s deadline"
 
 
 def _init_snapshot() -> dict[str, Any]:
@@ -873,7 +965,7 @@ def live():
 
 
 @app.get("/health")
-def health():
+async def health():
     """Readiness/startup probe.
 
     Returns 503 with ``status: initializing`` while Mem0 hasn't finished
@@ -890,6 +982,12 @@ def health():
     Used by ``readinessProbe`` and ``startupProbe``. The ``livenessProbe``
     points at ``/live`` instead so dependency slowness doesn't kill the
     pod mid-init.
+
+    Async (#337) so each probe runs under ``asyncio.wait_for`` — a
+    wedged backend (TCP accepted but SQL/cypher hangs) can no longer
+    inflate /health's response time past PROBE_DEADLINE_S. That was
+    the root cause of the recall↔immune health-perception split in
+    #297.
     """
     mem = memory
     if mem is None:
@@ -900,14 +998,14 @@ def health():
     checks: dict[str, Any] = {"status": "ok", "graph": graph_enabled}
     checks.update(_init_snapshot())
 
-    pg_err = _probe_pgvector()
+    pg_err = await _run_probe_with_deadline(_probe_pgvector, "pgvector")
     if pg_err is not None:
         log.warning("recall /health pg probe failed: %s", pg_err)
         checks["status"] = "degraded"
         checks["pg"] = "down"
 
     if graph_enabled:
-        neo_err = _probe_neo4j()
+        neo_err = await _run_probe_with_deadline(_probe_neo4j, "neo4j")
         if neo_err is not None:
             log.warning("recall /health neo4j probe failed: %s", neo_err)
             checks["status"] = "degraded"
