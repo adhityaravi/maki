@@ -920,6 +920,13 @@ def _init_snapshot() -> dict[str, Any]:
     }
     if _init_state["last_error"] is not None and _init_state["last_error_at"]:
         snap["last_error_age_s"] = round(now - _init_state["last_error_at"], 1)
+    # #339: surface ``ready_age_s`` so a curl /health distinguishes "just
+    # became ready, watch closely" from "ready for hours, stable". The
+    # ``ready_at`` field was written in three sites but never read until
+    # now — was dead telemetry.
+    ready_at = _init_state["ready_at"] or 0.0
+    if ready_at:
+        snap["ready_age_s"] = round(now - ready_at, 1)
     if memory is None and init_duration_s >= INIT_STUCK_THRESHOLD_S:
         snap["init_stuck"] = True
         # Surface the inferred dependency so a curl /health gives the same
@@ -947,7 +954,7 @@ def _graph_snapshot() -> dict[str, Any]:
 
 
 @app.get("/live")
-def live():
+async def live() -> dict[str, str]:
     """Liveness probe — process-only health check.
 
     Returns 200 as long as the FastAPI event loop is responsive. Does NOT
@@ -960,6 +967,15 @@ def live():
     ``/health``, which returns 503 during Mem0 init, so a slow init would
     blow past the liveness budget and crashloop the pod just as it was
     about to come up. ``/health`` remains the readiness/startup signal.
+
+    ``async def`` per #339: a sync ``def`` handler runs in Starlette's
+    anyio worker threadpool (default 40 threads), which the data-path
+    handlers (``/memories``, ``/search``) also share. Under sustained
+    or wedged traffic those handlers can saturate the pool, leaving
+    ``/live`` requests stuck in the queue — exactly the kubelet-timeout
+    -> crashloop failure mode this endpoint was split out to prevent.
+    Returning immediately from the event loop avoids the threadpool
+    entirely.
     """
     return {"status": "alive"}
 
