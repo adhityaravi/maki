@@ -121,6 +121,31 @@ resource "kubernetes_deployment" "recall" {
             name       = "data"
             mount_path = "/data"
           }
+          # Three-probe split per #253 (closes #276). Previously both readiness
+          # and liveness pointed at /health, which returns 503 while Mem0 is
+          # still initializing. A slow dep (pgvector/neo4j/synapse) during
+          # Memory.from_config would blow past the liveness budget and kubelet
+          # would kill the pod mid-init -> crashloop.
+          #
+          #   /live   - process-only; FastAPI loop responsive. Used by
+          #             liveness_probe. Never blocks on Mem0/deps.
+          #   /health - Mem0 + pgvector + neo4j probes. Used by
+          #             readiness_probe (routes traffic only when ready)
+          #             and startup_probe (gates liveness until init done).
+          startup_probe {
+            # 60 x 10s = 10min budget for Mem0 init. Once /health passes once,
+            # liveness_probe takes over. Generous because Memory.from_config
+            # blocks synchronously on pgvector + neo4j + synapse and any one
+            # being slow extends boot.
+            http_get {
+              path = "/health"
+              port = 8000
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 10
+            timeout_seconds       = 5
+            failure_threshold     = 60
+          }
           readiness_probe {
             http_get {
               path = "/health"
@@ -130,13 +155,33 @@ resource "kubernetes_deployment" "recall" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          liveness_probe {
+            # Process-only probe. Restarts the pod only when the FastAPI event
+            # loop itself stops responding - independent of Mem0 init state or
+            # backend dep health.
+            http_get {
+              path = "/live"
+              port = 8000
+            }
+            initial_delay_seconds = 0
+            period_seconds        = 30
+            timeout_seconds       = 5
+            failure_threshold     = 3
+          }
           resources {
+            # Bumped from 256Mi/512Mi after #251: mem0 fact-extraction runs
+            # the LLM add() path synchronously and accumulates messages +
+            # extracted facts in-process; at 512Mi a long conversation can
+            # OOM the pod mid-extract and CrashLoopBackOff. 512Mi/1Gi gives
+            # headroom for the in-flight extract without making recall a
+            # noticeably heavy tenant. Revisit if we move fact-extraction
+            # off the request thread.
             requests = {
-              memory = "256Mi"
+              memory = "512Mi"
               cpu    = "100m"
             }
             limits = {
-              memory = "512Mi"
+              memory = "1Gi"
               cpu    = "500m"
             }
           }

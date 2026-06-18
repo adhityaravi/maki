@@ -77,6 +77,19 @@ resource "kubernetes_deployment" "synapse" {
             period_seconds        = 10
             timeout_seconds       = 5
           }
+          liveness_probe {
+            # Generous threshold: 6 x 30s = 3min of /health failure before
+            # kubelet restarts the pod. Lets transient backend hiccups ride
+            # through; only kills genuinely stuck pods.
+            http_get {
+              path = "/health"
+              port = 8080
+            }
+            initial_delay_seconds = 60
+            period_seconds        = 30
+            timeout_seconds       = 10
+            failure_threshold     = 6
+          }
           resources {
             requests = {
               memory = "256Mi"
