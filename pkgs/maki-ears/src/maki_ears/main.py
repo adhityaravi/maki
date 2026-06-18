@@ -36,7 +36,7 @@ NATS_TOKEN = os.environ.get("NATS_TOKEN")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
-VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-general")
+VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-alerts")
 IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
 TRADING_CHANNEL_NAME = os.environ.get("TRADING_CHANNEL_NAME", "maki-trading")
 
@@ -561,7 +561,7 @@ async def _immune_response_listener():
 
 
 async def _handle_vitals(msg) -> None:
-    """Process one vitals digest and post to #maki-general.
+    """Process one vitals digest and post to #maki-alerts.
 
     ``subscribe_supervised`` handles the ack on our behalf (auto_ack defaults
     to True for JetStream subs) — ACK on success, NAK on uncaught handler
@@ -608,7 +608,7 @@ async def _vitals_listener():
 
 
 async def _handle_alert(msg) -> None:
-    """Process one immune alert and post to #maki-general."""
+    """Process one immune alert and post to #maki-alerts."""
     try:
         data = json.loads(msg.data.decode())
         alert = data.get("alert", "")
