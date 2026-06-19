@@ -5,7 +5,12 @@ log candidates, and decides whether to suppress (known no-op) or escalate.
 
 Confidence model:
 - First write: confidence=0.5, occurrence_count=1
-- Each passive match confirmed no-op: confidence += 0.1, occurrence_count += 1
+- Each match against an already-trusted no-op pattern: confidence += 0.1,
+  occurrence_count += 1 (reinforces what we already know).
+- Untrusted matches escalate to Claude and DO NOT bump stats — otherwise the
+  pattern self-promotes to trusted before Claude has confirmed anything
+  (issue #342). A future "Claude confirmed no-op" signal can bump stats on
+  the escalation path.
 - Trusted threshold: confidence >= 0.9 OR occurrence_count >= 3
   → pattern is silently suppressed without Claude involvement
 """
@@ -141,9 +146,13 @@ async def check_candidates(
                     },
                 )
             else:
-                # Either not no-op, or not yet trusted — escalate
-                # Still bump stats so confidence grows over time
-                await update_pattern_stats(nc, matched_pattern["id"], _CONFIDENCE_INCREMENT)
+                # Either not no-op, or not yet trusted — escalate.
+                # Do NOT bump stats here: occurrence_count drives trust promotion
+                # (_is_trusted), and bumping on every suspected match would let a
+                # brand-new no_op pattern self-promote to trusted in 2 hits without
+                # Claude ever confirming it. Stats should only grow on *confirmed*
+                # occurrences (the trusted-suppression path above, or a future
+                # explicit "Claude confirmed no-op" signal). See issue #342.
                 candidate["matched_pattern_id"] = matched_pattern["id"]
                 candidate["reason"] = (
                     "untrusted_noop" if is_noop else f"classified_{matched_pattern.get('classification')}"
