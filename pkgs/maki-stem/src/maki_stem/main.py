@@ -900,6 +900,17 @@ async def _process_turn(
                     )
                     raise
 
+                if data.get("cancelled"):
+                    log.warning(
+                        "Turn cancelled by cortex restart",
+                        extra={"turn_id": turn_id, "partial_chunks": len(full_response)},
+                    )
+                    # Raise so the caller's RuntimeError handler runs:
+                    # no memory write, no conversation stream publish, and ears
+                    # receives the "lost my train of thought" message instead of
+                    # a phantom empty done chunk.
+                    raise RuntimeError("cortex_restart_cancelled")
+
                 chunk_text = data.get("response", "")
                 done = data.get("done", False)
 
