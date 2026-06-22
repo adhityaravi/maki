@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -20,36 +21,78 @@ _TOKEN_URL_RE = re.compile(r"x-access-token:[^@\s/]+@")
 # refresh (ghr_), server-to-server (ghu_). Belt-and-suspenders in case the token
 # ever shows up outside the URL form.
 _BARE_TOKEN_RE = re.compile(r"\bgh[suporf]_[A-Za-z0-9]{20,}")
+# `Authorization: Basic <base64>` — the form we now inject via
+# `git -c http.extraheader=...` (issue #347). git itself should never echo
+# the header value back, but redact defensively if it ever surfaces in a
+# config dump, a process listing copy-pasted into a log, etc.
+_BASIC_AUTH_RE = re.compile(r"(Authorization:\s*Basic\s+)[A-Za-z0-9+/=]+", re.IGNORECASE)
 
 
 def redact_token(text: str) -> str:
     """Strip GitHub installation tokens from arbitrary text.
 
-    Handles the `x-access-token:TOKEN@host` URL form (the form we inject) and
-    the bare `ghs_*` / `ghp_*` / `gho_*` / `ghu_*` / `ghr_*` token prefixes as
-    a defensive fallback. Safe to call on stdout, stderr, log strings, MCP
-    results — any caller-visible output that may have come from a git process.
+    Handles the `x-access-token:TOKEN@host` URL form (the form older versions
+    embedded directly in the remote URL — see issue #347), the bare `ghs_*`
+    / `ghp_*` / `gho_*` / `ghu_*` / `ghr_*` token prefixes as a defensive
+    fallback, and the `Authorization: Basic <base64>` HTTP-header form we
+    now inject per-invocation via `git -c http.extraheader=...`. Safe to
+    call on stdout, stderr, log strings, MCP results — any caller-visible
+    output that may have come from a git process.
     """
     if not text:
         return text
     text = _TOKEN_URL_RE.sub("x-access-token:***@", text)
     text = _BARE_TOKEN_RE.sub("***", text)
+    text = _BASIC_AUTH_RE.sub(r"\1***", text)
     return text
 
 
-async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
+def _auth_config_args(token: str) -> tuple[str, ...]:
+    """Return ``git -c http.extraheader=...`` flags that auth a single invocation.
+
+    The installation token lives only as a substring of the spawned git
+    process's argv — there is no ``git remote set-url`` and therefore no
+    token persisted to ``<repo>/.git/config`` (issue #347). The encoded
+    header is ``Authorization: Basic <base64(x-access-token:TOKEN)>``, the
+    standard GitHub installation-token HTTP auth form.
+
+    Argv-only exposure is materially tighter than the previous
+    disk-persistence pattern: under the old design any sibling process
+    that could read ``.git/config`` (diagnostic dumps, side-car backups,
+    a stray ``cat`` from another tool) saw the token in cleartext for the
+    full ~1h token TTL. Here the token exists only for the git process's
+    own lifetime.
+    """
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return ("-c", f"http.extraheader=Authorization: Basic {encoded}")
+
+
+async def _run_git(
+    repo_path: str,
+    *args: str,
+    token: str | None = None,
+) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr).
+
+    When *token* is supplied, the GitHub installation token is injected via
+    ``git -c http.extraheader=...`` so it authenticates the single
+    invocation without ever landing in ``<repo>/.git/config`` (issue #347).
+    Local-only operations (``reset``, ``clean``, ``config``, ``rev-parse``)
+    don't need a token; remote operations (``fetch``, ``pull``, ``push``,
+    ``clone``) do.
 
     stdout and stderr are pre-redacted — any embedded GitHub token (in URLs
     git echoes back in errors, or otherwise) is stripped before the bytes
     leave this function. Every caller — logger, MCP tool, exception path —
     therefore sees safe text by construction.
     """
+    cmd_args: list[str] = []
+    if token:
+        cmd_args.extend(_auth_config_args(token))
+    cmd_args.extend(["-C", repo_path, *args])
     proc = await asyncio.create_subprocess_exec(
         "git",
-        "-C",
-        repo_path,
-        *args,
+        *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -57,14 +100,22 @@ async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
-async def _run_git_no_cwd(*args: str) -> tuple[int, str, str]:
-    """Run a git command without a `-C` working directory (e.g. clone).
+async def _run_git_no_cwd(
+    *args: str,
+    token: str | None = None,
+) -> tuple[int, str, str]:
+    """Run a git command without a ``-C`` working directory (e.g. ``clone``).
 
-    Same redaction guarantees as `_run_git`.
+    Same per-invocation auth injection and redaction guarantees as
+    ``_run_git``.
     """
+    cmd_args: list[str] = []
+    if token:
+        cmd_args.extend(_auth_config_args(token))
+    cmd_args.extend(args)
     proc = await asyncio.create_subprocess_exec(
         "git",
-        *args,
+        *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -107,13 +158,19 @@ async def hard_sync(
 
     Pipeline (each step aborts on non-zero returncode by raising ``SyncError``):
 
-      1. optional ``git remote set-url origin <token-url>`` — only when
-         *github_auth* is supplied, so the working tree gets a freshly minted
-         installation token. Requires either *clone_url* or both *owner* and
-         *name* so the URL can be constructed.
-      2. ``git fetch origin main``
-      3. ``git reset --hard origin/main``
-      4. ``git clean -fd``
+      1. optional ``git remote set-url origin <CLEAN_URL>`` — only when
+         *github_auth* is supplied. The URL is **token-free** by design
+         (issue #347): we mint the token in memory but rewrite the remote
+         to the plain ``https://github.com/...`` form, both establishing
+         the no-token-on-disk invariant and scrubbing any legacy
+         token-embedded URL left behind by older versions. Requires either
+         *clone_url* or both *owner* and *name* so the URL can be
+         constructed.
+      2. ``git -c http.extraheader=... fetch origin main`` — the
+         installation token authenticates this single invocation via an
+         in-memory ``-c`` config; it never lands in ``.git/config``.
+      3. ``git reset --hard origin/main`` (local; no auth needed)
+      4. ``git clean -fd`` (local; no auth needed)
 
     This replaces the inline pipeline in ``maki_cortex._process_turn`` whose
     bug — log-and-continue on failure — let cortex reason about stale code
@@ -125,6 +182,7 @@ async def hard_sync(
     All stderr surfaced via ``SyncError.stderr`` is pre-redacted by
     ``_run_git`` (no installation tokens leak).
     """
+    token: str | None = None
     if github_auth is not None:
         if not clone_url and not (owner and name):
             raise ValueError(
@@ -134,16 +192,21 @@ async def hard_sync(
             token = await github_auth.get_token()
         except Exception as exc:  # noqa: BLE001 — surface as a typed sync failure
             raise SyncError("token", None, f"failed to mint installation token: {exc}") from exc
-        if clone_url:
-            auth_url = clone_url.replace("https://", f"https://x-access-token:{token}@")
-        else:
-            auth_url = f"https://x-access-token:{token}@github.com/{owner}/{name}.git"
-        rc, _, stderr = await _run_git(repo_path, "remote", "set-url", "origin", auth_url)
+        # Rewrite the remote to the **token-free** URL. This both enforces
+        # the no-token-on-disk invariant for the fetch step below (which
+        # auths via -c http.extraheader instead) and scrubs any legacy
+        # `x-access-token:...@github.com` URL written by older versions of
+        # this module — see issue #347.
+        clean_url = clone_url if clone_url else f"https://github.com/{owner}/{name}.git"
+        rc, _, stderr = await _run_git(repo_path, "remote", "set-url", "origin", clean_url)
         if rc != 0:
             raise SyncError("remote set-url", rc, stderr)
 
+    fetch_rc, _, fetch_err = await _run_git(repo_path, "fetch", "origin", "main", token=token)
+    if fetch_rc != 0:
+        raise SyncError("fetch", fetch_rc, fetch_err)
+
     for step, args in (
-        ("fetch", ("fetch", "origin", "main")),
         ("reset", ("reset", "--hard", "origin/main")),
         ("clean", ("clean", "-fd")),
     ):
@@ -161,19 +224,26 @@ async def init_repo(
 ) -> bool:
     """Clone or pull a git repo. Returns True on success.
 
+    Authentication (issue #347): when *github_auth* is provided we mint a
+    short-lived installation token and inject it per-invocation via
+    ``git -c http.extraheader=...`` (see ``_auth_config_args``). The token
+    is **never** embedded in the remote URL and therefore **never** lands
+    in ``<repo>/.git/config``. The on-disk URL is always the plain
+    ``https://github.com/owner/repo.git`` form.
+
     Args:
         repo_path: Local path for the clone.
         clone_url: HTTPS clone URL (e.g. https://github.com/owner/repo.git).
-        github_auth: GitHubAuth instance — if provided, injects token into URL for auth.
+            Must be token-free; the token (if any) is added per-invocation.
+        github_auth: GitHubAuth instance — if provided, mints a token and
+            authenticates clone/pull via an in-memory header.
         git_user: Git user.name for commits.
         git_email: Git user.email for commits.
     """
-    auth_url = clone_url
+    token: str | None = None
     if github_auth:
         try:
             token = await github_auth.get_token()
-            # Inject token: https://github.com/... → https://x-access-token:TOKEN@github.com/...
-            auth_url = clone_url.replace("https://", f"https://x-access-token:{token}@")
         except Exception:
             log.warning("Failed to get GitHub token, cloning without auth")
 
@@ -182,7 +252,7 @@ async def init_repo(
         parent = os.path.dirname(repo_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        rc, _, stderr = await _run_git_no_cwd("clone", auth_url, repo_path)
+        rc, _, stderr = await _run_git_no_cwd("clone", clone_url, repo_path, token=token)
         if rc != 0:
             log.error("Git clone failed", extra={"stderr": stderr})
             return False
@@ -195,8 +265,13 @@ async def init_repo(
     else:
         log.info("Pulling latest", extra={"repo_path": repo_path})
         if github_auth:
-            await _run_git(repo_path, "remote", "set-url", "origin", auth_url)
-        rc, _, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main")
+            # Rewrite origin to the token-free URL. This both establishes
+            # the no-token-on-disk invariant for the pull below (which auths
+            # via -c http.extraheader) and scrubs any legacy
+            # `x-access-token:...@github.com` URL written by older versions
+            # of this module — see issue #347.
+            await _run_git(repo_path, "remote", "set-url", "origin", clone_url)
+        rc, _, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main", token=token)
         if rc != 0:
             log.warning("Git pull failed", extra={"stderr": stderr})
             return False

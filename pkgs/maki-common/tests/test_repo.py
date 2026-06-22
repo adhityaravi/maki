@@ -53,6 +53,66 @@ def test_redact_token_handles_empty_and_none_like() -> None:
     assert redact_token("") == ""
 
 
+def test_redact_token_strips_basic_auth_header() -> None:
+    """Issue #347: tokens now ride in Authorization: Basic <b64> headers.
+
+    The header value is base64-encoded so the bare-token regex won't catch
+    it; the dedicated Basic-auth pattern must.
+    """
+    import base64
+
+    encoded = base64.b64encode(b"x-access-token:ghs_aaaaaaaaaaaaaaaaaaaa").decode()
+    msg = f"some diagnostic: Authorization: Basic {encoded} (do not log this)"
+    redacted = redact_token(msg)
+    assert encoded not in redacted
+    assert "Authorization: Basic ***" in redacted
+
+
+def test_hard_sync_never_writes_token_into_remote_url() -> None:
+    """Regression for issue #347.
+
+    Older versions ran `git remote set-url origin https://x-access-token:TOKEN@...`
+    which persisted the installation token on disk in `.git/config` for the
+    full ~1h token TTL — readable by any process with filesystem access. The
+    fix injects auth per-invocation via `-c http.extraheader=...` instead.
+
+    This test pins the new invariant: the value passed to `set-url` must
+    NEVER contain the token. Catches any future refactor that re-introduces
+    the embedded-token URL pattern.
+    """
+    secret_token = "ghs_supersecret_NEVER_ON_DISK_xxxxxxxxxx"
+
+    class _LeakingAuth:
+        async def get_token(self) -> str:
+            return secret_token
+
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # remote set-url
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(
+            hard_sync(
+                "/repo/maki",
+                github_auth=_LeakingAuth(),
+                owner="adhityaravi",
+                name="maki",
+            )
+        )
+
+    # The secret must NEVER appear in any positional arg passed to git.
+    # `set-url` writes its argument to `.git/config`; if the token shows up
+    # here, it's on disk.
+    for argv in calls:
+        for arg in argv:
+            assert secret_token not in arg, (
+                f"Issue #347 regression: installation token leaked into git argv {argv!r}; "
+                "tokens must be injected via `_run_git(..., token=...)` only."
+            )
+
+
 # ---------------------------------------------------------------------------
 # RepoRegistry — multi-repo workspace resolution.
 #
@@ -179,17 +239,25 @@ def _fake_run_git(*results: tuple[int, str, str]):
 
     Also records every call so tests can assert that hard_sync stops at the
     first non-zero step (no `reset --hard` after a failed `fetch`).
+
+    The stub accepts a `token=` kwarg (issue #347 — installation tokens are
+    now injected per-invocation via `_run_git(..., token=...)`) and exposes
+    the per-call token under ``stub.token_calls`` so tests can verify that
+    fetch/pull/push run with auth and local-only steps (reset, clean) do not.
     """
     calls: list[tuple[str, ...]] = []
+    token_calls: list[str | None] = []
     iterator = iter(results)
 
-    async def stub(repo_path: str, *args: str) -> tuple[int, str, str]:
+    async def stub(repo_path: str, *args: str, token: str | None = None) -> tuple[int, str, str]:
         calls.append(args)
+        token_calls.append(token)
         try:
             return next(iterator)
         except StopIteration:  # pragma: no cover — defensive
             raise AssertionError(f"_run_git called more times than stubbed: {args}") from None
 
+    stub.token_calls = token_calls  # type: ignore[attr-defined]
     return stub, calls
 
 
@@ -286,14 +354,23 @@ def test_hard_sync_with_auth_sets_remote_url_first_then_fetch() -> None:
             )
         )
     assert calls[0][:3] == ("remote", "set-url", "origin")
-    # URL embeds the token; verify the call ran (the actual token is opaque here).
-    assert "x-access-token:" in calls[0][3]
-    assert "github.com/adhityaravi/maki.git" in calls[0][3]
+    # Issue #347: the URL written to .git/config must be token-free. The
+    # installation token is injected per-invocation on the fetch step below
+    # via `git -c http.extraheader=...` instead.
+    assert "x-access-token:" not in calls[0][3]
+    assert "ghs_" not in calls[0][3]
+    assert calls[0][3] == "https://github.com/adhityaravi/maki.git"
     assert calls[1:] == [
         ("fetch", "origin", "main"),
         ("reset", "--hard", "origin/main"),
         ("clean", "-fd"),
     ]
+    # And the token flows only to the network-facing step. set-url, reset,
+    # clean are all local and must run without auth.
+    assert stub.token_calls[0] is None  # type: ignore[attr-defined]
+    assert stub.token_calls[1] == "ghs_test_token_xxxxxxxxxxxxxxxxxxxx"  # type: ignore[attr-defined]
+    assert stub.token_calls[2] is None  # type: ignore[attr-defined]
+    assert stub.token_calls[3] is None  # type: ignore[attr-defined]
 
 
 def test_hard_sync_aborts_on_set_url_failure_does_not_fetch() -> None:

@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from maki_common.repo import RepoEntry, RepoRegistry, redact_token
+from maki_common.repo import RepoEntry, RepoRegistry, _auth_config_args, redact_token
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -32,18 +32,30 @@ def _safe_path(repo_path: str, relative: str) -> Path | None:
     return target
 
 
-async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
+async def _run_git(
+    repo_path: str,
+    *args: str,
+    token: str | None = None,
+) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr).
+
+    When *token* is supplied, the GitHub installation token is injected via
+    ``git -c http.extraheader=...`` so it authenticates this single
+    invocation without ever landing in ``<repo>/.git/config`` (issue #347).
+    Local-only operations (status, diff, add, commit, rev-parse) don't
+    need a token; remote operations (push, pull, fetch) do.
 
     stdout/stderr are pre-redacted of any GitHub token — git's own error
     messages echo the full remote URL (including `x-access-token:TOKEN@`),
     and that text flows into both structured logs and MCP results.
     """
+    cmd_args: list[str] = []
+    if token:
+        cmd_args.extend(_auth_config_args(token))
+    cmd_args.extend(["-C", repo_path, *args])
     proc = await asyncio.create_subprocess_exec(
         "git",
-        "-C",
-        repo_path,
-        *args,
+        *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -396,14 +408,19 @@ def make_code_edit_tools(
             if rc != 0:
                 return mcp_result(f"Commit failed: {stderr}")
 
-            # Set remote URL with fresh token for push
+            # Mint a fresh installation token for the push. The token is
+            # injected per-invocation via `git -c http.extraheader=...`
+            # (issue #347) — never written to `.git/config`. We also rewrite
+            # origin to the token-free URL to scrub any legacy embedded-token
+            # URL written by older versions of this module.
+            push_token: str | None = None
             if entry.auth and entry.owner and entry.name:
-                token = await entry.auth.get_token()
-                remote_url = f"https://x-access-token:{token}@github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", remote_url)
+                push_token = await entry.auth.get_token()
+                clean_url = f"https://github.com/{entry.owner}/{entry.name}.git"
+                await _run_git(entry.path, "remote", "set-url", "origin", clean_url)
 
             # Push
-            rc, stdout, stderr = await _run_git(entry.path, "push", "origin", "main")
+            rc, stdout, stderr = await _run_git(entry.path, "push", "origin", "main", token=push_token)
             if rc != 0:
                 return mcp_result(f"Push failed: {stderr}")
 
@@ -432,10 +449,15 @@ def make_code_edit_tools(
         if entry is None:
             return mcp_result(err or "")
         try:
+            # Mint a fresh installation token for the pull. Injected
+            # per-invocation via `git -c http.extraheader=...` (issue #347)
+            # — never written to `.git/config`. We also rewrite origin to
+            # the token-free URL to scrub any legacy embedded-token URL.
+            pull_token: str | None = None
             if entry.auth and entry.owner and entry.name:
-                token = await entry.auth.get_token()
-                remote_url = f"https://x-access-token:{token}@github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", remote_url)
+                pull_token = await entry.auth.get_token()
+                clean_url = f"https://github.com/{entry.owner}/{entry.name}.git"
+                await _run_git(entry.path, "remote", "set-url", "origin", clean_url)
 
             # Clear stuck rebase state before pulling — rebase --abort silently
             # fails in some states, so nuke the directory directly.
@@ -447,11 +469,11 @@ def make_code_edit_tools(
                     shutil.rmtree(p)
                     log.warning("Cleared stuck rebase dir", extra={"path": str(p)})
 
-            rc, stdout, stderr = await _run_git(entry.path, "pull", "--rebase", "origin", "main")
+            rc, stdout, stderr = await _run_git(entry.path, "pull", "--rebase", "origin", "main", token=pull_token)
             if rc != 0:
                 if "rebase" in stderr.lower():
                     log.warning("Rebase failed, retrying with merge")
-                    rc, stdout, stderr = await _run_git(entry.path, "pull", "origin", "main")
+                    rc, stdout, stderr = await _run_git(entry.path, "pull", "origin", "main", token=pull_token)
                 if rc != 0:
                     return mcp_result(f"Pull failed: {stderr}")
             return mcp_result(stdout if stdout.strip() else "Already up to date.")
