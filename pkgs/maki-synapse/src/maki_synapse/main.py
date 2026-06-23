@@ -374,6 +374,14 @@ async def chat_completions(req: ChatCompletionRequest):
                     raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
     except HTTPException:
         raise
+    except TimeoutError:
+        # The wrapper enforces a hard per-call deadline (DEFAULT_INVOKE_TIMEOUT_S);
+        # surfacing str(e) here would leak elapsed-seconds and prompt metadata
+        # into a public-ish error body. Keep the body opaque ("upstream timeout")
+        # and rely on the structured log inside invoke_claude for triage
+        # (mode, prompt_len, elapsed_ms). Also pairs with #158. See #350.
+        log.warning("Claude invocation timed out")
+        raise HTTPException(status_code=502, detail="upstream timeout")
     except Exception as e:
         log.exception("Claude invocation failed")
         raise HTTPException(status_code=502, detail=str(e))

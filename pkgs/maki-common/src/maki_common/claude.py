@@ -13,6 +13,19 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+# Default per-call deadlines applied inside the wrapper so callers don't need
+# to remember to wrap each invocation with asyncio.wait_for. A stuck claude
+# CLI subprocess (OAuth refresh stall, MCP livelock under max_turns>1,
+# uncancellable sandbox fork) would otherwise pin the calling coroutine
+# forever — silently wedging synapse (3-slot semaphore) and immune escalation
+# while heartbeats still report healthy. See issue #350.
+#
+# Picked generously: single-shot Mem0 / immune calls finish in seconds, but
+# multi-turn agentic work with tool use can legitimately run minutes.
+DEFAULT_INVOKE_TIMEOUT_S = 600.0
+DEFAULT_STREAM_TIMEOUT_S = 1800.0
+
+
 @dataclass
 class TokenUsage:
     """Token usage and cost captured from a Claude SDK ResultMessage."""
@@ -103,6 +116,24 @@ async def _maybe_acquire(semaphore: asyncio.Semaphore | None) -> AsyncIterator[N
             yield
 
 
+@contextlib.asynccontextmanager
+async def _maybe_timeout(timeout: float | None) -> AsyncIterator[None]:
+    """Apply ``asyncio.timeout(timeout)`` if non-None, otherwise no-op.
+
+    Wrapped as a context manager so call sites stay flat — both
+    ``invoke_claude`` and ``stream_claude`` need the same "timeout or
+    nothing" semantics around their ``async for`` loop, and threading an
+    ``if timeout is None`` branch through both would duplicate the loop
+    body. ``contextlib.nullcontext`` supports ``async with`` (3.10+) but
+    constructing it inline reads worse than this two-line helper.
+    """
+    if timeout is None:
+        yield
+    else:
+        async with asyncio.timeout(timeout):
+            yield
+
+
 async def _run_query(
     prompt: str,
     options: Any,
@@ -149,6 +180,7 @@ async def invoke_claude(
     mcp_servers: dict[str, Any] | None = None,
     mode: str = "",
     system_prompt: str | None = None,
+    timeout: float | None = DEFAULT_INVOKE_TIMEOUT_S,
 ) -> tuple[str, TokenUsage]:
     """Claude invocation via Agent SDK.
 
@@ -162,13 +194,25 @@ async def invoke_claude(
         system_prompt: Static system context (identity, memories, graph). Kept
             separate from the human prompt so conversation history cannot bleed
             into the system context and vice versa.
+        timeout: Hard deadline in seconds for the whole SDK loop. ``None``
+            disables it. Default ``DEFAULT_INVOKE_TIMEOUT_S`` (600s) so callers
+            inherit protection without per-site plumbing — see #350. A stuck
+            CLI subprocess (OAuth stall, MCP livelock) would otherwise pin
+            the caller indefinitely. On expiry, raises ``TimeoutError``
+            (after logging ``mode`` / ``prompt_len`` / ``elapsed_ms``); callers
+            map it to the appropriate failure mode (synapse → HTTP 502,
+            immune → mark escalation failed).
 
     Returns:
         Tuple of (response_text, token_usage).
+
+    Raises:
+        TimeoutError: If the SDK loop exceeds ``timeout`` seconds.
     """
     options = _build_options(model, max_turns, mcp_servers, system_prompt)
     text_parts: list[str] = []
     usage_box: list[TokenUsage] = []
+    t0 = time.monotonic()
     async with _maybe_acquire(semaphore):
         log.info(
             "Invoking Claude",
@@ -178,10 +222,29 @@ async def invoke_claude(
                 "max_turns": max_turns,
                 "mcp_server_count": len(mcp_servers) if mcp_servers else 0,
                 "mode": mode,
+                "timeout_s": timeout,
             },
         )
-        async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=usage_box):
-            text_parts.append(chunk)
+        try:
+            async with _maybe_timeout(timeout):
+                async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=usage_box):
+                    text_parts.append(chunk)
+        except TimeoutError:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.error(
+                "Claude invocation timeout",
+                extra={
+                    "mode": mode,
+                    "prompt_len": len(prompt),
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "timeout_s": timeout,
+                    "model": model,
+                },
+            )
+            # Re-raise as a fresh TimeoutError so callers (synapse, immune)
+            # can pattern-match without depending on whichever asyncio
+            # exception type the context manager surfaced.
+            raise TimeoutError(f"Claude invocation exceeded {timeout}s (mode={mode!r})") from None
     result = "\n".join(text_parts)
     log.info("Claude response received", extra={"response_len": len(result)})
     usage = usage_box[0] if usage_box else TokenUsage(model=model, mode=mode)
@@ -197,6 +260,7 @@ async def stream_claude(
     mode: str = "",
     usage_out: list[TokenUsage] | None = None,
     system_prompt: str | None = None,
+    timeout: float | None = DEFAULT_STREAM_TIMEOUT_S,
 ) -> AsyncIterator[str]:
     """Stream Claude responses, yielding each assistant text block as it arrives.
 
@@ -209,17 +273,48 @@ async def stream_claude(
         system_prompt: Static system context (identity, memories, graph). Kept
             separate from the human prompt so conversation history cannot bleed
             into the system context and vice versa.
+        timeout: Hard deadline in seconds for the whole stream. ``None``
+            disables it. Default ``DEFAULT_STREAM_TIMEOUT_S`` (1800s) — more
+            generous than ``invoke_claude`` because multi-turn agentic work
+            with tool use legitimately runs longer than single-shot calls.
+            On expiry, raises ``TimeoutError`` (after logging ``mode`` /
+            ``prompt_len`` / ``elapsed_ms``). See #350.
+
+    Raises:
+        TimeoutError: If the stream exceeds ``timeout`` seconds.
     """
     options = _build_options(model, max_turns, mcp_servers, system_prompt)
     local_usage: list[TokenUsage] = []
+    t0 = time.monotonic()
     async with _maybe_acquire(semaphore):
         log.info(
             "Streaming Claude",
-            extra={"model": model, "max_turns": max_turns, "prompt_len": len(prompt), "mode": mode},
+            extra={
+                "model": model,
+                "max_turns": max_turns,
+                "prompt_len": len(prompt),
+                "mode": mode,
+                "timeout_s": timeout,
+            },
         )
-        async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=local_usage):
-            log.info("Stream chunk", extra={"chunk_len": len(chunk)})
-            yield chunk
+        try:
+            async with _maybe_timeout(timeout):
+                async for chunk in _run_query(prompt, options, model=model, mode=mode, usage_out=local_usage):
+                    log.info("Stream chunk", extra={"chunk_len": len(chunk)})
+                    yield chunk
+        except TimeoutError:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.error(
+                "Claude stream timeout",
+                extra={
+                    "mode": mode,
+                    "prompt_len": len(prompt),
+                    "elapsed_ms": round(elapsed_ms, 1),
+                    "timeout_s": timeout,
+                    "model": model,
+                },
+            )
+            raise TimeoutError(f"Claude stream exceeded {timeout}s (mode={mode!r})") from None
     if usage_out is not None and local_usage:
         usage_out.append(local_usage[0])
     log.info("Stream complete")
