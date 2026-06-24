@@ -10,7 +10,13 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from maki_common import kv_get_float, parse_config_tags, spawn_background, strip_tags
+from maki_common import (
+    format_system_state_lines,
+    kv_get_float,
+    parse_config_tags,
+    spawn_background,
+    strip_tags,
+)
 from maki_common.config import apply_config_updates
 from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
 
@@ -141,11 +147,7 @@ def _build_idle_system_prompt(
     system_state = idle_context.get("system_state", {})
     config = idle_context.get("current_config", {})
 
-    state_lines = []
-    for name, info in system_state.items():
-        if isinstance(info, dict):
-            details = ", ".join(f"{k}={v}" for k, v in info.items())
-            state_lines.append(f"- {name}: {details}")
+    state_lines = format_system_state_lines(system_state)
     state_str = "\n".join(state_lines) if state_lines else "No data available"
 
     config_str = "\n".join(f"- {k}: {v}" for k, v in config.items())

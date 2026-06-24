@@ -11,7 +11,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from croniter import croniter
-from maki_common import kv_put_float, load_kv_config, try_claim_loop
+from maki_common import (
+    format_graph_block,
+    format_memories_block,
+    kv_put_float,
+    load_kv_config,
+    try_claim_loop,
+)
 
 log = logging.getLogger(__name__)
 
@@ -160,12 +166,13 @@ def assemble_loop_prompt(
     parts.append(main_section)
 
     # --- Dynamic tail (changes per turn) ---
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+    memories_block = format_memories_block(memories)
+    if memories_block:
+        parts.append(memories_block)
 
-    if graph_context:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
+    graph_block = format_graph_block(graph_context)
+    if graph_block:
+        parts.append(graph_block)
 
     return "\n\n".join(parts)
 

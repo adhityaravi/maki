@@ -14,7 +14,15 @@ import os
 import time
 import uuid
 
-from maki_common import configure_logging, connect_nats, init_kv, subscribe_supervised
+from maki_common import (
+    configure_logging,
+    connect_nats,
+    format_graph_block,
+    format_memories_block,
+    format_system_state_lines,
+    init_kv,
+    subscribe_supervised,
+)
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
 from maki_common.repo import SyncError, hard_sync, redact_token
@@ -268,24 +276,19 @@ def build_system_prompt(turn: dict) -> str:
     system_state = turn.get("system_state")
     system_state_summary = turn.get("system_state_summary")
     if system_state and isinstance(system_state, dict):
-        state_lines = []
-        for name, info in system_state.items():
-            if isinstance(info, dict):
-                details = ", ".join(f"{k}={v}" for k, v in info.items())
-                state_lines.append(f"- {name}: {details}")
+        state_lines = format_system_state_lines(system_state)
         if state_lines:
             parts.append("## Your system state\n" + "\n".join(state_lines))
     elif system_state_summary:
         parts.append(f"## System: {system_state_summary}")
 
-    memories = turn.get("memories", [])
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+    memories_block = format_memories_block(turn.get("memories", []))
+    if memories_block:
+        parts.append(memories_block)
 
-    graph = turn.get("graph_context", [])
-    if graph:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph))
+    graph_block = format_graph_block(turn.get("graph_context", []))
+    if graph_block:
+        parts.append(graph_block)
 
     session_summary = turn.get("session_summary", "")
     if session_summary:

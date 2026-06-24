@@ -12,6 +12,11 @@ from maki_common.nats import (
     subscribe_supervised,
     try_claim_loop,
 )
+from maki_common.prompts import (
+    format_graph_block,
+    format_memories_block,
+    format_system_state_lines,
+)
 from maki_common.tasks import active_background_task_count, spawn_background
 
 __version__ = "0.1.0"
@@ -22,6 +27,9 @@ __all__ = [
     "apply_config_updates",
     "configure_logging",
     "connect_nats",
+    "format_graph_block",
+    "format_memories_block",
+    "format_system_state_lines",
     "get_logger",
     "init_kv",
     "kv_get_float",
