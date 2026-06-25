@@ -15,7 +15,7 @@ from urllib.parse import quote_plus
 
 import neo4j
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from maki_common import configure_logging, connect_nats
 from maki_common.subjects import IMMUNE_ALERT
@@ -742,6 +742,35 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="maki-recall", version="0.0.1", lifespan=lifespan)
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all 500 handler — log with traceback, return a generic body.
+
+    Centralises the five copy-pasted ``except Exception: raise HTTPException(500,
+    detail=str(e))`` blocks the data endpoints used to carry. Two reasons that
+    pattern was wrong:
+
+      * ``detail=str(e)`` leaks internal exception strings — DB URIs, credential
+        fragments, stack hints — to whatever calls /memories. The generic body
+        here exposes only the HTTP status text.
+      * Every error became a 500 regardless of cause. ``HTTPException`` raised
+        explicitly by handlers (e.g. the 400 from ``_require_identifier`` or
+        the 503 from ``_require_memory``) is dispatched by FastAPI's own more-
+        specific handler and never reaches this one, so 4xx responses still
+        work as written.
+
+    The traceback is still captured in logs via ``log.exception``, which is
+    what the per-endpoint blocks did before — just once, in one place.
+    """
+    log.exception(
+        "Unhandled error on %s %s",
+        request.method,
+        request.url.path,
+        extra={"error_type": type(exc).__name__},
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
 class MemoryCreate(BaseModel):
     messages: list[dict[str, str]] = Field(..., description="List of {role, content} messages.")
     user_id: str | None = None
@@ -767,6 +796,41 @@ def _require_memory() -> Memory:
     if memory is None:
         raise HTTPException(status_code=503, detail="Mem0 initializing")
     return memory
+
+
+def _require_identifier(
+    user_id: str | None,
+    agent_id: str | None,
+    run_id: str | None,
+) -> None:
+    """Raise 400 unless at least one mem0 entity identifier is provided.
+
+    Mem0's storage model is keyed by ``user_id``/``agent_id``/``run_id``; a
+    request with none of them set has no scope and would either error deep
+    inside mem0 or — worse — operate over every entity. Reject early with
+    a clean 4xx instead of letting the catch-all handler return 500.
+    """
+    if not any([user_id, agent_id, run_id]):
+        raise HTTPException(status_code=400, detail="At least one identifier required.")
+
+
+def _identifier_params(
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Return a kwargs dict of the non-None mem0 identifier params.
+
+    Centralises the ``{k: v for k, v in {...}.items() if v is not None}``
+    comprehension that used to live in four endpoints. Suitable both for
+    direct kwarg-splat into ``mem.get_all``/``mem.delete_all`` and for
+    building the ``filters={}`` dict that ``mem.search`` expects.
+
+    Return type is ``dict[str, Any]`` rather than ``dict[str, str]`` so
+    callers can extend the dict with non-string mem0 kwargs (e.g.
+    ``metadata=dict[str, Any]`` in ``add_memory``) without a cast.
+    """
+    return {k: v for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id)) if v is not None}
 
 
 def _probe_pgvector() -> str | None:
@@ -1047,27 +1111,18 @@ async def health():
 @app.post("/memories")
 def add_memory(req: MemoryCreate):
     mem = _require_memory()
-    if not any([req.user_id, req.agent_id, req.run_id]):
-        raise HTTPException(status_code=400, detail="At least one identifier required.")
-    params = {k: v for k, v in req.model_dump().items() if v is not None and k != "messages"}
-    try:
-        return JSONResponse(content=mem.add(messages=req.messages, **params))
-    except Exception as e:
-        log.exception("Error adding memory")
-        raise HTTPException(status_code=500, detail=str(e))
+    _require_identifier(req.user_id, req.agent_id, req.run_id)
+    params = _identifier_params(req.user_id, req.agent_id, req.run_id)
+    if req.metadata is not None:
+        params["metadata"] = req.metadata
+    return JSONResponse(content=mem.add(messages=req.messages, **params))
 
 
 @app.get("/memories")
 def get_memories(user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None):
     mem = _require_memory()
-    if not any([user_id, agent_id, run_id]):
-        raise HTTPException(status_code=400, detail="At least one identifier required.")
-    params = {k: v for k, v in {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}.items() if v is not None}
-    try:
-        return mem.get_all(**params)
-    except Exception as e:
-        log.exception("Error getting memories")
-        raise HTTPException(status_code=500, detail=str(e))
+    _require_identifier(user_id, agent_id, run_id)
+    return mem.get_all(**_identifier_params(user_id, agent_id, run_id))
 
 
 @app.post("/search")
@@ -1075,43 +1130,28 @@ def search_memories(req: SearchRequest):
     mem = _require_memory()
     # mem0 requires entity identifiers (user_id, agent_id, run_id) inside filters={},
     # not as top-level kwargs — only limit stays top-level.
-    identity_keys = {"user_id", "agent_id", "run_id"}
-    filters = {k: v for k, v in req.model_dump().items() if v is not None and k in identity_keys}
+    filters = _identifier_params(req.user_id, req.agent_id, req.run_id)
     kwargs: dict[str, Any] = {}
     if filters:
         kwargs["filters"] = filters
     if req.limit is not None:
         kwargs["limit"] = req.limit
-    try:
-        return mem.search(query=req.query, **kwargs)
-    except Exception as e:
-        log.exception("Error searching memories")
-        raise HTTPException(status_code=500, detail=str(e))
+    return mem.search(query=req.query, **kwargs)
 
 
 @app.delete("/memories/{memory_id}")
 def delete_memory(memory_id: str):
     mem = _require_memory()
-    try:
-        mem.delete(memory_id=memory_id)
-        return {"message": "Memory deleted"}
-    except Exception as e:
-        log.exception("Error deleting memory")
-        raise HTTPException(status_code=500, detail=str(e))
+    mem.delete(memory_id=memory_id)
+    return {"message": "Memory deleted"}
 
 
 @app.delete("/memories")
 def delete_all_memories(user_id: str | None = None, agent_id: str | None = None, run_id: str | None = None):
     mem = _require_memory()
-    if not any([user_id, agent_id, run_id]):
-        raise HTTPException(status_code=400, detail="At least one identifier required.")
-    params = {k: v for k, v in {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}.items() if v is not None}
-    try:
-        mem.delete_all(**params)
-        return {"message": "All memories deleted"}
-    except Exception as e:
-        log.exception("Error deleting memories")
-        raise HTTPException(status_code=500, detail=str(e))
+    _require_identifier(user_id, agent_id, run_id)
+    mem.delete_all(**_identifier_params(user_id, agent_id, run_id))
+    return {"message": "All memories deleted"}
 
 
 def cli():
