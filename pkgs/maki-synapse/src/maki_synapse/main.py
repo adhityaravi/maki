@@ -20,6 +20,18 @@ Accepted-but-ignored (claude_agent_sdk.invoke_claude does not expose them):
 Response echoes the actual Claude model that served the request, not the
 `model` field from the request — `invoke_claude` always uses the `MODEL`
 env var, and lying about it would mislead clients that log/assert on it.
+
+Internal shape
+--------------
+``chat_completions`` is intentionally thin — it delegates to three single-
+responsibility helpers so each piece can be unit-tested without spinning up
+FastAPI or mocking NATS (see #112):
+
+  - ``_build_system_and_user(req) -> PromptBundle`` — validate + assemble.
+  - ``_invoke_with_json_retry(...)`` — call Claude with one corrective retry
+    on JSON-mode parse failure, accumulating token usage across both calls.
+  - ``_parse_response(text, has_tools=...)`` — decode tool_calls JSON,
+    falling back to plain text on shape mismatch.
 """
 
 import asyncio
@@ -29,6 +41,7 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -45,6 +58,15 @@ _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 SUPPORTED_TOOL_CHOICE = ("auto", "none", "required")
+
+# Appended to the system prompt when response_format={"type":"json_object"}.
+# Kept as a module constant so the wording is reviewable in one place — the
+# model is sensitive to "no markdown fencing" being literal.
+JSON_MODE_INSTRUCTION = (
+    "\n\nIMPORTANT: You MUST respond with valid JSON only. "
+    "No explanation, no markdown fencing, no text before or after the JSON. "
+    "Output a single JSON object starting with { and ending with }."
+)
 
 app = FastAPI(title="maki-synapse", version="0.0.1")
 
@@ -208,6 +230,31 @@ def extract_json_str(text: str) -> str:
     return text
 
 
+def try_parse_json_lenient(text: str) -> tuple[Any, str]:
+    """Extract and parse JSON from text with markdown/preamble tolerance.
+
+    Returns ``(parsed, cleaned)``:
+      - ``parsed`` is the decoded value, or ``None`` when extraction produced
+        invalid JSON.
+      - ``cleaned`` is always ``extract_json_str(text)`` so callers in JSON
+        mode can swap a markdown-fenced response for the bare JSON payload
+        without re-running extraction.
+
+    ``parsed`` is typed ``Any`` rather than ``dict | None`` because
+    ``extract_json_str`` also recognizes top-level arrays — we accept them
+    rather than re-classify them as not-JSON.
+
+    Consolidates the ``extract_json_str(text) + json.loads(raw)`` pattern
+    that previously lived inline at all three call sites in chat_completions
+    (see #112).
+    """
+    raw = extract_json_str(text)
+    try:
+        return json.loads(raw), raw
+    except json.JSONDecodeError:
+        return None, raw
+
+
 # --- Token usage helpers ---
 
 
@@ -265,6 +312,189 @@ def _log_ignored_fields(req: ChatCompletionRequest) -> None:
         )
 
 
+# --- Request prep / invocation / response parsing ---
+
+
+@dataclass(frozen=True)
+class PromptBundle:
+    """Decoded request: assembled prompts plus the flags downstream needs.
+
+    ``has_tools`` reflects the *effective* tool set after applying
+    ``tool_choice="none"`` filtering, so the parser can use it directly to
+    decide whether to attempt tool_calls extraction.
+    """
+
+    system: str
+    user: str
+    json_mode: bool
+    has_tools: bool
+    tool_choice: str
+
+
+def _build_system_and_user(req: ChatCompletionRequest) -> PromptBundle:
+    """Validate the request and assemble the system + user prompts.
+
+    Owns: tool_choice validation, ignored-field warnings, message flattening,
+    tool-prompt injection, JSON-mode instruction. Returns a frozen bundle so
+    the orchestrator can pass strings + flags around without re-deriving them.
+    """
+    tool_choice = req.tool_choice or "auto"
+    if tool_choice not in SUPPORTED_TOOL_CHOICE:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Unsupported tool_choice: {req.tool_choice!r}. Supported values: {list(SUPPORTED_TOOL_CHOICE)}."),
+        )
+
+    _log_ignored_fields(req)
+
+    system_parts, user_parts = _serialize_messages(req.messages)
+    system_prompt = "\n".join(system_parts)
+
+    # tool_choice="none" means: act as if no tools were supplied.
+    effective_tools = req.tools if tool_choice != "none" else None
+    if effective_tools:
+        system_prompt += build_tool_prompt(effective_tools, required=(tool_choice == "required"))
+
+    json_mode = bool(req.response_format and req.response_format.get("type") == "json_object")
+    if json_mode:
+        system_prompt += JSON_MODE_INSTRUCTION
+
+    return PromptBundle(
+        system=system_prompt,
+        user="\n".join(user_parts),
+        json_mode=json_mode,
+        has_tools=bool(effective_tools),
+        tool_choice=tool_choice,
+    )
+
+
+async def _invoke_with_json_retry(
+    user_prompt: str,
+    system_prompt: str,
+    *,
+    json_mode: bool,
+) -> tuple[str, TokenUsage]:
+    """Invoke Claude, retrying once with a corrective suffix on JSON parse failure.
+
+    Returns ``(text, token_usage)``:
+      - In JSON mode, ``text`` is the *cleaned* extracted JSON (markdown
+        fences and preamble stripped) so the caller can serve it as
+        ``content`` without re-running extraction.
+      - ``token_usage`` is cumulative across both calls when a retry fires —
+        both invocations were billed, so both must be reflected in the
+        OpenAI Usage we surface (fixes #107, which dropped first-call tokens).
+
+    Wraps both invocations in a single try/except so upstream failures map
+    consistently to HTTP 502: TimeoutError → ``"upstream timeout"`` (opaque,
+    because the elapsed-seconds detail leaks deadline metadata; see #350),
+    other exceptions → ``str(e)``. A retry that still fails to parse JSON
+    also raises 502 with the accumulated usage logged for cost triage.
+    """
+    try:
+        text, token_usage = await invoke_claude(
+            user_prompt,
+            model=MODEL,
+            semaphore=_semaphore,
+            system_prompt=system_prompt or None,
+            mode="synapse_proxy",
+        )
+        log.info("Claude response", extra={"response_len": len(text)})
+
+        if not json_mode:
+            return text, token_usage
+
+        # JSON mode: validate extraction. On success the cleaned string replaces
+        # text so callers receive a clean json.loads-able payload, not the
+        # original markdown-fenced version.
+        parsed, cleaned = try_parse_json_lenient(text)
+        if parsed is not None:
+            return cleaned, token_usage
+
+        log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
+        retry_prompt = (
+            f"{user_prompt}\n\n"
+            "Your previous response was not valid JSON. "
+            "Respond with ONLY the raw JSON object. No other text."
+        )
+        retry_text, retry_usage = await invoke_claude(
+            retry_prompt,
+            model=MODEL,
+            semaphore=_semaphore,
+            system_prompt=system_prompt or None,
+            mode="synapse_proxy_retry",
+        )
+        # Both calls were billed — accumulate so the OpenAI Usage we return
+        # reflects the real cost, not just the retry's.
+        token_usage = _add_token_usages(token_usage, retry_usage)
+        log.info("Retry response", extra={"response_len": len(retry_text)})
+
+        retry_parsed, retry_cleaned = try_parse_json_lenient(retry_text)
+        if retry_parsed is not None:
+            return retry_cleaned, token_usage
+
+        # Log the accumulated cost so the wasted attempt is visible in
+        # telemetry even though the 502 response body carries no usage field.
+        log.error(
+            "JSON retry also failed, returning 502",
+            extra={
+                "raw_preview": retry_text[:200],
+                "token_usage": token_usage.to_log_dict(),
+            },
+        )
+        raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
+    except HTTPException:
+        raise
+    except TimeoutError:
+        # The wrapper enforces a hard per-call deadline (DEFAULT_INVOKE_TIMEOUT_S);
+        # surfacing str(e) here would leak elapsed-seconds and prompt metadata
+        # into a public-ish error body. Keep the body opaque ("upstream timeout")
+        # and rely on the structured log inside invoke_claude for triage
+        # (mode, prompt_len, elapsed_ms). Also pairs with #158. See #350.
+        log.warning("Claude invocation timed out")
+        raise HTTPException(status_code=502, detail="upstream timeout")
+    except Exception as e:
+        log.exception("Claude invocation failed")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _parse_response(text: str, *, has_tools: bool) -> tuple[ResponseMessage, str]:
+    """Decode Claude's text output into ``(ResponseMessage, finish_reason)``.
+
+    With tools enabled and non-empty text, attempts to extract a
+    ``{"tool_calls": [...]}`` payload. Falls back to plain text whenever the
+    output is malformed JSON, the JSON shape doesn't match, or individual
+    tool_call entries are missing required fields.
+    """
+    if not (has_tools and text.strip()):
+        return ResponseMessage(content=text), "stop"
+
+    parsed, _ = try_parse_json_lenient(text)
+    if parsed is None:
+        # Preserve the original log: when tools are enabled and Claude
+        # returns something that doesn't parse, callers want a breadcrumb.
+        log.warning("Failed to parse tool response, returning as text")
+        return ResponseMessage(content=text), "stop"
+    if not isinstance(parsed, dict) or "tool_calls" not in parsed:
+        return ResponseMessage(content=text), "stop"
+
+    try:
+        tool_calls = [
+            ToolCallItem(
+                id=f"call_{uuid.uuid4().hex[:8]}",
+                function=ToolCallFunction(
+                    name=tc["name"],
+                    arguments=(json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"]),
+                ),
+            )
+            for tc in parsed["tool_calls"]
+        ]
+    except (KeyError, TypeError) as e:
+        log.warning("Failed to parse tool response, returning as text", extra={"error": str(e)})
+        return ResponseMessage(content=text), "stop"
+
+    return ResponseMessage(content=None, tool_calls=tool_calls), "tool_calls"
+
+
 # --- Endpoints ---
 
 
@@ -280,144 +510,30 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # Validate tool_choice up front — silent mis-handling is the whole point
-    # of this endpoint's prior bug.
-    tool_choice = req.tool_choice or "auto"
-    if tool_choice not in SUPPORTED_TOOL_CHOICE:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Unsupported tool_choice: {req.tool_choice!r}. Supported values: {list(SUPPORTED_TOOL_CHOICE)}."),
-        )
+    """OpenAI-compatible chat completions.
 
-    _log_ignored_fields(req)
-
-    system_parts, user_parts = _serialize_messages(req.messages)
-    system_prompt = "\n".join(system_parts)
-
-    # tool_choice="none" means: act as if no tools were supplied.
-    effective_tools = req.tools if tool_choice != "none" else None
-
-    if effective_tools:
-        system_prompt += build_tool_prompt(effective_tools, required=(tool_choice == "required"))
-
-    json_mode = req.response_format and req.response_format.get("type") == "json_object"
-    if json_mode:
-        system_prompt += (
-            "\n\nIMPORTANT: You MUST respond with valid JSON only. "
-            "No explanation, no markdown fencing, no text before or after the JSON. "
-            "Output a single JSON object starting with { and ending with }."
-        )
-
-    user_prompt = "\n".join(user_parts)
+    Thin orchestrator: build → invoke → parse. Each step lives in its own
+    helper so this body fits on one screen and the helpers are unit-testable
+    without spinning up FastAPI or mocking NATS (see #112).
+    """
+    prompt = _build_system_and_user(req)
     request_id = f"synapse-{uuid.uuid4().hex[:12]}"
 
-    try:
-        log.info(
-            "Invoking Claude",
-            extra={
-                "tools": bool(effective_tools),
-                "tool_choice": tool_choice,
-                "user_prompt_len": len(user_prompt),
-            },
-        )
-        text, token_usage = await invoke_claude(
-            user_prompt,
-            model=MODEL,
-            semaphore=_semaphore,
-            system_prompt=system_prompt or None,
-            mode="synapse_proxy",
-        )
-        log.info("Claude response", extra={"response_len": len(text)})
-
-        # JSON mode: validate extraction, retry once on failure.
-        # On success, replace text with the extracted JSON so callers receive a
-        # clean json.loads-able payload (not the original markdown-fenced text).
-        if json_mode:
-            raw = extract_json_str(text)
-            try:
-                json.loads(raw)
-                text = raw
-            except json.JSONDecodeError:
-                log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
-                retry_prompt = (
-                    f"{user_prompt}\n\n"
-                    "Your previous response was not valid JSON. "
-                    "Respond with ONLY the raw JSON object. No other text."
-                )
-                retry_text, retry_usage = await invoke_claude(
-                    retry_prompt,
-                    model=MODEL,
-                    semaphore=_semaphore,
-                    system_prompt=system_prompt or None,
-                    mode="synapse_proxy_retry",
-                )
-                # Both calls were billed — accumulate so the OpenAI Usage we
-                # return reflects the real cost, not just the retry's.
-                token_usage = _add_token_usages(token_usage, retry_usage)
-                text = retry_text
-                log.info("Retry response", extra={"response_len": len(text)})
-                retry_raw = extract_json_str(text)
-                try:
-                    json.loads(retry_raw)
-                    text = retry_raw
-                except json.JSONDecodeError:
-                    # Log the accumulated cost so the wasted attempt is
-                    # visible in telemetry even though the 502 response body
-                    # carries no usage field.
-                    log.error(
-                        "JSON retry also failed, returning 502",
-                        extra={
-                            "raw_preview": text[:200],
-                            "token_usage": token_usage.to_log_dict(),
-                        },
-                    )
-                    raise HTTPException(status_code=502, detail="Model failed to return valid JSON after retry")
-    except HTTPException:
-        raise
-    except TimeoutError:
-        # The wrapper enforces a hard per-call deadline (DEFAULT_INVOKE_TIMEOUT_S);
-        # surfacing str(e) here would leak elapsed-seconds and prompt metadata
-        # into a public-ish error body. Keep the body opaque ("upstream timeout")
-        # and rely on the structured log inside invoke_claude for triage
-        # (mode, prompt_len, elapsed_ms). Also pairs with #158. See #350.
-        log.warning("Claude invocation timed out")
-        raise HTTPException(status_code=502, detail="upstream timeout")
-    except Exception as e:
-        log.exception("Claude invocation failed")
-        raise HTTPException(status_code=502, detail=str(e))
-
-    usage = _map_usage(token_usage)
-
-    # Parse response
-    message: ResponseMessage
-    finish_reason = "stop"
-
-    if effective_tools and text.strip():
-        try:
-            raw = extract_json_str(text)
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and "tool_calls" in parsed:
-                tool_calls = [
-                    ToolCallItem(
-                        id=f"call_{uuid.uuid4().hex[:8]}",
-                        function=ToolCallFunction(
-                            name=tc["name"],
-                            arguments=(
-                                json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"]
-                            ),
-                        ),
-                    )
-                    for tc in parsed["tool_calls"]
-                ]
-                message = ResponseMessage(content=None, tool_calls=tool_calls)
-                finish_reason = "tool_calls"
-            else:
-                message = ResponseMessage(content=text)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            log.warning("Failed to parse tool response, returning as text", extra={"error": str(e)})
-            message = ResponseMessage(content=text)
-    else:
-        message = ResponseMessage(content=text)
+    log.info(
+        "Invoking Claude",
+        extra={
+            "tool_choice": prompt.tool_choice,
+            "has_tools": prompt.has_tools,
+            "json_mode": prompt.json_mode,
+            "user_prompt_len": len(prompt.user),
+        },
+    )
+    text, token_usage = await _invoke_with_json_retry(
+        prompt.user,
+        prompt.system,
+        json_mode=prompt.json_mode,
+    )
+    message, finish_reason = _parse_response(text, has_tools=prompt.has_tools)
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{request_id}",
@@ -427,7 +543,7 @@ async def chat_completions(req: ChatCompletionRequest):
         # mislead clients that log or assert on response.model.
         model=MODEL,
         choices=[Choice(message=message, finish_reason=finish_reason)],
-        usage=usage,
+        usage=_map_usage(token_usage),
     )
 
 
