@@ -11,7 +11,14 @@ import os
 import uuid
 
 import discord
-from maki_common import PendingQueues, configure_logging, connect_nats, init_kv, subscribe_supervised
+from maki_common import (
+    PendingQueues,
+    configure_logging,
+    connect_nats,
+    init_kv,
+    kv_acquire_lease,
+    subscribe_supervised,
+)
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
@@ -661,32 +668,8 @@ async def _send_response(channel, text: str):
 
 
 async def _try_acquire_leadership() -> bool:
-    """Try to become the ears leader via NATS KV CAS."""
-    import json as _json
-    import time as _time
-
-    now = _time.time()
-    claim = _json.dumps({"instance": INSTANCE_ID, "claimed_at": now}).encode()
-
-    try:
-        entry = await _lock_kv.get(LEADER_KEY)
-        data = _json.loads(entry.value.decode())
-        # If current leader's claim is fresh, we're not the leader
-        if now - data.get("claimed_at", 0) < LEADER_TTL:
-            if data.get("instance") == INSTANCE_ID:
-                # We're already the leader — renew
-                await _lock_kv.update(LEADER_KEY, claim, entry.revision)
-                return True
-            return False
-        # Claim expired — try to take over
-        await _lock_kv.update(LEADER_KEY, claim, entry.revision)
-        return True
-    except Exception:
-        try:
-            await _lock_kv.create(LEADER_KEY, claim)
-            return True
-        except Exception:
-            return False
+    """Try to become the ears leader via the shared KV-lease primitive."""
+    return await kv_acquire_lease(_lock_kv, LEADER_KEY, LEADER_TTL, INSTANCE_ID, allow_renew=True)
 
 
 def _create_bot():
@@ -769,9 +752,6 @@ async def main():
             log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
 
         await asyncio.sleep(LEADER_TTL)
-
-    await _nc.close()
-    log.info("NATS connection closed")
 
 
 def cli():

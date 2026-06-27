@@ -6,6 +6,7 @@ from maki_common.logging import configure_logging, get_logger
 from maki_common.nats import (
     connect_nats,
     init_kv,
+    kv_acquire_lease,
     kv_get_float,
     kv_put_float,
     load_kv_config,
@@ -32,6 +33,7 @@ __all__ = [
     "format_system_state_lines",
     "get_logger",
     "init_kv",
+    "kv_acquire_lease",
     "kv_get_float",
     "kv_put_float",
     "load_kv_config",

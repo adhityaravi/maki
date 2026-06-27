@@ -109,11 +109,74 @@ async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, An
     return config
 
 
+async def kv_acquire_lease(
+    kv: KeyValue,
+    key: str,
+    ttl: float,
+    instance_id: str,
+    *,
+    allow_renew: bool = False,
+) -> bool:
+    """Acquire a TTL-bounded lease via NATS KV optimistic CAS.
+
+    A single primitive that covers two patterns:
+
+    * One-shot loop claim (``allow_renew=False``): used to gate periodic work
+      across replicas. The current holder cannot re-claim within ``ttl``
+      seconds — they must wait for the claim to expire. Used by
+      :func:`try_claim_loop`.
+    * Renewable lease (``allow_renew=True``): used for singleton leader
+      election. The current holder refreshes their own claim before it
+      expires; another instance can only take over after expiry.
+
+    Args:
+        kv: KV bucket (e.g. maki-lock).
+        key: Lease key (e.g. "ears.leader", "loop.stem.idle").
+        ttl: Lease duration in seconds.
+        instance_id: Unique ID for this process instance.
+        allow_renew: If True and we're the current holder of a fresh claim,
+            renew it via CAS. If False, return False without renewing.
+
+    Returns:
+        True if this instance now holds the lease, False otherwise.
+    """
+    now = time.time()
+    claim = json.dumps({"instance": instance_id, "claimed_at": now}).encode()
+
+    try:
+        entry = await kv.get(key)
+        data = json.loads(entry.value.decode())
+        if now - data.get("claimed_at", 0) < ttl:
+            if allow_renew and data.get("instance") == instance_id:
+                # We're already the holder — renew the lease via CAS
+                try:
+                    await kv.update(key, claim, entry.revision)
+                    return True
+                except Exception:
+                    return False
+            return False
+        # Lease expired — try to take over via CAS
+        try:
+            await kv.update(key, claim, entry.revision)
+            return True
+        except Exception:
+            return False
+    except nats.js.errors.KeyNotFoundError:
+        try:
+            await kv.create(key, claim)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
 async def try_claim_loop(kv: KeyValue, key: str, interval: float, instance_id: str) -> bool:
     """Try to claim a periodic loop iteration via NATS KV CAS.
 
-    Prevents multiple instances from running the same timed loop concurrently.
-    Uses optimistic locking — first instance to update wins, others skip.
+    Thin wrapper around :func:`kv_acquire_lease` with ``allow_renew=False``.
+    Prevents multiple instances from running the same timed loop concurrently
+    — first instance to update wins, others skip.
 
     Args:
         kv: KV bucket (e.g. maki-lock).
@@ -124,25 +187,7 @@ async def try_claim_loop(kv: KeyValue, key: str, interval: float, instance_id: s
     Returns:
         True if this instance should run, False if another claimed it.
     """
-    now = time.time()
-    claim = json.dumps({"instance": instance_id, "claimed_at": now}).encode()
-
-    try:
-        entry = await kv.get(key)
-        data = json.loads(entry.value.decode())
-        if now - data.get("claimed_at", 0) < interval:
-            return False
-        # Claim expired — try to take over via CAS
-        await kv.update(key, claim, entry.revision)
-        return True
-    except nats.js.errors.KeyNotFoundError:
-        try:
-            await kv.create(key, claim)
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
+    return await kv_acquire_lease(kv, key, interval, instance_id, allow_renew=False)
 
 
 async def kv_put_float(kv: KeyValue, key: str, value: float) -> None:
