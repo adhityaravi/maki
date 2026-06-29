@@ -95,20 +95,22 @@ async def trading_signal_listener(nc, db_pool) -> None:
 async def trading_manual_listener(nc, lock_kv) -> None:
     """Handle ``!trade`` commands from ears.
 
-    ADDCASH grows the seed via :func:`maki_common.trading.capital.add_cash`;
-    BUY/SELL are parsed and appended to the trade book via
-    :func:`maki_common.trading.book.append_trade`. Acks are published back
-    to EARS_OUT so Discord can display them.
+    Ears parses with :func:`maki_common.trading.parse_manual_command` and
+    publishes a structured payload (issue #116) — this listener consumes
+    that payload directly and never re-tokenizes the raw command string,
+    so error wording and accepted syntax stay in lock-step across both
+    services.
+
+    ``kind == "addcash"`` grows the seed via
+    :func:`maki_common.trading.add_cash`; ``kind == "trade"`` is appended
+    to the trade book via :func:`maki_common.trading.append_trade`. Acks
+    are published back to EARS_OUT so Discord can display them.
 
     Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
     re-subscribes instead of silently dropping every subsequent !trade
     command (issue #175).
     """
-    from maki_common.trading import (
-        add_cash,
-        append_trade,
-        parse_trade_command,
-    )
+    from maki_common.trading import add_cash, append_trade
 
     async def _ack(text: str) -> None:
         try:
@@ -128,21 +130,10 @@ async def trading_manual_listener(nc, lock_kv) -> None:
     async def _handle(msg) -> None:
         try:
             data = json.loads(msg.data.decode())
-            command = (data.get("command") or "").strip()
-            tokens = command.split()
-            if len(tokens) < 2:
-                return
-            verb = tokens[1].upper()
+            kind = data.get("kind")
 
-            if verb == "ADDCASH":
-                if len(tokens) < 3:
-                    await _ack("❌ ADDCASH: missing amount")
-                    return
-                try:
-                    amount = float(tokens[2])
-                except ValueError:
-                    await _ack(f"❌ ADDCASH: invalid amount `{tokens[2]}`")
-                    return
+            if kind == "addcash":
+                amount = float(data.get("amount_eur") or 0)
                 try:
                     new_seed = await add_cash(lock_kv, amount)
                 except ValueError as exc:
@@ -155,41 +146,39 @@ async def trading_manual_listener(nc, lock_kv) -> None:
                 await _ack(f"💰 +€{amount:.2f} — seed now €{new_seed:.2f}")
                 return
 
-            # BUY / SELL — parse via manual module, append to book if priced
-            try:
-                trade = parse_trade_command(command)
-            except ValueError as exc:
-                await _ack(f"❌ {exc}")
-                return
+            if kind == "trade":
+                symbol = str(data.get("symbol") or "").upper()
+                direction = str(data.get("direction") or "").lower()
+                amount_eur = float(data.get("amount_eur") or 0)
+                raw_price = data.get("price")
+                price: float | None = float(raw_price) if raw_price is not None else None
+                verb_name = direction.upper()
 
-            if trade.price is None:
-                await _ack(
-                    f"⚠️ {trade.direction.name} {trade.symbol} logged without price — "
-                    "not appended to book (price required)"
+                if price is None:
+                    await _ack(f"⚠️ {verb_name} {symbol} logged without price — not appended to book (price required)")
+                    return
+
+                await append_trade(
+                    lock_kv,
+                    symbol,
+                    direction=direction,
+                    price=price,
+                    size_eur=amount_eur,
                 )
+                log.info(
+                    "Manual trade appended to book",
+                    extra={
+                        "symbol": symbol,
+                        "direction": direction,
+                        "amount_eur": amount_eur,
+                        "price": price,
+                    },
+                )
+                emoji = "🟢" if direction == "buy" else "🔴"
+                await _ack(f"{emoji} **{verb_name}** {symbol} €{amount_eur:.2f} @ €{price:.2f} — booked")
                 return
 
-            await append_trade(
-                lock_kv,
-                trade.symbol,
-                direction=trade.direction.value,
-                price=trade.price,
-                size_eur=trade.amount_eur,
-            )
-            log.info(
-                "Manual trade appended to book",
-                extra={
-                    "symbol": trade.symbol,
-                    "direction": trade.direction.value,
-                    "amount_eur": trade.amount_eur,
-                    "price": trade.price,
-                },
-            )
-            emoji = "🟢" if trade.direction.name == "BUY" else "🔴"
-            await _ack(
-                f"{emoji} **{trade.direction.name}** {trade.symbol} "
-                f"€{trade.amount_eur:.2f} @ €{trade.price:.2f} — booked"
-            )
+            log.warning("Unknown manual-trade kind", extra={"kind": kind})
         except Exception:
             log.exception("Failed to process manual trade command")
 

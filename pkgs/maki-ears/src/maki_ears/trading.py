@@ -13,6 +13,12 @@ import logging
 
 import discord
 from maki_common.subjects import EARS_INTERACTION, TRADING_MANUAL_TRADE
+from maki_common.trading import (
+    AddCash,
+    Direction,
+    Trade,
+    parse_manual_command,
+)
 
 log = logging.getLogger(__name__)
 
@@ -253,8 +259,11 @@ async def handle_trade_command(
         !trade {BUY|SELL} {SYMBOL} {AMOUNT_EUR} [@PRICE] [NOTE...]
         !trade ADDCASH {AMOUNT_EUR} [NOTE...]
 
-    Ears does minimal inline validation to give immediate Discord feedback.
-    Full parsing lives in maki-loops' ``manual`` and ``capital`` modules.
+    Parsing is delegated to :func:`maki_common.trading.parse_manual_command`
+    — the same parser stem uses to validate. Ears publishes the parsed,
+    structured payload to NATS so stem never re-tokenizes the raw string;
+    that keeps error wording and accepted syntax in lock-step across both
+    services (see issue #116).
     """
     msg_key = f"msg.{message.id}"
     try:
@@ -263,75 +272,62 @@ async def handle_trade_command(
         log.info("Dedup: trade command already claimed", extra={"message_id": str(message.id)})
         return
 
-    tokens = content.strip().split()
-    if len(tokens) < 2:
-        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
-        return
-
-    verb = tokens[1].upper()
-
-    # ── ADDCASH — grow the seed ──────────────────────────────────────────
-    if verb == "ADDCASH":
-        if len(tokens) < 3:
-            await message.channel.send(f"❌ Missing amount.\n{_USAGE}")
-            return
-        try:
-            amount_eur = float(tokens[2])
-            if amount_eur <= 0:
-                raise ValueError
-        except ValueError:
-            await message.channel.send(f"❌ Amount must be a positive number, got `{tokens[2]}`.\n{_USAGE}")
-            return
-
-        payload = {
-            "command": content,
-            "username": message.author.name,
-            "message_id": str(message.id),
-        }
-        try:
-            await nc.publish(TRADING_MANUAL_TRADE, json.dumps(payload).encode())
-            log.info("Addcash command published", extra={"amount_eur": amount_eur})
-        except Exception:
-            log.exception("Failed to publish addcash command")
-            await message.channel.send("❌ Failed to record — NATS unavailable.")
-            return
-        await message.channel.send(f"💰 **ADDCASH** €{amount_eur:.2f} — applying...")
-        return
-
-    # ── BUY / SELL — log a trade to the book ─────────────────────────────
-    if verb not in ("BUY", "SELL"):
-        await message.channel.send(f"❌ Unknown verb `{tokens[1]}`.\n{_USAGE}")
-        return
-
-    if len(tokens) < 4:
-        await message.channel.send(f"❌ Too few arguments.\n{_USAGE}")
-        return
-
     try:
-        amount_eur = float(tokens[3])
-        if amount_eur <= 0:
-            raise ValueError
-    except ValueError:
-        await message.channel.send(f"❌ Amount must be a positive number, got `{tokens[3]}`.\n{_USAGE}")
+        parsed = parse_manual_command(content)
+    except ValueError as exc:
+        await message.channel.send(f"❌ {exc}\n{_USAGE}")
         return
 
-    symbol = tokens[2].upper()
-    payload = {
-        "command": content,
+    base_payload: dict = {
         "username": message.author.name,
         "message_id": str(message.id),
     }
 
+    # ── ADDCASH — grow the seed ──────────────────────────────────────────
+    if isinstance(parsed, AddCash):
+        payload = {
+            **base_payload,
+            "kind": "addcash",
+            "amount_eur": parsed.amount_eur,
+            "note": parsed.note,
+        }
+        try:
+            await nc.publish(TRADING_MANUAL_TRADE, json.dumps(payload).encode())
+            log.info("Addcash command published", extra={"amount_eur": parsed.amount_eur})
+        except Exception:
+            log.exception("Failed to publish addcash command")
+            await message.channel.send("❌ Failed to record — NATS unavailable.")
+            return
+        await message.channel.send(f"💰 **ADDCASH** €{parsed.amount_eur:.2f} — applying...")
+        return
+
+    # ── BUY / SELL — log a trade to the book ─────────────────────────────
+    trade: Trade = parsed
+    payload = {
+        **base_payload,
+        "kind": "trade",
+        "symbol": trade.symbol,
+        "direction": trade.direction.value,
+        "amount_eur": trade.amount_eur,
+        "price": trade.price,
+        "note": trade.note,
+    }
     try:
         await nc.publish(TRADING_MANUAL_TRADE, json.dumps(payload).encode())
         log.info(
             "Trade command published",
-            extra={"symbol": symbol, "direction": verb, "amount_eur": amount_eur},
+            extra={
+                "symbol": trade.symbol,
+                "direction": trade.direction.value,
+                "amount_eur": trade.amount_eur,
+            },
         )
     except Exception:
         log.exception("Failed to publish trade command")
         await message.channel.send("❌ Failed to record trade — NATS unavailable.")
         return
 
-    direction_emoji = "🟢" if verb == "BUY" else "🔴"
-    await message.channel.send(f"{direction_emoji} **{verb}** {symbol} €{amount_eur:.2f} — logged")
+    direction_emoji = "🟢" if trade.direction is Direction.BUY else "🔴"
+    await message.channel.send(
+        f"{direction_emoji} **{trade.direction.name}** {trade.symbol} €{trade.amount_eur:.2f} — logged"
+    )

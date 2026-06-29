@@ -31,19 +31,29 @@ from maki_common.trading.capital import (
     add_cash,
     load_seed,
 )
-from maki_common.trading.manual import Direction, Trade, parse_trade_command
+from maki_common.trading.manual import (
+    AddCash,
+    Direction,
+    ManualCommand,
+    Trade,
+    parse_manual_command,
+    parse_trade_command,
+)
 
 __all__ = [
     "DEFAULT_SEED_EUR",
+    "AddCash",
     "Direction",
     "KV_BOOK_PREFIX",
     "KV_CAPITAL",
+    "ManualCommand",
     "Trade",
     "add_cash",
     "append_trade",
     "compute_position",
     "load_book",
     "load_seed",
+    "parse_manual_command",
     "parse_trade_command",
     "safe_symbol",
 ]
