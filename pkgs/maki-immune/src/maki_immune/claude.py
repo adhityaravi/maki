@@ -284,6 +284,59 @@ def _record_action(action: dict) -> None:
             log.exception("Failed to publish escalation action")
 
 
+# --- Shared Claude Invocation ---
+
+
+async def _invoke_immune_claude(prompt_suffix: str = "") -> str:
+    """Assemble the standard immune prompt, invoke Claude, apply config-tag updates,
+    publish any ``[ALERT:...]`` tags, and return the raw response text.
+
+    Centralizes the prompt-assembly + invoke_claude + parse_config_tags +
+    apply_config_updates + ALERT-publish boilerplate shared by
+    ``escalate_to_claude``, ``handle_immune_command``, and
+    ``immune_heartbeat_loop``. Callers handle their own divergent reporting
+    (DIGEST / RESPONSE / [SILENT]) on the returned text.
+
+    Note: ALERTs are published from this single site so the three call sites
+    cannot drift. DIGESTs are intentionally caller-controlled — escalate sends
+    them to #maki-vitals, the heartbeat loop suppresses them when [SILENT] is
+    set, and the command handler suppresses them outright (#maki-immune
+    already gets the full RESPONSE).
+    """
+    system_state = _build_system_state()
+    recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
+    config = await load_kv_config(_config_kv, _default_config)
+
+    prompt = _system_prompt.format(
+        system_state=system_state,
+        recent_actions=recent_actions_str,
+        config=json.dumps(config, indent=2),
+    )
+    if prompt_suffix:
+        prompt += prompt_suffix
+
+    response, _usage = await invoke_claude(
+        prompt,
+        model=MODEL,
+        semaphore=_semaphore,
+        max_turns=MAX_CLAUDE_TURNS,
+        mcp_servers={"maki-immune": _mcp_server},
+    )
+
+    config_updates = parse_config_tags(response)
+    await apply_config_updates(
+        _config_kv,
+        config_updates,
+        allowed_keys=set(_default_config.keys()),
+        validators=_config_validators,
+    )
+
+    for alert in parse_tagged(response, "ALERT"):
+        await _publish_alert(alert)
+
+    return response
+
+
 # --- Claude Escalation ---
 
 
@@ -331,17 +384,7 @@ async def escalate_to_claude(component: str, state: dict, reason: str):
     }
 
     try:
-        system_state = _build_system_state()
-        recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
-        config = await load_kv_config(_config_kv, _default_config)
-        config_str = json.dumps(config, indent=2)
-
-        prompt = _system_prompt.format(
-            system_state=system_state,
-            recent_actions=recent_actions_str,
-            config=config_str,
-        )
-        prompt += f"""
+        suffix = f"""
 
 ## ESCALATION
 
@@ -353,26 +396,15 @@ Investigate this problem using your tools. Read logs, check events, examine the 
 Determine root cause and take corrective action if possible.
 Always report what you found and what you did via [DIGEST:...] and/or [ALERT:...]."""
 
-        response, _usage = await invoke_claude(
-            prompt,
-            model=MODEL,
-            semaphore=_semaphore,
-            max_turns=MAX_CLAUDE_TURNS,
-            mcp_servers={"maki-immune": _mcp_server},
-        )
-
-        config_updates = parse_config_tags(response)
-        await apply_config_updates(
-            _config_kv, config_updates, allowed_keys=set(_default_config.keys()), validators=_config_validators
-        )
+        response = await _invoke_immune_claude(suffix)
 
         digests = parse_tagged(response, "DIGEST")
         for digest in digests:
             await _publish_vitals(digest)
 
+        # ALERTs already published inside _invoke_immune_claude; re-parse here
+        # only so the durable outcome record can count/include them in summary.
         alerts = parse_tagged(response, "ALERT")
-        for alert in alerts:
-            await _publish_alert(alert)
 
         summary_source = "\n".join(digests + alerts) if (digests or alerts) else response
         outcome = {
@@ -468,17 +500,7 @@ async def handle_immune_command(msg):
             await _publish_immune_response(message_id, reply)
             return
 
-        system_state = _build_system_state()
-        recent_actions_str = json.dumps(_recent_actions[-10:], indent=2, default=str) if _recent_actions else "None"
-        config = await load_kv_config(_config_kv, _default_config)
-        config_str = json.dumps(config, indent=2)
-
-        prompt = _system_prompt.format(
-            system_state=system_state,
-            recent_actions=recent_actions_str,
-            config=config_str,
-        )
-        prompt += f"""
+        suffix = f"""
 
 ## DIRECT COMMAND FROM ADI
 
@@ -494,32 +516,16 @@ Put your full response in [RESPONSE:...] tags. This will be sent back to Adi in 
 Also use [DIGEST:...] for anything that should go to #maki-vitals."""
 
         try:
-            response, _usage = await invoke_claude(
-                prompt,
-                model=MODEL,
-                semaphore=_semaphore,
-                max_turns=MAX_CLAUDE_TURNS,
-                mcp_servers={"maki-immune": _mcp_server},
-            )
-
-            config_updates = parse_config_tags(response)
-            await apply_config_updates(
-                _config_kv, config_updates, allowed_keys=set(_default_config.keys()), validators=_config_validators
-            )
+            # ALERTs are published inside _invoke_immune_claude. DIGEST tags are
+            # intentionally not published to #maki-vitals here — the full response
+            # already goes back to #maki-immune, and publishing DIGESTs would cause
+            # immune updates to leak into #maki-general.
+            response = await _invoke_immune_claude(suffix)
 
             responses = parse_tagged(response, "RESPONSE")
-            if responses:
-                reply = "\n\n".join(responses)
-            else:
-                reply = response
+            reply = "\n\n".join(responses) if responses else response
 
             await _publish_immune_response(message_id, reply)
-
-            # Note: DIGEST tags are intentionally not published to #maki-vitals here —
-            # the full response already goes back to #maki-immune. Publishing DIGESTs
-            # would cause immune updates to leak into #maki-general.
-            for alert in parse_tagged(response, "ALERT"):
-                await _publish_alert(alert)
 
             log.info("Immune command handled", extra={"message_id": message_id})
 
@@ -585,35 +591,12 @@ async def immune_heartbeat_loop():
             log.info("Immune heartbeat triggered — starting patrol")
             last_patrol = time.time()
 
-            system_state = _build_system_state()
-            recent_actions_str = json.dumps(_recent_actions[-10:], indent=2) if _recent_actions else "None"
-            config_str = json.dumps(config, indent=2)
-
-            prompt = _system_prompt.format(
-                system_state=system_state,
-                recent_actions=recent_actions_str,
-                config=config_str,
-            )
-
-            response, _usage = await invoke_claude(
-                prompt,
-                model=MODEL,
-                semaphore=_semaphore,
-                max_turns=MAX_CLAUDE_TURNS,
-                mcp_servers={"maki-immune": _mcp_server},
-            )
-
-            config_updates = parse_config_tags(response)
-            await apply_config_updates(
-                _config_kv, config_updates, allowed_keys=set(_default_config.keys()), validators=_config_validators
-            )
+            # ALERTs are published inside _invoke_immune_claude.
+            response = await _invoke_immune_claude()
 
             if "[SILENT]" not in response:
                 for digest in parse_tagged(response, "DIGEST"):
                     await _publish_vitals(digest)
-
-            for alert in parse_tagged(response, "ALERT"):
-                await _publish_alert(alert)
 
             log.info("Immune heartbeat complete", extra={"silent": "[SILENT]" in response})
 
