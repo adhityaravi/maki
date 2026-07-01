@@ -116,24 +116,59 @@ def make_k8s_tools(
             return mcp_result(f"Failed to describe pod {pod_name}: {e}")
 
     async def get_pod_logs(args: dict[str, Any]) -> dict[str, Any]:
-        """Read recent logs from a pod."""
+        """Read recent logs from a pod.
+
+        Set previous=true to read the last-terminated container's logs
+        (equivalent to ``kubectl logs --previous``) — use this when a pod is
+        CrashLoopBackOff or was quickly restarted and you need the stack trace
+        from the prior crash. See issue #366 — without this, crash-restart
+        traces are systematically invisible.
+        """
         pod_name = args.get("pod_name", "")
         tail_lines = min(int(args.get("tail_lines", "100")), 500)
-        log.info("Tool: get_pod_logs", extra={"pod_name": pod_name, "tail_lines": tail_lines})
+        previous_raw = args.get("previous", False)
+        if isinstance(previous_raw, str):
+            previous = previous_raw.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            previous = bool(previous_raw)
+        log.info(
+            "Tool: get_pod_logs",
+            extra={"pod_name": pod_name, "tail_lines": tail_lines, "previous": previous},
+        )
         try:
             logs = await asyncio.to_thread(
                 k8s_v1.read_namespaced_pod_log,
                 name=pod_name,
                 namespace=namespace,
                 tail_lines=tail_lines,
+                previous=previous,
             )
             if not logs:
-                return mcp_result(f"(empty logs for {pod_name})")
+                suffix = " (previous instance)" if previous else ""
+                return mcp_result(f"(empty logs for {pod_name}{suffix})")
             if len(logs) > 4000:
                 logs = logs[-4000:]
                 logs = f"[truncated to last 4000 chars]\n{logs}"
+            if previous:
+                logs = f"[previous terminated container]\n{logs}"
             return mcp_result(logs)
         except Exception as e:
+            # k8s returns 400 BadRequest with "previous terminated container ...
+            # not found in pod" when there is no prior instance to read from
+            # (never restarted, or the terminated container's logs have been
+            # GC'd by kubelet). Surface that plainly instead of a raw traceback.
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", "") or str(e)
+            body_str = str(body).lower()
+            is_no_previous = previous and (
+                status == 400 or "previous terminated container" in body_str or "not found in pod" in body_str
+            )
+            if is_no_previous:
+                return mcp_result(
+                    f"No previous instance to read for {pod_name}: the container "
+                    f"has not terminated (no restarts), or its terminated logs have "
+                    f"been garbage-collected. Try previous=false for current logs."
+                )
             return mcp_result(f"Failed to get logs for {pod_name}: {e}")
 
     async def get_k8s_events(args: dict[str, Any]) -> dict[str, Any]:
@@ -468,8 +503,12 @@ def make_k8s_tools(
         ),
         (
             "get_pod_logs",
-            "Read recent logs from a pod. Returns up to 500 lines / 4000 chars.",
-            {"pod_name": str, "tail_lines": str},
+            "Read recent logs from a pod. Returns up to 500 lines / 4000 chars. "
+            "Set previous=true to read the last-terminated container's logs "
+            "(equivalent to `kubectl logs --previous`) — use this when a pod is "
+            "CrashLoopBackOff or recently restarted and you need the stack trace "
+            "from the prior crash.",
+            {"pod_name": str, "tail_lines": str, "previous": str},
             get_pod_logs,
         ),
         (

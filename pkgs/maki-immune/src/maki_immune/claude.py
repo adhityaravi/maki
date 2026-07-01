@@ -647,6 +647,8 @@ def _build_escalation_summary(candidate: dict, classification: dict | None) -> s
     """Build a brief summary for #maki-immune after pattern escalation."""
     component = candidate["component"]
     pod = candidate["pod"]
+    source = candidate.get("source", "current")
+    source_suffix = " [crashed instance]" if source == "previous" else ""
 
     if classification:
         cls = classification["classification"]
@@ -654,7 +656,7 @@ def _build_escalation_summary(candidate: dict, classification: dict | None) -> s
         notes = classification["notes"]
         pat = classification["pattern"]
         return (
-            f"**Pattern classified** — {component} ({pod})\n"
+            f"**Pattern classified** — {component} ({pod}){source_suffix}\n"
             f"classification: `{cls}` (confidence: {conf:.1f})\n"
             f"pattern: `{pat}`\n"
             f"notes: {notes}"
@@ -662,7 +664,7 @@ def _build_escalation_summary(candidate: dict, classification: dict | None) -> s
     else:
         sigs = ", ".join(candidate.get("signatures", []))
         return (
-            f"**Pattern escalation** — {component} ({pod}): "
+            f"**Pattern escalation** — {component} ({pod}){source_suffix}: "
             f"Claude did not produce a valid PATTERN_CLASSIFICATION block. Manual review needed.\n"
             f"Signatures: {sigs}"
         )
@@ -681,10 +683,16 @@ async def escalate_pattern_to_claude(candidate: dict) -> None:
     pod = candidate["pod"]
     log_tail = candidate.get("log_tail", "")
     signatures = candidate.get("signatures", [])
+    source = candidate.get("source", "current")
+    source_label = (
+        "previous container instance (post-crash trace from the terminated container — pod has restart_count > 0)"
+        if source == "previous"
+        else "current running container (steady-state logs)"
+    )
 
     log.info(
         "Escalating pattern to Claude",
-        extra={"component": component, "pod": pod, "signatures": signatures},
+        extra={"component": component, "pod": pod, "signatures": signatures, "source": source},
     )
 
     # Fetch last 5 known patterns for context (dedup guard)
@@ -710,6 +718,7 @@ An unknown error signature was detected in pod logs. Classify it: is it a safe n
 - Pod: {pod}
 - Site: {_site_name}
 - Signatures found: {", ".join(signatures)}
+- Log source: {source_label}
 - Timestamp: {timestamp}
 
 ## Log tail (raw)
@@ -723,6 +732,7 @@ An unknown error signature was detected in pod logs. Classify it: is it a safe n
 ## Your task
 
 1. Investigate if needed — use get_pod_logs or get_k8s_events for this pod if the tail isn't enough.
+   For crash-restart cases, get_pod_logs supports previous=true to pull the terminated container's logs.
 2. Search memories — you may have seen this before.
 3. Act if needed — restart the pod/deployment only if the problem is active and actionable.
 4. End your response with a PATTERN_CLASSIFICATION block (required):
@@ -816,27 +826,66 @@ async def passive_log_monitor_loop():
                     continue
 
                 pod_name = pod.metadata.name
+
+                # Decide whether the previous container instance is worth reading.
+                # If a pod just crashed and k8s restarted it, the current container
+                # is the post-restart startup — the actual stack trace lives in
+                # `previous` logs. Without this, crash-loop and quick-recovery
+                # scenarios are systematically invisible to signature matching
+                # (issue #366).
+                fetch_previous = False
+                if pod.status and pod.status.container_statuses:
+                    for cs in pod.status.container_statuses:
+                        restart_count = cs.restart_count or 0
+                        had_terminated = bool(cs.last_state and cs.last_state.terminated)
+                        if restart_count > 0 or had_terminated:
+                            fetch_previous = True
+                            break
+
+                # Current container logs.
                 try:
-                    log_text = await asyncio.to_thread(
+                    current_text = await asyncio.to_thread(
                         _k8s_v1.read_namespaced_pod_log,
                         name=pod_name,
                         namespace=_namespace,
                         tail_lines=15,
                     )
                 except Exception:
-                    continue
+                    current_text = ""
 
-                if not log_text:
-                    continue
+                # Previous (crashed) container logs — only when the pod has
+                # actually restarted. Silently swallow the 400 BadRequest that
+                # k8s returns when there's no terminated instance to read from,
+                # or its logs were already GC'd by kubelet.
+                previous_text = ""
+                if fetch_previous:
+                    try:
+                        previous_text = await asyncio.to_thread(
+                            _k8s_v1.read_namespaced_pod_log,
+                            name=pod_name,
+                            namespace=_namespace,
+                            tail_lines=15,
+                            previous=True,
+                        )
+                    except Exception:
+                        previous_text = ""
 
-                matches = _ERROR_SIGNATURES.findall(log_text)
-                if matches:
+                # Emit one candidate per source that had a signature hit. Tagging
+                # candidates with their source keeps escalation prompts honest
+                # about which container instance actually produced the trace.
+                for source, text in (("current", current_text), ("previous", previous_text)):
+                    if not text:
+                        continue
+                    matches = _ERROR_SIGNATURES.findall(text)
+                    if not matches:
+                        continue
                     candidates.append(
                         {
                             "component": app_label,
                             "pod": pod_name,
                             "signatures": sorted(set(matches)),
-                            "log_tail": log_text.strip()[-500:],
+                            "log_tail": text.strip()[-500:],
+                            "source": source,
                         }
                     )
 
@@ -867,7 +916,11 @@ async def passive_log_monitor_loop():
                 # fingerprint per passive window to avoid flooding Claude with the same error
                 escalated_this_window: set[str] = set()
                 for c in to_escalate:
-                    fingerprint = f"{c['component']}:{':'.join(sorted(c.get('signatures', [])))}"
+                    # Fingerprint includes source so a previous-container crash
+                    # and a current-container error with the same signatures
+                    # aren't collapsed — they're different failure modes.
+                    source_tag = c.get("source", "current")
+                    fingerprint = f"{c['component']}:{source_tag}:{':'.join(sorted(c.get('signatures', [])))}"
                     log.info(
                         "Escalating error candidate",
                         extra={
@@ -875,6 +928,7 @@ async def passive_log_monitor_loop():
                             "pod": c["pod"],
                             "signatures": c["signatures"],
                             "reason": c.get("reason", "unknown"),
+                            "source": source_tag,
                         },
                     )
                     if fingerprint in escalated_this_window:
