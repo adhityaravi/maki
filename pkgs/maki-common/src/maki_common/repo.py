@@ -215,6 +215,27 @@ async def hard_sync(
             raise SyncError(step, rc, stderr)
 
 
+def build_github_auth(
+    app_id: str | None,
+    private_key: str | None,
+    installation_id: str | None,
+) -> Any | None:
+    """Construct a ``GitHubAuth`` if all three config fields are present, else ``None``.
+
+    A tiny factory so callers (cortex startup, immune startup) don't each
+    import ``maki_common.tools.github.GitHubAuth`` and repeat the
+    "all-three-or-nothing" guard. Keeps the ``GitHubAuth`` import in one
+    place and lets ``init_repo`` / ``hard_sync`` remain
+    ``github_auth``-shaped without leaking the concrete class to every
+    component.
+    """
+    if not (app_id and private_key and installation_id):
+        return None
+    from maki_common.tools.github import GitHubAuth
+
+    return GitHubAuth(app_id, private_key, installation_id)
+
+
 async def init_repo(
     repo_path: str,
     clone_url: str,

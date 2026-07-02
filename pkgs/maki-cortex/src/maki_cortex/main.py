@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import uuid
+from typing import Any
 
 from maki_common import (
     configure_logging,
@@ -25,7 +26,7 @@ from maki_common import (
 )
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
-from maki_common.repo import SyncError, hard_sync, redact_token
+from maki_common.repo import SyncError, build_github_auth, hard_sync, init_repo
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
@@ -55,6 +56,9 @@ GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
 REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
 REPO_NAME = os.environ.get("REPO_NAME", "maki")
 REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
+# Token-free clone URL — auth is injected per-invocation via
+# ``git -c http.extraheader=...`` inside ``maki_common.repo`` (issue #347).
+CLONE_URL = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
 
 HEALTH_ENDPOINTS = {
     "recall": RECALL_URL,
@@ -70,6 +74,9 @@ _semaphore = asyncio.Semaphore(1)
 
 # Hoisted from main() so handle_turn_request can use it for auto-pull
 _github_private_key: str | None = None
+# GitHubAuth instance built once at startup — reused by the per-turn hard-sync
+# so we don't reconstruct it (and re-import GitHubAuth) on every turn.
+_github_auth: Any | None = None
 
 
 class _TurnState:
@@ -343,13 +350,8 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
     # The "Auto-sync before turn" log line was unconditional too — it lied
     # whenever sync silently failed. See issue #290.
     if git_pull and os.path.exists(REPO_PATH):
-        auth = None
-        if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
-            from maki_common.tools.github import GitHubAuth
-
-            auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
         try:
-            await hard_sync(REPO_PATH, github_auth=auth, owner=REPO_OWNER, name=REPO_NAME)
+            await hard_sync(REPO_PATH, github_auth=_github_auth, clone_url=CLONE_URL)
         except SyncError as exc:
             # stderr is pre-redacted inside hard_sync — safe to log and publish.
             log.error(
@@ -673,7 +675,7 @@ async def main():
     config_kv = await init_kv(js, "maki-cortex-config")
 
     # Load GitHub App private key if configured
-    global _github_private_key
+    global _github_private_key, _github_auth
     github_private_key = None
     if GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
         with open(GITHUB_PRIVATE_KEY_PATH) as f:
@@ -681,41 +683,22 @@ async def main():
         _github_private_key = github_private_key
         log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
-    # Clone or pull the repo for self-evolution tools
-    if github_private_key and os.path.exists(REPO_PATH):
-        log.info("Repo already present", extra={"path": REPO_PATH})
-    elif github_private_key:
-        import subprocess
+    # Build the GitHubAuth instance once so both the startup clone/pull and the
+    # per-turn hard-sync reuse it — no inline reconstruction on every turn, no
+    # authed URL hand-assembly. The token itself is minted lazily (per git
+    # invocation) inside ``maki_common.repo`` (issue #347).
+    _github_auth = build_github_auth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
 
-        from maki_common.tools.github import GitHubAuth
-
-        _auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
-        token = await _auth.get_token()
-        repo_url = f"https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-        log.info("Cloning repo", extra={"path": REPO_PATH})
-        os.makedirs(os.path.dirname(REPO_PATH), exist_ok=True)
-        result = subprocess.run(
-            ["git", "clone", repo_url, REPO_PATH],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            # Redact: git's own clone error includes the auth URL, which carries
-            # a live installation token. Logs are forever; tokens shouldn't be.
-            log.error("Git clone failed", extra={"stderr": redact_token(result.stderr)})
-        else:
-            log.info("Repo cloned", extra={"path": REPO_PATH})
-
-    # Set committer identity so git commit doesn't error in a bare container.
-    # The actual author is forced to makiself[bot] via --author in git_commit_and_push.
-    if os.path.exists(REPO_PATH):
-        import subprocess as _sp
-
-        _sp.run(["git", "-C", REPO_PATH, "config", "user.name", "makiself[bot]"], capture_output=True)
-        _sp.run(
-            ["git", "-C", REPO_PATH, "config", "user.email", "makiself[bot]@users.noreply.github.com"],
-            capture_output=True,
-        )
+    # Clone (fresh) or pull (existing) the repo for self-evolution tools. This
+    # goes through ``maki_common.repo.init_repo`` — the same helper immune uses
+    # — so cortex no longer reinvents clone/pull with a sync ``subprocess.run``
+    # inside ``async def main()``, and the "repo already present" case actually
+    # syncs to origin/main at startup instead of waiting for the first turn.
+    # ``init_repo`` also configures git user.name/user.email on a fresh clone.
+    if _github_auth or os.path.exists(REPO_PATH):
+        ok = await init_repo(REPO_PATH, clone_url=CLONE_URL, github_auth=_github_auth)
+        if not ok:
+            log.warning("Repo init at startup failed — self-evolution tools may be degraded")
 
     from maki_common.tools import create_cortex_tools
 
