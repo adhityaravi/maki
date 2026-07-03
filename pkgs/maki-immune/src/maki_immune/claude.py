@@ -8,7 +8,7 @@ import re
 import time
 from typing import Any
 
-from maki_common import load_kv_config, parse_config_tags
+from maki_common import load_kv_config, parse_config_tags, spawn_background
 from maki_common.claude import invoke_claude
 from maki_common.config import apply_config_updates, parse_tagged
 from maki_common.nats import try_claim_loop
@@ -279,7 +279,10 @@ def _record_action(action: dict) -> None:
             log.exception("Failed to schedule recent_actions persist")
     if _nc is not None:
         try:
-            asyncio.create_task(_nc.publish(IMMUNE_ACTION, json.dumps(action, default=str).encode()))
+            spawn_background(
+                _nc.publish(IMMUNE_ACTION, json.dumps(action, default=str).encode()),
+                name="immune.action_publish",
+            )
         except Exception:
             log.exception("Failed to publish escalation action")
 
@@ -938,7 +941,7 @@ async def passive_log_monitor_loop():
                         )
                         continue
                     escalated_this_window.add(fingerprint)
-                    asyncio.create_task(escalate_pattern_to_claude(c))
+                    spawn_background(escalate_pattern_to_claude(c), name="immune.pattern_escalation")
             # No-error runs are fully silent — no logging
 
         except Exception:
@@ -975,7 +978,10 @@ async def cortex_stuck_handler(msg):
             ". User is waiting for a response." if user_waiting else "."
         )
 
-        asyncio.create_task(escalate_to_claude("maki-cortex", state, reason))
+        spawn_background(
+            escalate_to_claude("maki-cortex", state, reason),
+            name=f"immune.cortex_stuck_escalation.{turn_id}",
+        )
 
     except Exception:
         log.exception("Cortex stuck handler error")

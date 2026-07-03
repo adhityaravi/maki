@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 from kubernetes import client as k8s_client
-from maki_common import load_kv_config, subscribe_supervised
+from maki_common import load_kv_config, spawn_background, subscribe_supervised
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
 
 # Wall-clock seconds a single cortex turn may run before immune publishes
@@ -704,8 +704,10 @@ def _check_cortex_heartbeat():
                 }
             ).encode()
             # Fire-and-forget so the synchronous check doesn't block the loop.
+            # ``spawn_background`` anchors the publish task against GC and
+            # logs any uncaught exception (issue #123).
             try:
-                asyncio.create_task(_nc.publish(CORTEX_STUCK, payload))
+                spawn_background(_nc.publish(CORTEX_STUCK, payload), name="immune.cortex_stuck_publish")
             except Exception:
                 log.exception("Failed to schedule CORTEX_STUCK publish")
             _cortex_stuck_alerted["last_fired_at"] = now
@@ -845,10 +847,11 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         await _publish_alert(
             f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"
         )
-        asyncio.create_task(
+        spawn_background(
             _escalate_to_claude(
                 component, state, f"Reflex restart limit reached ({len(history)}/{max_restarts} restarts in last hour)"
-            )
+            ),
+            name="immune.reflex_limit_escalation",
         )
         return
 
@@ -1054,7 +1057,10 @@ async def _check_stuck_components(config: dict) -> None:
                 f"finished initializing, so the restart reflex never fired. Investigate "
                 f"(logs, events, init containers, dependencies) and remediate if safe."
             )
-            asyncio.create_task(_escalate_to_claude(component, state, reason))
+            spawn_background(
+                _escalate_to_claude(component, state, reason),
+                name="immune.stuck_escalation",
+            )
 
 
 async def _check_long_unhealthy_components(config: dict) -> None:
@@ -1244,7 +1250,10 @@ async def _check_long_unhealthy_components(config: dict) -> None:
                 f"remediate. If the underlying issue is structural, file or revisit the "
                 f"relevant bug issue."
             )
-            asyncio.create_task(_escalate_to_claude(component, state, reason))
+            spawn_background(
+                _escalate_to_claude(component, state, reason),
+                name="immune.long_unhealthy_reescalation",
+            )
 
 
 # --- Immune Self-Health Watchdog ---

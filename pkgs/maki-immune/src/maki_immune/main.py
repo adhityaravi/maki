@@ -13,7 +13,7 @@ import uuid
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-from maki_common import configure_logging, connect_nats, init_kv, load_kv_config
+from maki_common import configure_logging, connect_nats, init_kv, load_kv_config, spawn_background
 from maki_common.health import tcp_health_server
 from maki_common.subjects import (
     CORTEX_STUCK,
@@ -382,8 +382,13 @@ async def _persist_recent_actions():
 
 
 def _schedule_persist_recent_actions():
-    """Schedule _persist_recent_actions as a background task."""
-    asyncio.ensure_future(_persist_recent_actions())
+    """Schedule _persist_recent_actions as a background task.
+
+    Uses ``spawn_background`` (not bare ``ensure_future``) so the task is
+    anchored against mid-flight GC and any uncaught exception is logged
+    instead of vanishing silently (issue #123).
+    """
+    spawn_background(_persist_recent_actions(), name="immune.persist_recent_actions")
 
 
 # --- NATS Publishing ---
@@ -848,30 +853,32 @@ async def main():
 
     # Background tasks (tracked in ``_critical_listener_tasks`` so the
     # readiness probe flips red if any listener dies — see #175.)
-    _critical_listener_tasks["deploy_propagate"] = asyncio.create_task(
+    # ``spawn_background`` also anchors each task against GC and logs any
+    # uncaught exception (issue #123).
+    _critical_listener_tasks["deploy_propagate"] = spawn_background(
         deploy_mod.deploy_propagate_listener(), name="deploy_propagate_listener"
     )
     log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
 
-    _critical_listener_tasks["restart_propagate"] = asyncio.create_task(
+    _critical_listener_tasks["restart_propagate"] = spawn_background(
         deploy_mod.restart_propagate_listener(), name="restart_propagate_listener"
     )
     log.info("Started JetStream restart propagation listener", extra={"subject": RESTART_PROPAGATE})
 
-    _health_monitor_task = asyncio.create_task(health_mod.health_monitor_loop())
-    asyncio.create_task(claude_mod.immune_heartbeat_loop())
-    asyncio.create_task(claude_mod.passive_log_monitor_loop())
-    asyncio.create_task(claude_mod.loop_heartbeat_watcher())
+    _health_monitor_task = spawn_background(health_mod.health_monitor_loop(), name="immune.health_monitor_loop")
+    spawn_background(claude_mod.immune_heartbeat_loop(), name="immune.heartbeat_loop")
+    spawn_background(claude_mod.passive_log_monitor_loop(), name="immune.passive_log_monitor_loop")
+    spawn_background(claude_mod.loop_heartbeat_watcher(), name="immune.loop_heartbeat_watcher")
     # Track these supervised listeners so the readiness probe can fail if any
     # of them dies — see ``_critical_listener_tasks`` and #175.
-    _critical_listener_tasks["cortex_heartbeat"] = asyncio.create_task(
+    _critical_listener_tasks["cortex_heartbeat"] = spawn_background(
         health_mod.cortex_heartbeat_listener(), name="cortex_heartbeat_listener"
     )
-    _critical_listener_tasks["token_usage"] = asyncio.create_task(
+    _critical_listener_tasks["token_usage"] = spawn_background(
         health_mod.token_usage_listener(), name="token_usage_listener"
     )
-    _critical_listener_tasks["gossip"] = asyncio.create_task(health_mod.gossip_listener(), name="gossip_listener")
-    asyncio.create_task(health_mod.gossip_publisher())
+    _critical_listener_tasks["gossip"] = spawn_background(health_mod.gossip_listener(), name="gossip_listener")
+    spawn_background(health_mod.gossip_publisher(), name="immune.gossip_publisher")
 
     server = await tcp_health_server(port=HEALTH_PORT, check=_health_check)
     log.info("Health server listening", extra={"port": HEALTH_PORT})

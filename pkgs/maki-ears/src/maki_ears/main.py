@@ -17,6 +17,7 @@ from maki_common import (
     connect_nats,
     init_kv,
     kv_acquire_lease,
+    spawn_background,
     subscribe_supervised,
 )
 from maki_common.subjects import (
@@ -415,7 +416,7 @@ async def _handle_search_request(msg) -> None:
 
 async def _dispatch_search(msg) -> None:
     """Spawn-and-return: per-message task so a slow Discord call never blocks the supervisor."""
-    asyncio.create_task(_handle_search_request(msg))
+    spawn_background(_handle_search_request(msg), name="ears.search_request")
 
 
 async def _search_listener() -> None:
@@ -713,11 +714,14 @@ async def main():
 
     # NATS listeners run always — harmless when not leader
     # (response listeners silently drop unmatched messages,
-    #  outbound listeners have no channels to post to without Discord)
-    asyncio.create_task(_out_listener())
-    asyncio.create_task(_immune_response_listener())
-    asyncio.create_task(_vitals_listener())
-    asyncio.create_task(_alert_listener())
+    #  outbound listeners have no channels to post to without Discord).
+    # ``spawn_background`` anchors these against GC and logs any uncaught
+    # exception — a bare ``create_task`` would let a listener silently vanish
+    # if the caller's weak-ref lapses (issue #123).
+    spawn_background(_out_listener(), name="ears.out_listener")
+    spawn_background(_immune_response_listener(), name="ears.immune_response_listener")
+    spawn_background(_vitals_listener(), name="ears.vitals_listener")
+    spawn_background(_alert_listener(), name="ears.alert_listener")
 
     # Leader election loop — only the leader connects to Discord
     while True:
@@ -732,7 +736,12 @@ async def main():
             _immune_channel_ids.clear()
             _trading_channel_ids.clear()
 
-            renewal_task = asyncio.create_task(_leader_renewal_loop())
+            # ``spawn_background`` for renewal_task gives us exception logging;
+            # the returned Task is still assigned for the ``.cancel()`` call in
+            # the ``finally`` block below (issue #123). search_task keeps a bare
+            # create_task because its handle is both retained here and awaited
+            # via cancel — no risk of GC or silent exception loss.
+            renewal_task = spawn_background(_leader_renewal_loop(), name="ears.leader_renewal")
             search_task = asyncio.create_task(_search_listener())
 
             try:

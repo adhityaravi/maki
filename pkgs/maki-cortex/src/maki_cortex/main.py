@@ -22,6 +22,7 @@ from maki_common import (
     format_memories_block,
     format_system_state_lines,
     init_kv,
+    spawn_background,
     subscribe_supervised,
 )
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
@@ -716,7 +717,7 @@ async def main():
     )
     log.info("MCP tools registered")
 
-    _heartbeat_task = asyncio.create_task(heartbeat_loop(nc))
+    spawn_background(heartbeat_loop(nc), name="cortex.heartbeat_loop")
     log.info("Heartbeat loop started")
 
     async def _handle_turn_message(msg) -> None:
@@ -733,8 +734,10 @@ async def main():
         try:
             turn = json.loads(msg.data.decode())
             mode = turn.get("mode", "")
+            turn_id = turn.get("turn_id", "unknown")
         except Exception:
             mode = ""
+            turn_id = "unknown"
 
         is_background = mode in _BACKGROUND_MODES
 
@@ -752,7 +755,9 @@ async def main():
 
         # No need to track the spawned task here — _turn_state.task gets
         # populated under _turn_lock the moment the handler enters its body.
-        asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
+        # ``spawn_background`` anchors against GC and logs uncaught exceptions
+        # so a raised handler doesn't vanish silently (issue #123).
+        spawn_background(handle_turn_request(msg, nc, mcp_server), name=f"cortex.turn.{turn_id}")
 
     # Critical: the turn-request listener is the entire point of cortex. Wrap
     # it in ``subscribe_supervised`` so a NATS reconnect or stream drain
