@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import time
-import uuid
 from datetime import UTC, datetime
 
 from maki_common import (
@@ -18,7 +16,9 @@ from maki_common import (
     strip_tags,
 )
 from maki_common.config import apply_config_updates
-from maki_common.subjects import CORTEX_TURN_REQUEST, EARS_OUT
+from maki_common.subjects import EARS_OUT
+
+from maki_stem.turn import new_turn_id, submit_turn_single
 
 from .base import (
     RECENTLY_ACTIVE_THRESHOLD,
@@ -226,7 +226,7 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         except Exception:
             log.warning("Failed to fetch open issues for idle dedup")
 
-    turn_id = f"idle-{uuid.uuid4().hex[:8]}"
+    turn_id = new_turn_id("idle")
     idle_context = {
         "last_interaction": datetime.fromtimestamp(last_activity, tz=UTC).isoformat(),
         "hours_since_last_interaction": round((time.time() - last_activity) / 3600, 1),
@@ -252,32 +252,39 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     }
 
     try:
-        async with ctx.pending.session(turn_id) as queue:
-            await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(idle_payload).encode())
-            log.info("Idle turn published", extra={"turn_id": turn_id})
+        # Idle reflection is single-shot — one response with done=True.
+        # `submit_turn_single` handles publish + pending queue lifecycle and,
+        # crucially, publishes CORTEX_STUCK on timeout so immune can rescue
+        # a wedged cortex regardless of who initiated the turn.
+        response_data = await submit_turn_single(
+            ctx,
+            turn_id=turn_id,
+            payload=idle_payload,
+            timeout=TURN_TIMEOUT,
+            mode="idle",
+            user_waiting=False,
+        )
+        log.info("Idle turn published", extra={"turn_id": turn_id})
+        thought = response_data.get("response", "")
 
-            # Idle reflection is single-shot — one response with done=True
-            response_data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-            thought = response_data.get("response", "")
+        clean_thought = strip_tags(thought or "")
+        config_updates = parse_config_tags(thought or "")
+        if config_updates:
+            await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
 
-            clean_thought = strip_tags(thought or "")
-            config_updates = parse_config_tags(thought or "")
-            if config_updates:
-                await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
+        if clean_thought:
+            thought_payload = {"text": clean_thought, "turn_id": turn_id}
+            await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
+            log.info("Thought published", extra={"turn_id": turn_id})
 
-            if clean_thought:
-                thought_payload = {"text": clean_thought, "turn_id": turn_id}
-                await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
-                log.info("Thought published", extra={"turn_id": turn_id})
-
-                state_summary = ctx.format_system_state(system_state)
-                spawn_background(
-                    ctx.feed_memories(
-                        f"[Idle reflection] System state: {state_summary}",
-                        clean_thought,
-                    ),
-                    name="idle.feed_memories",
-                )
+            state_summary = ctx.format_system_state(system_state)
+            spawn_background(
+                ctx.feed_memories(
+                    f"[Idle reflection] System state: {state_summary}",
+                    clean_thought,
+                ),
+                name="idle.feed_memories",
+            )
 
     except TimeoutError:
         log.error("Idle turn timed out", extra={"turn_id": turn_id})

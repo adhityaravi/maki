@@ -38,8 +38,6 @@ from maki_common.subjects import (
     CONFIG_SYNC,
     CONVERSATION_STREAM,
     CORTEX_HEALTH,
-    CORTEX_STUCK,
-    CORTEX_TURN_REQUEST,
     CORTEX_TURN_RESPONSE,
     DB_QUERY,
     EARS_IN,
@@ -59,6 +57,7 @@ from maki_stem.trading import (
     trading_signal_listener,
     trading_tool_listener,
 )
+from maki_stem.turn import new_turn_id, submit_turn_streaming
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -838,7 +837,7 @@ async def _process_turn(
     """
     await kv_put_float(_lock_kv, "stem.last_activity", time.time())
 
-    turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+    turn_id = new_turn_id("turn")
     _active_turns[turn_id] = time.time()
     log.info("Turn started", extra={"turn_id": turn_id, "message_len": len(message)})
 
@@ -878,72 +877,61 @@ async def _process_turn(
     full_response = []
 
     try:
-        async with _pending.session(turn_id) as queue:
-            await _nc.publish(CORTEX_TURN_REQUEST, json.dumps(turn_payload).encode())
-            log.info("Turn request published", extra={"turn_id": turn_id})
+        log.info("Turn request publishing", extra={"turn_id": turn_id})
+        # ``submit_turn_streaming`` handles publish + queue lifecycle and
+        # publishes CORTEX_STUCK on timeout uniformly across all callers (#125).
+        async for data in submit_turn_streaming(
+            _stem_ctx,
+            turn_id=turn_id,
+            payload=turn_payload,
+            timeout=TURN_TIMEOUT,
+            mode="normal",
+            user_waiting=True,
+        ):
+            if data.get("cancelled"):
+                log.warning(
+                    "Turn cancelled by cortex restart",
+                    extra={"turn_id": turn_id, "partial_chunks": len(full_response)},
+                )
+                # Raise so the caller's RuntimeError handler runs:
+                # no memory write, no conversation stream publish, and ears
+                # receives the "lost my train of thought" message instead of
+                # a phantom empty done chunk.
+                raise RuntimeError("cortex_restart_cancelled")
 
-            while True:
-                try:
-                    data = await asyncio.wait_for(queue.get(), timeout=TURN_TIMEOUT)
-                except TimeoutError:
-                    log.error("Turn timed out", extra={"turn_id": turn_id})
-                    await _nc.publish(
-                        CORTEX_STUCK,
-                        json.dumps(
-                            {
-                                "turn_id": turn_id,
-                                "mode": "normal",
-                                "timeout_seconds": TURN_TIMEOUT,
-                                "user_waiting": True,
-                            }
-                        ).encode(),
-                    )
-                    raise
+            chunk_text = data.get("response", "")
+            done = data.get("done", False)
 
-                if data.get("cancelled"):
-                    log.warning(
-                        "Turn cancelled by cortex restart",
-                        extra={"turn_id": turn_id, "partial_chunks": len(full_response)},
-                    )
-                    # Raise so the caller's RuntimeError handler runs:
-                    # no memory write, no conversation stream publish, and ears
-                    # receives the "lost my train of thought" message instead of
-                    # a phantom empty done chunk.
-                    raise RuntimeError("cortex_restart_cancelled")
+            if chunk_text:
+                full_response.append(chunk_text)
 
-                chunk_text = data.get("response", "")
-                done = data.get("done", False)
+            if forward_to and (chunk_text or done):
+                ears_msg = {
+                    "message_id": forward_to["message_id"],
+                    "channel_id": forward_to["channel_id"],
+                    "turn_id": turn_id,
+                    "response": chunk_text,
+                    "done": done,
+                }
+                await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
 
-                if chunk_text:
-                    full_response.append(chunk_text)
+        cortex_response = "".join(full_response)
+        clean_response = strip_tags(cortex_response)
+        config_updates = parse_config_tags(cortex_response)
+        if config_updates:
+            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
 
-                if forward_to and (chunk_text or done):
-                    ears_msg = {
-                        "message_id": forward_to["message_id"],
-                        "channel_id": forward_to["channel_id"],
-                        "turn_id": turn_id,
-                        "response": chunk_text,
-                        "done": done,
-                    }
-                    await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
+        spawn_background(
+            _publish_turn_to_stream(turn_id, message, clean_response),
+            name="stem.publish_turn_to_stream",
+        )
+        spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
 
-                if done:
-                    break
+        return turn_id, clean_response
 
-            cortex_response = "".join(full_response)
-            clean_response = strip_tags(cortex_response)
-            config_updates = parse_config_tags(cortex_response)
-            if config_updates:
-                await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
-
-            spawn_background(
-                _publish_turn_to_stream(turn_id, message, clean_response),
-                name="stem.publish_turn_to_stream",
-            )
-            spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
-
-            return turn_id, clean_response
-
+    except TimeoutError:
+        log.error("Turn timed out", extra={"turn_id": turn_id})
+        raise
     finally:
         _active_turns.pop(turn_id, None)
 
