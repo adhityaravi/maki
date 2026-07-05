@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import uuid
+from functools import partial
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
@@ -34,6 +35,7 @@ from maki_common.subjects import (
 from maki_immune import claude as claude_mod
 from maki_immune import deploy as deploy_mod
 from maki_immune import health as health_mod
+from maki_immune.lock import infra_lock as _infra_lock_impl
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -355,6 +357,15 @@ async def _release_lock(holder: str):
             )
     except Exception:
         pass
+
+
+# ``async with _infra_lock("immune-X", ttl=Y)`` for deploy/health call sites.
+# Raises ``LockNotAcquired`` when the lock is held elsewhere; always releases on
+# exit. Callers use ``try/except LockNotAcquired`` to render their site-specific
+# "lock held" response (see #127). ``partial`` binds the module-level
+# acquire/release functions so submodules don't need to know they exist — the
+# CM they receive already carries the correct kv-backed implementation.
+_infra_lock = partial(_infra_lock_impl, acquire=_acquire_lock, release=_release_lock)
 
 
 # --- Recent Actions Persistence ---
@@ -756,8 +767,7 @@ async def main():
         recent_actions_max=RECENT_ACTIONS_MAX,
         deploy_history=_deploy_history,
         failed_image_blacklist=_failed_image_blacklist,
-        acquire_lock=_acquire_lock,
-        release_lock=_release_lock,
+        infra_lock=_infra_lock,
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
@@ -814,8 +824,7 @@ async def main():
         hive_state=_hive_state,
         failed_image_blacklist=_failed_image_blacklist,
         cortex_state=_cortex_state,
-        acquire_lock=_acquire_lock,
-        release_lock=_release_lock,
+        infra_lock=_infra_lock,
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,

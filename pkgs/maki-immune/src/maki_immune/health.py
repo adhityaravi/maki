@@ -13,6 +13,8 @@ from kubernetes import client as k8s_client
 from maki_common import load_kv_config, spawn_background, subscribe_supervised
 from maki_common.subjects import CORTEX_STUCK, CORTEX_TOKEN_USAGE, IMMUNE_ACTION, IMMUNE_HEALTH
 
+from maki_immune.lock import LockNotAcquired
+
 # Wall-clock seconds a single cortex turn may run before immune publishes
 # CORTEX_STUCK as a safety net. Cortex has its own internal asyncio.wait_for
 # (CORTEX_MAX_TURN_SECONDS, default 1200s); this immune-side watchdog is the
@@ -157,8 +159,7 @@ _running_images: Any = None
 _hive_state: Any = None
 _failed_image_blacklist: Any = None
 _cortex_state: Any = None  # dict with last_heartbeat, active_turn, turn_mode, turn_started
-_acquire_lock: Any = None
-_release_lock: Any = None
+_infra_lock: Any = None
 _publish_alert: Any = None
 _publish_vitals: Any = None
 _schedule_persist: Any = None
@@ -243,8 +244,7 @@ def init(
     hive_state,
     failed_image_blacklist,
     cortex_state,
-    acquire_lock,
-    release_lock,
+    infra_lock,
     publish_alert,
     publish_vitals,
     schedule_persist_recent_actions,
@@ -254,7 +254,7 @@ def init(
     global _check_interval, _gossip_stale_threshold, _health_endpoints, _default_config, _config_kv, _cortex_config_kv
     global _component_health, _pod_metrics, _restart_history, _recent_actions, _recent_actions_max
     global _running_images, _hive_state, _failed_image_blacklist, _cortex_state
-    global _acquire_lock, _release_lock, _publish_alert, _publish_vitals, _schedule_persist
+    global _infra_lock, _publish_alert, _publish_vitals, _schedule_persist
     global _escalate_to_claude
     _nc = nc
     _k8s_v1 = k8s_v1
@@ -277,8 +277,7 @@ def init(
     _hive_state = hive_state
     _failed_image_blacklist = failed_image_blacklist
     _cortex_state = cortex_state
-    _acquire_lock = acquire_lock
-    _release_lock = release_lock
+    _infra_lock = infra_lock
     _publish_alert = publish_alert
     _publish_vitals = publish_vitals
     _schedule_persist = schedule_persist_recent_actions
@@ -855,44 +854,48 @@ async def _trigger_reflex(component: str, state: dict, config: dict):
         )
         return
 
-    if not await _acquire_lock("immune-reflex", ttl=60):
+    try:
+        async with _infra_lock("immune-reflex", ttl=60):
+            try:
+                history.append(now)
+                _restart_history[component] = history
+
+                await asyncio.to_thread(
+                    _k8s_v1.delete_namespaced_pod,
+                    name=pod_name,
+                    namespace=_namespace,
+                    grace_period_seconds=10,
+                )
+
+                action = {
+                    "type": "reflex_restart",
+                    "component": component,
+                    "pod_name": pod_name,
+                    "restart_number": len(history),
+                    "max_restarts": max_restarts,
+                    "timestamp": now,
+                }
+                _recent_actions.append(action)
+                if len(_recent_actions) > _recent_actions_max:
+                    _recent_actions.pop(0)
+                _schedule_persist()
+
+                log.info(
+                    "Reflex restart",
+                    extra={
+                        "component": component,
+                        "pod_name": pod_name,
+                        "restart_number": len(history),
+                        "max": max_restarts,
+                    },
+                )
+                await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+
+            except Exception:
+                log.exception("Failed to restart pod", extra={"pod_name": pod_name})
+    except LockNotAcquired:
         log.warning("Cannot acquire lock for reflex restart", extra={"component": component})
         return
-
-    try:
-        history.append(now)
-        _restart_history[component] = history
-
-        await asyncio.to_thread(
-            _k8s_v1.delete_namespaced_pod,
-            name=pod_name,
-            namespace=_namespace,
-            grace_period_seconds=10,
-        )
-
-        action = {
-            "type": "reflex_restart",
-            "component": component,
-            "pod_name": pod_name,
-            "restart_number": len(history),
-            "max_restarts": max_restarts,
-            "timestamp": now,
-        }
-        _recent_actions.append(action)
-        if len(_recent_actions) > _recent_actions_max:
-            _recent_actions.pop(0)
-        _schedule_persist()
-
-        log.info(
-            "Reflex restart",
-            extra={"component": component, "pod_name": pod_name, "restart_number": len(history), "max": max_restarts},
-        )
-        await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-
-    except Exception:
-        log.exception("Failed to restart pod", extra={"pod_name": pod_name})
-    finally:
-        await _release_lock("immune-reflex")
 
 
 # --- Stuck-Component Detection (Tier 1.5) ---
@@ -1482,66 +1485,65 @@ async def _check_stuck_recovery(config: dict) -> None:
         if not pod_name:
             continue
 
-        if not await _acquire_lock("immune-stuck-recovery", ttl=60):
-            log.warning("Cannot acquire lock for stuck recovery", extra={"component": component})
-            continue
-
         stuck_hours = round(stuck_for / 3600, 1)
         try:
-            await asyncio.to_thread(
-                _k8s_v1.delete_namespaced_pod,
-                name=pod_name,
-                namespace=_namespace,
-                grace_period_seconds=30,
-            )
+            async with _infra_lock("immune-stuck-recovery", ttl=60):
+                try:
+                    await asyncio.to_thread(
+                        _k8s_v1.delete_namespaced_pod,
+                        name=pod_name,
+                        namespace=_namespace,
+                        grace_period_seconds=30,
+                    )
 
-            count = int(tracker.get("count") or 0) + 1
-            tracker["last_attempted_at"] = now
-            tracker["count"] = count
+                    count = int(tracker.get("count") or 0) + 1
+                    tracker["last_attempted_at"] = now
+                    tracker["count"] = count
 
-            log.error(
-                "Stuck-recovery pod delete fired",
-                extra={
-                    "component": component,
-                    "pod_name": pod_name,
-                    "stuck_for_hours": stuck_hours,
-                    "attempt_count": count,
-                    "healthy_peers": healthy_peers,
-                    "phase": phase,
-                    "waiting_reason": waiting_reason,
-                },
-            )
+                    log.error(
+                        "Stuck-recovery pod delete fired",
+                        extra={
+                            "component": component,
+                            "pod_name": pod_name,
+                            "stuck_for_hours": stuck_hours,
+                            "attempt_count": count,
+                            "healthy_peers": healthy_peers,
+                            "phase": phase,
+                            "waiting_reason": waiting_reason,
+                        },
+                    )
 
-            await _publish_alert(
-                f"AUTO-RECOVERY: deleted {pod_name} after {stuck_hours}h stuck in "
-                f"phase={phase}/{waiting_reason or 'unhealthy'}. Hive shows healthy "
-                f"peers on {healthy_peers} so this is a local-only wedge safe to act on. "
-                f"Attempt #{count}; kubelet will recreate from spec."
-            )
+                    await _publish_alert(
+                        f"AUTO-RECOVERY: deleted {pod_name} after {stuck_hours}h stuck in "
+                        f"phase={phase}/{waiting_reason or 'unhealthy'}. Hive shows healthy "
+                        f"peers on {healthy_peers} so this is a local-only wedge safe to act on. "
+                        f"Attempt #{count}; kubelet will recreate from spec."
+                    )
 
-            action = {
-                "type": "stuck_recovery_delete",
-                "component": component,
-                "pod_name": pod_name,
-                "stuck_for_hours": stuck_hours,
-                "attempt_count": count,
-                "healthy_peers": healthy_peers,
-                "phase": phase,
-                "waiting_reason": waiting_reason,
-                "timestamp": now,
-            }
-            _recent_actions.append(action)
-            if len(_recent_actions) > _recent_actions_max:
-                _recent_actions.pop(0)
-            _schedule_persist()
-            try:
-                await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-            except Exception:
-                log.exception("Failed to publish stuck-recovery action")
-        except Exception:
-            log.exception("Failed to delete stuck pod", extra={"pod_name": pod_name})
-        finally:
-            await _release_lock("immune-stuck-recovery")
+                    action = {
+                        "type": "stuck_recovery_delete",
+                        "component": component,
+                        "pod_name": pod_name,
+                        "stuck_for_hours": stuck_hours,
+                        "attempt_count": count,
+                        "healthy_peers": healthy_peers,
+                        "phase": phase,
+                        "waiting_reason": waiting_reason,
+                        "timestamp": now,
+                    }
+                    _recent_actions.append(action)
+                    if len(_recent_actions) > _recent_actions_max:
+                        _recent_actions.pop(0)
+                    _schedule_persist()
+                    try:
+                        await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+                    except Exception:
+                        log.exception("Failed to publish stuck-recovery action")
+                except Exception:
+                    log.exception("Failed to delete stuck pod", extra={"pod_name": pod_name})
+        except LockNotAcquired:
+            log.warning("Cannot acquire lock for stuck recovery", extra={"component": component})
+            continue
 
 
 # --- Gossip Ring ---
