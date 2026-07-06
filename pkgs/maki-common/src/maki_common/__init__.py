@@ -1,6 +1,7 @@
 """maki-common: Shared utilities for Maki services."""
 
 from maki_common.config import apply_config_updates, parse_config_tags, parse_tagged, strip_tags
+from maki_common.db import build_pg_dsn
 from maki_common.futures import PendingFutures, PendingQueues
 from maki_common.logging import configure_logging, get_logger
 from maki_common.nats import (
@@ -26,6 +27,7 @@ __all__ = [
     "__version__",
     "active_background_task_count",
     "apply_config_updates",
+    "build_pg_dsn",
     "configure_logging",
     "connect_nats",
     "format_graph_block",

@@ -11,13 +11,12 @@ import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import quote_plus
 
 import neo4j
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from maki_common import configure_logging, connect_nats
+from maki_common import build_pg_dsn, configure_logging, connect_nats
 from maki_common.subjects import IMMUNE_ALERT
 from mem0 import Memory
 from pydantic import BaseModel, Field
@@ -123,20 +122,14 @@ PROBE_DEADLINE_S = float(os.environ.get("RECALL_PROBE_DEADLINE_S", "5.0"))
 
 
 def _build_pg_uri() -> str:
-    user = quote_plus(os.environ.get("POSTGRES_USER", "maki"))
-    password = quote_plus(os.environ["POSTGRES_PASSWORD"])
-    hosts = os.environ.get("POSTGRES_HOST", "maki-vault")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db = os.environ.get("POSTGRES_DB", "maki")
-    host_port = ",".join(f"{h}:{port}" for h in hosts.split(","))
-    # connect_timeout is a libpq URI parameter — applies to both psycopg
-    # (used by mem0's pgvector backend) and any other libpq client built
-    # from this URI. See #312 — without it, a half-open TCP socket to
-    # Postgres hung Memory.from_config indefinitely.
-    return (
-        f"postgresql://{user}:{password}@{host_port}/{db}"
-        f"?target_session_attrs=read-write&connect_timeout={PG_CONNECT_TIMEOUT_S}"
-    )
+    # Thin wrapper around maki_common.build_pg_dsn — kept as a local
+    # helper so the two libpq-specific tunings recall wants (a fleet-wide
+    # HA-aware DSN plus a URI-level connect_timeout for #312) live in one
+    # place at the call sites. The single-vs-multi-host, URL-encoding,
+    # and target_session_attrs behavior all live in maki_common now
+    # (see #130 — stem's local builder used to string-interpolate a
+    # comma-separated POSTGRES_HOST straight into the URL).
+    return build_pg_dsn(connect_timeout=PG_CONNECT_TIMEOUT_S)
 
 
 def _build_config() -> tuple[dict[str, Any], bool]:

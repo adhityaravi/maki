@@ -14,7 +14,6 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from importlib.metadata import entry_points
-from urllib.parse import quote_plus
 
 import asyncpg
 import httpx
@@ -23,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from maki_common import (
     PendingQueues,
+    build_pg_dsn,
     configure_logging,
     connect_nats,
     init_kv,
@@ -162,9 +162,17 @@ _db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in 
 
 
 def _build_pg_dsn() -> str:
-    """Build PostgreSQL DSN from environment variables."""
-    pw = quote_plus(POSTGRES_PASSWORD) if POSTGRES_PASSWORD else ""
-    return f"postgresql://{POSTGRES_USER}:{pw}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    """Build PostgreSQL DSN from environment variables.
+
+    Delegates to ``maki_common.build_pg_dsn`` so stem and recall use one
+    shared HA-aware builder — the old local version string-interpolated
+    ``POSTGRES_HOST`` directly and would emit an invalid URI as soon as
+    vault ran as an HA pair with a comma-separated host list. See #130.
+    asyncpg parses libpq-style multi-host URIs and honours
+    ``target_session_attrs`` in the query string, so no per-driver
+    special-case is needed here.
+    """
+    return build_pg_dsn()
 
 
 def _init_github_client():
