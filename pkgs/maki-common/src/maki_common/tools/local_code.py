@@ -24,10 +24,20 @@ MAX_SEARCH_RESULTS = 30
 
 
 def _safe_path(repo_path: str, relative: str) -> Path | None:
-    """Resolve a relative path within repo_path, rejecting traversal."""
+    """Resolve a relative path within repo_path, rejecting traversal.
+
+    Uses component-wise containment (``Path.is_relative_to``) rather than a
+    string-prefix check — otherwise a sibling directory whose name shares a
+    prefix with the repo (e.g. ``/work/maki`` vs ``/work/maki-evil``) would
+    slip through and every filesystem tool (read, write, git_diff, ...) could
+    escape the repo.
+    """
     base = Path(repo_path).resolve()
-    target = (base / relative).resolve()
-    if not str(target).startswith(str(base)):
+    try:
+        target = (base / relative).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if target != base and not target.is_relative_to(base):
         return None
     return target
 
