@@ -289,15 +289,15 @@ _health_monitor_task: asyncio.Task | None = None
 _critical_listener_tasks: dict[str, asyncio.Task] = {}
 
 
-def _health_check() -> tuple[bool, str | None]:
-    """Return (ok, reason) for the readiness/liveness probe."""
-    if _nc is None or not _nc.is_connected:
-        return False, "NATS not connected"
-    if _lock_kv is None:
-        return False, "Infrastructure-lock KV not initialised"
-    if _health_monitor_task is None:
-        return False, "Health-monitor task not started"
-    if _health_monitor_task.done():
+def _liveness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/live`` liveness probe.
+
+    Only restart-worthy conditions fail here: the health-monitor task or a
+    supervised critical listener has exited. NATS disconnection is *not*
+    liveness — it either self-heals via reconnect or belongs to readiness'
+    "don't route to me" side. See issue #373 for the split rationale.
+    """
+    if _health_monitor_task is not None and _health_monitor_task.done():
         if _health_monitor_task.cancelled():
             return False, "Health-monitor task cancelled"
         exc = _health_monitor_task.exception()
@@ -309,6 +309,27 @@ def _health_check() -> tuple[bool, str | None]:
             exc = task.exception()
             return False, f"{label} listener crashed: {exc!r}"
     return True, None
+
+
+def _readiness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/health`` readiness probe.
+
+    Includes everything liveness checks plus startup/connectivity gates —
+    NATS, lock KV, health-monitor task presence — that don't warrant a
+    restart but should keep traffic off until they resolve.
+    """
+    if _nc is None or not _nc.is_connected:
+        return False, "NATS not connected"
+    if _lock_kv is None:
+        return False, "Infrastructure-lock KV not initialised"
+    if _health_monitor_task is None:
+        return False, "Health-monitor task not started"
+    return _liveness_check()
+
+
+# Legacy alias — semantically identical to readiness, matching the
+# pre-split behaviour of the single ``_health_check`` callable.
+_health_check = _readiness_check
 
 
 # --- Infrastructure Lock ---
@@ -889,7 +910,10 @@ async def main():
     _critical_listener_tasks["gossip"] = spawn_background(health_mod.gossip_listener(), name="gossip_listener")
     spawn_background(health_mod.gossip_publisher(), name="immune.gossip_publisher")
 
-    server = await tcp_health_server(port=HEALTH_PORT, check=_health_check)
+    server = await tcp_health_server(
+        port=HEALTH_PORT,
+        checks={"/live": _liveness_check, "/health": _readiness_check},
+    )
     log.info("Health server listening", extra={"port": HEALTH_PORT})
 
     await server.serve_forever()

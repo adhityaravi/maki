@@ -152,30 +152,28 @@ _critical_listener_tasks: dict[str, asyncio.Task] = {}
 CORTEX_LIVENESS_TURN_MULTIPLIER = float(os.environ.get("CORTEX_LIVENESS_TURN_MULTIPLIER", "2.0"))
 
 
-def _health_check() -> tuple[bool, str | None]:
-    """Return (ok, reason) for the readiness/liveness probe.
+def _liveness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/live`` liveness probe.
 
-    On top of the usual NATS / subscription / heartbeat checks, fail the
-    probe when the active turn has been running far longer than the soft
-    watchdog allows. The soft watchdog (asyncio.wait_for inside
-    handle_turn_request) only fires at suspension points; if the event
-    loop is wedged below the application layer the only recovery is to
-    let kubelet SIGKILL the pod. See issue #185.
+    Liveness answers a single question: "would a restart fix this?" It fails
+    only for conditions that require kubelet to SIGKILL and reschedule the
+    pod — a crashed heartbeat, a dead critical listener, or an event loop
+    wedged below the application layer (see issue #185). It deliberately
+    does *not* fail on NATS disconnection or missing startup state, because
+    those either fix themselves (reconnect) or belong to the readiness
+    probe's "don't route traffic to me" side of the split (issue #373).
     """
-    if _nc_ref is None or not _nc_ref.is_connected:
-        return False, "NATS not connected"
-    if _heartbeat_task is None:
-        return False, "Heartbeat task not started"
-    if _heartbeat_task.done():
+    # A heartbeat task that started and then died is a restart-worthy fault.
+    # A heartbeat that hasn't started yet is startup ordering — readiness'
+    # concern, not liveness'.
+    if _heartbeat_task is not None and _heartbeat_task.done():
         if _heartbeat_task.cancelled():
             return False, "Heartbeat task cancelled"
         exc = _heartbeat_task.exception()
         return False, f"Heartbeat task crashed: {exc!r}"
+
     # Critical listeners are wrapped in ``subscribe_supervised`` and should
-    # run forever. If any has exited, the readiness probe must fail so kubelet
-    # restarts the pod (issue #175).
-    if not _critical_listener_tasks:
-        return False, "Turn-request listener not started"
+    # run forever. If any has exited, kubelet must restart the pod (#175).
     for label, task in _critical_listener_tasks.items():
         if task.done():
             if task.cancelled():
@@ -202,6 +200,29 @@ def _health_check() -> tuple[bool, str | None]:
             )
 
     return True, None
+
+
+def _readiness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/health`` readiness probe.
+
+    Readiness answers "should I receive turn traffic right now?" It fails
+    on anything liveness fails on (a broken pod isn't ready either) plus
+    startup-ordering and connectivity conditions that don't warrant a
+    restart: NATS reconnecting, listeners not yet subscribed. See #373.
+    """
+    if _nc_ref is None or not _nc_ref.is_connected:
+        return False, "NATS not connected"
+    if _heartbeat_task is None:
+        return False, "Heartbeat task not started"
+    if not _critical_listener_tasks:
+        return False, "Turn-request listener not started"
+    return _liveness_check()
+
+
+# Retained under the legacy name for any external caller that imported
+# ``_health_check`` directly. Semantically identical to readiness — the
+# stricter of the two, matching the pre-split behaviour.
+_health_check = _readiness_check
 
 
 _BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care", "trading_analyst"})
@@ -663,10 +684,16 @@ async def main():
     )
 
     # Health server up front so kubelet probes can connect from the moment
-    # the pod starts. The check returns 503 until NATS, the turn subscription
-    # and the heartbeat task are all live, which keeps readiness false during
-    # startup (no traffic routed) without killing the pod via liveness.
-    await tcp_health_server(port=HEALTH_PORT, check=_health_check)
+    # the pod starts. ``/health`` (readiness) returns 503 until NATS, the
+    # turn subscription and the heartbeat task are all live, keeping traffic
+    # off during startup. ``/live`` (liveness) is the narrower "would a
+    # restart fix this?" check — it stays green during NATS reconnects so
+    # kubelet doesn't SIGKILL a pod that's just waiting for the nerve to
+    # come back. Split enabled by issue #373.
+    await tcp_health_server(
+        port=HEALTH_PORT,
+        checks={"/live": _liveness_check, "/health": _readiness_check},
+    )
     log.info("Health server started", extra={"port": HEALTH_PORT})
 
     global _nc_ref, _heartbeat_task

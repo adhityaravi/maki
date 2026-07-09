@@ -5,11 +5,23 @@ indistinguishable from a wired-but-broken pod when used as a Kubernetes
 readiness probe target — disconnected NATS, dead subscriptions, or a crashed
 background task all sailed through.
 
-This module now supports a per-service ``check`` callable. The callable returns
-``(ok: bool, reason: str | None)``. When ``ok`` is ``False`` the response is a
-``503 Service Unavailable`` with the reason in the JSON body. When no check is
-registered the server keeps the legacy "always 200" behaviour for callers that
-genuinely have no health state worth reporting.
+Two related fixes live here now:
+
+1. Per-service ``check`` callable. The callable returns
+   ``(ok: bool, reason: str | None)``. When ``ok`` is ``False`` the response
+   is a ``503 Service Unavailable`` with the reason in the JSON body. When no
+   check is registered the server keeps the legacy "always 200" behaviour for
+   callers that genuinely have no health state worth reporting.
+
+2. HTTP path routing (issue #373). The old handler discarded the request line
+   entirely, which meant ``GET /live``, ``GET /health`` and ``GET /nonexistent``
+   all ran the same check. That collapsed liveness and readiness onto a single
+   endpoint and is the architectural reason cortex/immune couldn't wire a
+   separate ``livenessProbe`` (#276). The server now accepts a ``checks``
+   mapping of URL path → check. Unregistered paths return ``404 Not Found`` so
+   probe misconfiguration surfaces instead of masquerading as healthy. The
+   single ``check`` API is retained as a whole-server fallback for backwards
+   compatibility with pre-routing callers.
 """
 
 from __future__ import annotations
@@ -34,6 +46,14 @@ _OK_RESPONSE = (
     b"Content-Type: application/json\r\n"
     b"Content-Length: " + str(len(_OK_BODY)).encode() + b"\r\n"
     b"\r\n" + _OK_BODY
+)
+
+_NOT_FOUND_BODY = b'{"status":"not_found"}'
+_NOT_FOUND_RESPONSE = (
+    b"HTTP/1.1 404 Not Found\r\n"
+    b"Content-Type: application/json\r\n"
+    b"Content-Length: " + str(len(_NOT_FOUND_BODY)).encode() + b"\r\n"
+    b"\r\n" + _NOT_FOUND_BODY
 )
 
 
@@ -61,18 +81,72 @@ async def _run_check(check: HealthCheck) -> tuple[bool, str | None]:
         return False, f"check raised: {type(exc).__name__}: {exc}"
 
 
-def _make_handler(check: HealthCheck | None):
+def _parse_request_path(raw: bytes) -> str | None:
+    """Extract the URL path from an HTTP request line.
+
+    Returns ``None`` on malformed input. Only looks at the first CRLF-delimited
+    line (the request line) — headers and body are ignored because we only need
+    the path to route. Query string, if present, is stripped.
+    """
+    try:
+        line_end = raw.find(b"\r\n")
+        if line_end == -1:
+            # Some minimal clients only send LF; be lenient so probes still route.
+            line_end = raw.find(b"\n")
+            if line_end == -1:
+                return None
+        parts = raw[:line_end].split(b" ")
+        if len(parts) < 2:
+            return None
+        target = parts[1].decode("ascii", errors="replace")
+        q = target.find("?")
+        if q != -1:
+            target = target[:q]
+        return target or "/"
+    except Exception:
+        return None
+
+
+def _make_handler(check: HealthCheck | None, checks: dict[str, HealthCheck] | None):
+    routes: dict[str, HealthCheck] = dict(checks or {})
+    fallback: HealthCheck | None = check
+    has_routes = bool(routes)
+
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await reader.read(4096)
-            if check is None:
+            raw = await reader.read(4096)
+
+            # Nothing configured at all → legacy always-200 (vault sidecars etc).
+            if not has_routes and fallback is None:
+                writer.write(_OK_RESPONSE)
+                await writer.drain()
+                return
+
+            path = _parse_request_path(raw)
+            selected: HealthCheck | None = None
+
+            if path is not None and path in routes:
+                selected = routes[path]
+            elif not has_routes:
+                # Single-check overload: match every path (pre-routing behaviour).
+                selected = fallback
+            elif fallback is not None:
+                # Route table + explicit fallback: unlisted paths hit the fallback.
+                selected = fallback
+
+            if selected is None:
+                # Route table configured but path is unknown and no fallback given.
+                # 404 on purpose — silent 200 on ``/nonexistent`` was a
+                # probe-misconfiguration trap (issue #373).
+                writer.write(_NOT_FOUND_RESPONSE)
+                await writer.drain()
+                return
+
+            ok, reason = await _run_check(selected)
+            if ok:
                 writer.write(_OK_RESPONSE)
             else:
-                ok, reason = await _run_check(check)
-                if ok:
-                    writer.write(_OK_RESPONSE)
-                else:
-                    writer.write(_build_unhealthy_response(reason))
+                writer.write(_build_unhealthy_response(reason))
             await writer.drain()
         except Exception:
             log.exception("Health handler failed")
@@ -89,23 +163,38 @@ async def tcp_health_server(
     host: str = "0.0.0.0",
     port: int = 8080,
     check: HealthCheck | None = None,
+    checks: dict[str, HealthCheck] | None = None,
 ) -> asyncio.Server:
     """Start a minimal TCP health endpoint.
 
-    If *check* is provided it is invoked on every request and must return
-    ``(ok: bool, reason: str | None)``. When ``ok`` is ``False`` the response
-    is a 503 with the reason in the JSON body. With no check, the server
-    returns 200 unconditionally — only suitable for services that genuinely
-    have no meaningful health state (vault sidecars, etc).
+    Two composable APIs:
 
-    *check* may be sync or async. Exceptions inside the check are converted
-    to an unhealthy response rather than propagated, so a buggy check never
+    * ``check`` — single callable used for every URL path. Backwards-compatible
+      with pre-routing callers. When ``checks`` is *also* provided, ``check``
+      acts as a fallback for paths not present in the mapping.
+    * ``checks`` — mapping of URL path (e.g. ``"/live"``, ``"/health"``) to
+      individual check callables. Requests for paths not in the mapping and
+      not covered by ``check`` return **404 Not Found** so a mis-wired probe
+      surfaces instead of silently succeeding.
+
+    Each check returns ``(ok: bool, reason: str | None)``. When ``ok`` is
+    ``False`` the response is a 503 with the reason in the JSON body. With no
+    check configured, the server returns 200 unconditionally — only suitable
+    for services that genuinely have no meaningful health state.
+
+    Checks may be sync or async. Exceptions inside a check are converted to
+    an unhealthy response rather than propagated, so a buggy check never
     crashes the listener.
     """
-    handler = _make_handler(check)
+    handler = _make_handler(check, checks)
     server = await asyncio.start_server(handler, host, port)
     log.info(
         "Health server listening",
-        extra={"host": host, "port": port, "checked": check is not None},
+        extra={
+            "host": host,
+            "port": port,
+            "single_check": check is not None,
+            "routes": sorted(checks.keys()) if checks else [],
+        },
     )
     return server
