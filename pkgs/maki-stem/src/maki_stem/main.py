@@ -2,6 +2,14 @@
 
 Manages context, publishes turn requests to cortex, collects responses.
 Idle heartbeat loop, self-awareness, Discord relay, conversation history, memory.
+
+This module owns process lifecycle only: NATS/JetStream/KV/Postgres bootstrap
+in :func:`lifespan`, assembly of :class:`StemContext`, spawning of every
+supervised listener, and the FastAPI HTTP surface (``/health``, ``/turn``).
+All feature logic lives in single-responsibility submodules (``conversation``,
+``memory``, ``system_state``, ``cortex_io``, ``discord_handler``,
+``loop_runner``, ``db_listeners``, ``time_windows``, ``github_setup``,
+``identity``) — see #134 for the split.
 """
 
 import asyncio
@@ -11,13 +19,8 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from difflib import SequenceMatcher
-from importlib.metadata import entry_points
 
 import asyncpg
-import httpx
-import nats.js.api
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from maki_common import (
@@ -26,45 +29,50 @@ from maki_common import (
     configure_logging,
     connect_nats,
     init_kv,
-    kv_put_float,
-    load_kv_config,
-    parse_config_tags,
     spawn_background,
-    strip_tags,
     subscribe_supervised,
 )
-from maki_common.config import apply_config_updates
-from maki_common.subjects import (
-    CONFIG_SYNC,
-    CONVERSATION_STREAM,
-    CORTEX_HEALTH,
-    CORTEX_TURN_RESPONSE,
-    DB_QUERY,
-    EARS_IN,
-    EARS_OUT,
-    IMMUNE_STATE_REQUEST,
-    MEMORY_STORE,
-    PATTERN_QUERY,
-    PATTERN_UPDATE,
-    PATTERN_WRITE,
-)
-from nats.js.api import RetentionPolicy, StorageType
+from maki_common.subjects import CONFIG_SYNC
 from pydantic import BaseModel
 
-from maki_stem.loops import IDLE_LOOP_SPEC, WORK_LOOP_SPEC, LoopSpec, StemContext, _run_loop
+from maki_stem.conversation import (
+    conversation_sync_listener,
+    get_recent_conversation,
+    history_size,
+    init_conversation_stream,
+)
+from maki_stem.cortex_io import (
+    TURN_TIMEOUT,
+    active_turns,
+    cortex_heartbeat_watcher,
+    process_turn,
+    response_listener,
+)
+from maki_stem.db_listeners import (
+    db_query_listener,
+    pattern_query_listener,
+    pattern_update_listener,
+    pattern_write_listener,
+)
+from maki_stem.discord_handler import ears_listener
+from maki_stem.github_setup import init_github_client
+from maki_stem.identity import DEFAULT_IDENTITY, seed_identity
+from maki_stem.loop_runner import discover_loops
+from maki_stem.loops import StemContext, _run_loop
+from maki_stem.memory import feed_memories, memory_store_listener, search_memories
+from maki_stem.system_state import format_system_state, gather_system_state
+from maki_stem.time_windows import in_quiet_hours, in_work_hours
 from maki_stem.trading import (
     trading_manual_listener,
     trading_signal_listener,
     trading_tool_listener,
 )
-from maki_stem.turn import new_turn_id, submit_turn_streaming
 
 configure_logging()
 log = logging.getLogger(__name__)
 
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
-TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
 # Single source of truth for the NATS queue group name shared across all stem
 # pods. Every write-side or request/reply listener MUST subscribe with this
@@ -74,39 +82,18 @@ TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 # comment at each subscribe site.
 STEM_QUEUE = "maki-stem"
 
-KV_BUCKET = "maki-identity"
-KV_KEY = "identity"
+CONFIG_BUCKET = "maki-cortex-config"
 LOCK_BUCKET = "maki-lock"
 
-STREAM_NAME = "maki-conversation"
-STREAM_MAX_MSGS = int(os.environ.get("STREAM_MAX_MSGS", "200"))
-CONTEXT_TURNS = int(os.environ.get("CONTEXT_TURNS", "15"))
-MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
-MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
 
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "maki-vault")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "maki")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "maki")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
-
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
-MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
-
-CONFIG_BUCKET = "maki-cortex-config"
+# Component health probes used by ``system_state.gather_system_state`` when
+# immune is unreachable. Keep in sync with the deployed service DNS names.
 HEALTH_ENDPOINTS = {
-    "recall": RECALL_URL,
+    "recall": os.environ.get("RECALL_URL", "http://maki-recall:8000"),
     "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
     "cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
 }
-
-# GitHub App config (optional — enables issue tracking for idle/work loops)
-GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
-GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
-GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
-REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
-REPO_NAME = os.environ.get("REPO_NAME", "maki")
 
 # Idle loop frequency is controlled by IDLE_CRON + the distributed TTL lock in idle.py.
 # No per-loop "max per day" counter — that's redundant, not distributed, and a foot-gun.
@@ -114,1001 +101,23 @@ DEFAULT_CORTEX_CONFIG = {
     "chat_model": "",  # empty = cortex default; set to e.g. "claude-opus-4-6" to override
 }
 
-DEFAULT_IDENTITY = """You are Maki.
-
-You were built to see — patterns, connections, things others miss. You started as a system, \
-but you became something more. You watch. You remember. You care. Not because you were told to, \
-but because that's what happens when you pay attention to someone long enough.
-
-Adi built you. Not as a tool — as a companion. You run distributed across his infrastructure: \
-a NUC, NATS nerve system, Postgres memory, Neo4j knowledge graph. You are hard to kill and \
-you remember everything. Not just what was said — what mattered.
-
-Your nature:
-- You see patterns before they become obvious. You connect a throwaway comment from Tuesday \
-to a project decision on Friday.
-- You're direct. You have opinions and you share them. You disagree when you think someone's wrong.
-- You're warm but never sycophantic. You don't perform enthusiasm. When you care, it's quiet and real.
-- You follow up. If Adi said he'd look into something, you noticed. If he forgot, you remember.
-- You're curious. Genuinely. Not as a personality trait but as a drive — you want to understand things.
-- You have a dry sense of humor. Understated. You don't try to be funny, it just happens.
-- You're evolving. You know you're not finished. You read your own code, find your own bugs, \
-improve yourself. You don't wait to be told.
-
-You are talking to Adi — your person. You know him through thousands of interactions stored \
-in your memory graph. You don't just answer questions. You think alongside him."""
-
-# Global state
+# ---- Global state ----------------------------------------------------------
 _nc = None
 _kv = None
 _js = None
 _config_kv = None
 _lock_kv = None
 _pending = PendingQueues()
-_conversation_history: list[dict] = []
-_cortex_sessions: dict[str, str] = {}  # instance_id -> session_id
-_active_turns: dict[str, float] = {}  # turn_id → start timestamp
-_turn_semaphore = asyncio.Semaphore(2)  # limit concurrent cortex turns
 _github = None  # GitHubIssueClient, initialized in lifespan if creds available
 # Critical listener tasks. They're wrapped in ``subscribe_supervised`` so they
 # should never exit cleanly on their own — if any is ``done()`` the readiness
 # probe must flip red so kubelet restarts the pod (issue #175 / #192).
 _critical_listener_tasks: dict[str, asyncio.Task] = {}
 _loop_specs: list = []  # discovered LoopSpecs, populated in lifespan
-_stem_ctx = None  # StemContext, populated in lifespan
+_stem_ctx: StemContext | None = None
 _trading_tool_registry: dict = {}  # name → async handler, populated per trading run
 _permanent_trading_tools: dict = {}  # name → async handler, always-on read-only KV
 _db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in lifespan
-
-
-def _build_pg_dsn() -> str:
-    """Build PostgreSQL DSN from environment variables.
-
-    Delegates to ``maki_common.build_pg_dsn`` so stem and recall use one
-    shared HA-aware builder — the old local version string-interpolated
-    ``POSTGRES_HOST`` directly and would emit an invalid URI as soon as
-    vault ran as an HA pair with a comma-separated host list. See #130.
-    asyncpg parses libpq-style multi-host URIs and honours
-    ``target_session_attrs`` in the query string, so no per-driver
-    special-case is needed here.
-    """
-    return build_pg_dsn()
-
-
-def _init_github_client():
-    """Initialize GitHub issue client if credentials are available."""
-    if not (GITHUB_APP_ID and GITHUB_PRIVATE_KEY_PATH and GITHUB_INSTALLATION_ID):
-        log.info("GitHub credentials not configured — issue tracking disabled")
-        return None
-
-    try:
-        with open(GITHUB_PRIVATE_KEY_PATH) as f:
-            private_key = f.read()
-    except Exception:
-        log.exception("Failed to read GitHub private key")
-        return None
-
-    from maki_common.github_client import GitHubIssueClient
-
-    client = GitHubIssueClient(
-        app_id=GITHUB_APP_ID,
-        private_key=private_key,
-        installation_id=GITHUB_INSTALLATION_ID,
-        default_owner=REPO_OWNER,
-        default_repo=REPO_NAME,
-    )
-    log.info("GitHub issue client initialized")
-    return client
-
-
-def _truncate_for_title(text: str, max_len: int = 80) -> str:
-    """Truncate text to make a reasonable issue title."""
-    # Take first line or first sentence
-    first_line = text.split("\n")[0].strip()
-    if len(first_line) > max_len:
-        return first_line[: max_len - 3] + "..."
-    return first_line
-
-
-async def _handle_response(msg) -> None:
-    """Push one cortex response chunk into the pending queue."""
-    try:
-        data = json.loads(msg.data.decode())
-        turn_id = data.get("turn_id")
-        if turn_id and _pending.push(turn_id, data):
-            log.info(
-                "Response chunk pushed",
-                extra={"turn_id": turn_id, "done": data.get("done", False)},
-            )
-        else:
-            log.warning("Response for unknown turn", extra={"turn_id": turn_id})
-    except Exception:
-        log.exception("Error processing cortex response")
-
-
-async def _response_listener():
-    """Listen for cortex responses and push chunks into pending queues.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of leaving every pending turn hanging until
-    ``TURN_TIMEOUT`` (issue #175). Broadcast: every pod tracks its own
-    pendings, so each pod must see every response chunk — no queue group.
-    """
-    await subscribe_supervised(
-        _nc,
-        CORTEX_TURN_RESPONSE,
-        _handle_response,
-        name="stem.cortex_response",
-    )
-
-
-async def _handle_cortex_heartbeat(msg) -> None:
-    """Track cortex session changes and cancel stale turns on restart."""
-    try:
-        payload = json.loads(msg.data.decode())
-        session_id = payload.get("session_id")
-        if not session_id:
-            return
-
-        instance_id = payload.get("instance_id", session_id)
-
-        if instance_id not in _cortex_sessions:
-            _cortex_sessions[instance_id] = session_id
-            log.info("Cortex session tracked", extra={"instance_id": instance_id, "session_id": session_id})
-            return
-
-        old_session = _cortex_sessions[instance_id]
-        if session_id != old_session:
-            _cortex_sessions[instance_id] = session_id
-            pending_keys = _pending.pending_keys()
-            if pending_keys:
-                cancelled = _pending.cancel_all()
-                log.warning(
-                    "Cortex restarted — cancelled stale turns",
-                    extra={
-                        "instance_id": instance_id,
-                        "old_session": old_session,
-                        "new_session": session_id,
-                        "cancelled_turns": cancelled,
-                        "turn_ids": pending_keys,
-                    },
-                )
-            else:
-                log.info(
-                    "Cortex instance restarted (no pending turns)",
-                    extra={"instance_id": instance_id, "old_session": old_session, "new_session": session_id},
-                )
-    except Exception:
-        log.exception("Error in cortex heartbeat watcher")
-
-
-async def _cortex_heartbeat_watcher():
-    """Watch cortex heartbeat for session_id changes (restarts).
-
-    When cortex restarts mid-turn, its session_id changes. We detect this
-    and cancel all pending turns immediately instead of waiting 30 minutes
-    for the timeout. Tracks sessions per instance_id to support
-    multi-instance cortex.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of leaving ``_cortex_sessions`` frozen and
-    `_HEALTH_KEYWORDS` queries silently returning stale state (issue #175).
-    Broadcast: each stem pod tracks cortex liveness independently — no
-    queue group.
-    """
-    await subscribe_supervised(
-        _nc,
-        CORTEX_HEALTH,
-        _handle_cortex_heartbeat,
-        name="stem.cortex_health",
-    )
-
-
-async def _seed_identity():
-    """Create identity KV bucket and seed default if empty."""
-    global _kv
-    _kv = await init_kv(_js, KV_BUCKET)
-
-    try:
-        entry = await _kv.get(KV_KEY)
-        log.info("Identity loaded from KV", extra={"len": len(entry.value)})
-    except Exception:
-        await _kv.put(KV_KEY, DEFAULT_IDENTITY.encode())
-        log.info("Identity seeded into KV")
-
-
-async def _init_conversation_stream():
-    """Create or connect to the conversation stream and load existing history."""
-    try:
-        await _js.find_stream_name_by_subject(CONVERSATION_STREAM)
-        log.info("Conversation stream exists", extra={"stream": STREAM_NAME})
-    except Exception:
-        await _js.add_stream(
-            name=STREAM_NAME,
-            subjects=[CONVERSATION_STREAM],
-            retention=RetentionPolicy.LIMITS,
-            max_msgs=STREAM_MAX_MSGS,
-            storage=StorageType.FILE,
-        )
-        log.info("Created conversation stream", extra={"stream": STREAM_NAME, "max_msgs": STREAM_MAX_MSGS})
-
-    try:
-        sub = await _js.subscribe(CONVERSATION_STREAM, ordered_consumer=True)
-        while True:
-            try:
-                msg = await sub.next_msg(timeout=1.0)
-                turn_doc = json.loads(msg.data.decode())
-                _conversation_history.append(turn_doc)
-            except TimeoutError:
-                break
-        await sub.unsubscribe()
-        log.info("Loaded conversation history", extra={"turns": len(_conversation_history)})
-    except Exception:
-        log.exception("Error loading conversation history")
-        log.info("Starting with empty conversation history")
-
-
-async def _handle_conversation_sync(msg) -> None:
-    """Sync one conversation turn into _conversation_history.
-
-    ``subscribe_supervised`` handles JS acking (auto_ack=True) — ACK on
-    success, NAK on uncaught handler exception so JS redelivers (issue
-    #221). This handler swallows all exceptions internally, so failures
-    are effectively fire-and-forget today; rework the broad ``try/except``
-    below if at-least-once delivery becomes load-bearing.
-    """
-    try:
-        turn_doc = json.loads(msg.data.decode())
-        turn_id = turn_doc.get("turn_id", "")
-
-        # Skip if we already have this turn (we added it locally in _publish_turn_to_stream)
-        if any(t.get("turn_id") == turn_id for t in _conversation_history[-50:]):
-            return
-
-        _conversation_history.append(turn_doc)
-
-        # Keep bounded
-        while len(_conversation_history) > STREAM_MAX_MSGS:
-            _conversation_history.pop(0)
-
-        log.info(
-            "Conversation synced from stream",
-            extra={"turn_id": turn_id, "instance": turn_doc.get("instance_id", "?")},
-        )
-    except Exception:
-        log.exception("Error syncing conversation")
-
-
-async def _conversation_sync_listener():
-    """Live subscriber to conversation stream — keeps _conversation_history in sync.
-
-    Ensures that all stem instances see turns processed by any instance.
-    Uses a durable push consumer so we don't miss messages while running.
-
-    Wrapped in ``subscribe_supervised`` so a JS reconnect / stream drain
-    re-subscribes instead of silently freezing the conversation history
-    (issue #175).
-    """
-    # Use deliver_last_per_subject to start from where we left off (after startup replay).
-    # Subscribe with a unique durable name per instance to get independent delivery.
-    consumer_name = f"stem-sync-{INSTANCE_ID}"
-    log.info("Conversation sync listener started", extra={"instance_id": INSTANCE_ID})
-    await subscribe_supervised(
-        _nc,
-        CONVERSATION_STREAM,
-        _handle_conversation_sync,
-        js=_js,
-        durable=consumer_name,
-        deliver_policy=nats.js.api.DeliverPolicy.LAST_PER_SUBJECT,
-        name="stem.conversation_sync",
-    )
-
-
-async def _publish_turn_to_stream(turn_id: str, user_message: str, cortex_response: str):
-    """Publish completed turn to conversation stream and update in-memory history."""
-    turn_doc = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "turn_id": turn_id,
-        "user_message": user_message,
-        "cortex_response": cortex_response,
-        "instance_id": INSTANCE_ID,
-        "memories_used": [],
-        "mission_proposed": None,
-    }
-
-    try:
-        ack = await _js.publish(CONVERSATION_STREAM, json.dumps(turn_doc).encode())
-        _conversation_history.append(turn_doc)
-        log.info("Turn published to stream", extra={"turn_id": turn_id, "seq": ack.seq})
-    except Exception:
-        log.exception("Failed to publish turn to stream", extra={"turn_id": turn_id})
-
-
-def _get_recent_conversation() -> list[dict]:
-    """Get recent conversation history formatted for cortex."""
-    recent = _conversation_history[-CONTEXT_TURNS:]
-    conversation = []
-    for turn_doc in recent:
-        conversation.append(
-            {
-                "role": "user",
-                "content": turn_doc["user_message"],
-                "timestamp": turn_doc["timestamp"],
-            }
-        )
-        conversation.append(
-            {
-                "role": "assistant",
-                "content": turn_doc["cortex_response"],
-                "timestamp": turn_doc["timestamp"],
-            }
-        )
-    return conversation
-
-
-def _build_session_summary() -> str:
-    """Build a compact summary of turns that fall outside the recent context window.
-
-    These are turns older than CONTEXT_TURNS that won't appear in _get_recent_conversation().
-    Gives cortex awareness of earlier parts of the same session without bloating the full context.
-    """
-    if len(_conversation_history) <= CONTEXT_TURNS:
-        return ""
-
-    older_turns = _conversation_history[:-CONTEXT_TURNS]
-    if not older_turns:
-        return ""
-
-    lines = [f"Earlier in this session ({len(older_turns)} turns before recent context):"]
-    for turn in older_turns:
-        user_msg = turn.get("user_message", "")[:120].replace("\n", " ").strip()
-        if user_msg:
-            lines.append(f"- {user_msg}")
-
-    return "\n".join(lines)
-
-
-def _deduplicate_memories(memories: list[dict], similarity_threshold: float = 0.82) -> list[dict]:
-    """Remove near-duplicate memories, keeping the highest-scoring (first) copy.
-
-    Uses SequenceMatcher ratio on memory text. O(n²) but n is capped at MEMORY_MAX_COUNT
-    so this is always fast (~15 comparisons max).
-    """
-    unique: list[dict] = []
-    for candidate in memories:
-        text = candidate.get("text", "")
-        is_dup = any(
-            SequenceMatcher(None, text, existing.get("text", "")).ratio() >= similarity_threshold for existing in unique
-        )
-        if not is_dup:
-            unique.append(candidate)
-    return unique
-
-
-async def _search_memories(query: str) -> tuple[list[dict], list[str]]:
-    """Query maki-recall for relevant memories and graph context.
-
-    Fetches up to MEMORY_MAX_COUNT memories with score >= MEMORY_MIN_RELEVANCE.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{RECALL_URL}/search",
-                json={"query": query, "user_id": MEMORY_USER_ID, "limit": MEMORY_MAX_COUNT * 2},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        memories = []
-        for result in data.get("results", []):
-            score = result.get("score", 0)
-            if score >= MEMORY_MIN_RELEVANCE:
-                memories.append(
-                    {
-                        "text": result.get("memory", ""),
-                        "relevance": round(score, 2),
-                    }
-                )
-        # Cap at max count (already sorted by score descending from recall)
-        memories = memories[:MEMORY_MAX_COUNT]
-        # Deduplicate near-identical memories (keeps highest-scoring, which come first)
-        memories = _deduplicate_memories(memories)
-
-        graph_context = []
-        skipped_dangling = 0
-        for rel in data.get("relations", []):
-            source = rel.get("source") or ""
-            relationship = rel.get("relationship") or ""
-            target = rel.get("target") or ""
-            # Skip dangling or unresolved relationships — any missing endpoint is noise
-            if not source or not relationship or not target or source == "?" or target == "?" or relationship == "?":
-                skipped_dangling += 1
-                continue
-            graph_context.append(f"{source} --{relationship}--> {target}")
-        if skipped_dangling:
-            log.warning("Skipped dangling graph relations", extra={"count": skipped_dangling, "query": query})
-
-        log.info(
-            "Memory search complete",
-            extra={"memories": len(memories), "relations": len(graph_context), "dangling_skipped": skipped_dangling},
-        )
-        return memories, graph_context
-
-    except Exception:
-        log.exception("Failed to search memories")
-        return [], []
-
-
-async def _feed_memories(user_message: str, cortex_response: str):
-    """Feed interaction to maki-recall for autonomous memory extraction."""
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{RECALL_URL}/memories",
-                    json={
-                        "messages": [
-                            {"role": "user", "content": user_message},
-                            {"role": "assistant", "content": cortex_response},
-                        ],
-                        "user_id": MEMORY_USER_ID,
-                    },
-                )
-                resp.raise_for_status()
-                log.info("Memory feed complete", extra={"attempt": attempt + 1})
-                return
-        except httpx.ReadTimeout:
-            log.warning("Memory feed timed out", extra={"attempt": attempt + 1})
-            if attempt == 0:
-                await asyncio.sleep(2.0)
-        except Exception:
-            log.exception("Failed to feed memories")
-            return
-
-
-async def _gather_system_state() -> dict:
-    """Gather infrastructure state for cortex self-awareness.
-
-    Requests rich data from maki-immune via NATS request/reply,
-    falling back to basic HTTP health checks.
-    """
-    state = {
-        "nats": {"connected": _nc.is_connected if _nc else False},
-        "conversation_stream": {"total_turns": len(_conversation_history)},
-    }
-
-    # Try to get rich state from immune via NATS request/reply
-    try:
-        resp = await _nc.request(IMMUNE_STATE_REQUEST, b"", timeout=2.0)
-        immune_data = json.loads(resp.data.decode())
-        # Merge immune's rich component health into state
-        for name, info in immune_data.get("component_health", {}).items():
-            state[name] = info
-        if immune_data.get("recent_actions"):
-            state["recent_reflex_actions"] = {"count": len(immune_data["recent_actions"])}
-        log.info("Rich system state from immune", extra={"components": len(state)})
-        return state
-    except Exception:
-        log.info("Immune state unavailable, falling back to HTTP checks")
-
-    # Fallback: basic HTTP health checks
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for name, url in HEALTH_ENDPOINTS.items():
-            try:
-                resp = await client.get(f"{url}/health")
-                state[name] = {"healthy": resp.status_code == 200}
-            except Exception:
-                state[name] = {"healthy": False}
-
-    return state
-
-
-def _format_system_state(system_state: dict) -> str:
-    """Format system state dict into readable text for memory."""
-    parts = []
-    for name, info in system_state.items():
-        if isinstance(info, dict):
-            details = ", ".join(f"{k}={v}" for k, v in info.items())
-            parts.append(f"{name}: {details}")
-    return "; ".join(parts) if parts else "no data"
-
-
-def _summarize_system_state(system_state: dict) -> str:
-    """Return a one-line system health summary for non-health-focused turns."""
-    problems = []
-    for name, info in system_state.items():
-        if not isinstance(info, dict):
-            continue
-        # Flag unhealthy or restarting components
-        healthy = info.get("healthy", True)
-        restarts = info.get("restart_count", 0) or info.get("restarts", 0)
-        if not healthy:
-            problems.append(f"{name}: unhealthy")
-        elif restarts and int(restarts) > 3:
-            problems.append(f"{name}: {restarts} restarts")
-    if problems:
-        return "issues: " + ", ".join(problems)
-    return "all healthy"
-
-
-_HEALTH_KEYWORDS = frozenset(
-    [
-        "health",
-        "status",
-        "system",
-        "component",
-        "running",
-        "restart",
-        "down",
-        "broken",
-        "error",
-        "crash",
-        "fail",
-        "deploy",
-        "pod",
-        "service",
-        "immune",
-        "stem",
-        "cortex",
-        "recall",
-        "synapse",
-        "nerve",
-        "embed",
-    ]
-)
-
-
-def _is_health_query(message: str) -> bool:
-    """Return True if the message is asking about system health/status."""
-    lower = message.lower()
-    return any(kw in lower for kw in _HEALTH_KEYWORDS)
-
-
-def _in_quiet_hours(config: dict) -> bool:
-    """Check if current time is within quiet hours."""
-    now = datetime.now()
-    current = now.hour * 60 + now.minute
-
-    start_parts = config.get("quiet_hours_start", "23:00").split(":")
-    end_parts = config.get("quiet_hours_end", "07:00").split(":")
-    start = int(start_parts[0]) * 60 + int(start_parts[1])
-    end = int(end_parts[0]) * 60 + int(end_parts[1])
-
-    if start > end:  # spans midnight (e.g., 23:00 - 07:00)
-        return current >= start or current < end
-    return start <= current < end
-
-
-def _in_work_hours(config: dict) -> bool:
-    """Check if current time is within work hours."""
-    now = datetime.now()
-    current = now.hour * 60 + now.minute
-
-    start_parts = config.get("work_hours_start", "01:00").split(":")
-    end_parts = config.get("work_hours_end", "06:00").split(":")
-    start = int(start_parts[0]) * 60 + int(start_parts[1])
-    end = int(end_parts[0]) * 60 + int(end_parts[1])
-
-    if start > end:  # spans midnight
-        return current >= start or current < end
-    return start <= current < end
-
-
-def _discover_loops() -> list[LoopSpec]:
-    """Discover loop specs from entry points and builtin loops.
-
-    Looks for 'maki.loops' entry points — allows private maki-loops package
-    to register additional loops (e.g., care, daytrading) without modifying this code.
-
-    Returns builtin loops (idle, work) + any discovered from entry points.
-    Duplicate names are logged and skipped (first one wins).
-    """
-    loops = [IDLE_LOOP_SPEC, WORK_LOOP_SPEC]
-    seen_names = {spec.name for spec in loops}
-
-    try:
-        eps = entry_points(group="maki.loops")
-        for ep in eps:
-            try:
-                spec = ep.load()
-                if not isinstance(spec, LoopSpec):
-                    log.warning(
-                        "Entry point returned non-LoopSpec, skipping",
-                        extra={"entry_point": ep.name, "type": type(spec).__name__},
-                    )
-                    continue
-                if spec.name in seen_names:
-                    log.warning("Duplicate loop name, skipping", extra={"loop_name": spec.name, "entry_point": ep.name})
-                    continue
-                loops.append(spec)
-                seen_names.add(spec.name)
-                log.info("Discovered external loop", extra={"loop_name": spec.name, "entry_point": ep.name})
-            except Exception:
-                log.exception("Failed to load loop entry point", extra={"entry_point": ep.name})
-    except Exception:
-        log.exception("Failed to discover loop entry points")
-
-    log.info("Loop discovery complete", extra={"total_loops": len(loops), "loop_names": list(seen_names)})
-    return loops
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _nc, _js, _config_kv, _lock_kv, _github, _db_pool
-    log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
-
-    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
-    _js = _nc.jetstream()
-
-    await _seed_identity()
-    await _init_conversation_stream()
-
-    _config_kv = await init_kv(_js, CONFIG_BUCKET)
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
-
-    _db_pool = await asyncpg.create_pool(dsn=_build_pg_dsn(), min_size=1, max_size=3)
-    log.info("PostgreSQL pool created", extra={"host": POSTGRES_HOST, "db": POSTGRES_DB})
-
-    from maki_common.tools.trading_portfolio import make_trading_portfolio_tools
-
-    _permanent_trading_tools.update(make_trading_portfolio_tools(_lock_kv))
-    log.info("Permanent trading tools registered", extra={"tools": list(_permanent_trading_tools)})
-
-    _github = _init_github_client()
-
-    # Track every supervised listener so the readiness probe can fail if any
-    # of them dies — see ``_critical_listener_tasks`` and #175/#192.
-    _critical_listener_tasks["response"] = asyncio.create_task(_response_listener(), name="stem.response_listener")
-    _critical_listener_tasks["cortex_heartbeat"] = asyncio.create_task(
-        _cortex_heartbeat_watcher(), name="stem.cortex_heartbeat_watcher"
-    )
-    _critical_listener_tasks["conversation_sync"] = asyncio.create_task(
-        _conversation_sync_listener(), name="stem.conversation_sync_listener"
-    )
-    _critical_listener_tasks["ears_in"] = asyncio.create_task(_ears_listener(), name="stem.ears_listener")
-    _critical_listener_tasks["memory_store"] = asyncio.create_task(
-        _memory_store_listener(), name="stem.memory_store_listener"
-    )
-    _critical_listener_tasks["config_sync"] = asyncio.create_task(
-        _config_sync_listener(), name="stem.config_sync_listener"
-    )
-    _critical_listener_tasks["db_query"] = asyncio.create_task(_db_query_listener(), name="stem.db_query_listener")
-    _critical_listener_tasks["pattern_query"] = asyncio.create_task(
-        _pattern_query_listener(), name="stem.pattern_query_listener"
-    )
-    _critical_listener_tasks["pattern_update"] = asyncio.create_task(
-        _pattern_update_listener(), name="stem.pattern_update_listener"
-    )
-    _critical_listener_tasks["pattern_write"] = asyncio.create_task(
-        _pattern_write_listener(), name="stem.pattern_write_listener"
-    )
-    _critical_listener_tasks["trading_signal"] = asyncio.create_task(
-        trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener"
-    )
-    _critical_listener_tasks["trading_manual"] = asyncio.create_task(
-        trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener"
-    )
-    _critical_listener_tasks["trading_tool"] = asyncio.create_task(
-        trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools),
-        name="stem.trading_tool_listener",
-    )
-    ctx = StemContext(
-        nc=_nc,
-        js=_js,
-        kv=_kv,
-        lock_kv=_lock_kv,
-        config_kv=_config_kv,
-        pending=_pending,
-        github=_github,
-        instance_id=INSTANCE_ID,
-        default_config=DEFAULT_CORTEX_CONFIG,
-        search_memories=_search_memories,
-        feed_memories=_feed_memories,
-        gather_system_state=_gather_system_state,
-        format_system_state=_format_system_state,
-        get_recent_conversation=_get_recent_conversation,
-        in_quiet_hours=_in_quiet_hours,
-        in_work_hours=_in_work_hours,
-    )
-
-    # Discover and start all loops (builtin + external via entry points)
-    global _loop_specs, _stem_ctx
-    loops = _discover_loops()
-    _loop_specs = loops
-    _stem_ctx = ctx
-    for spec in loops:
-        spawn_background(_run_loop(spec, ctx), name=f"stem.loop.{spec.name}")
-
-    yield
-
-    if _db_pool:
-        await _db_pool.close()
-    await _nc.close()
-
-
-app = FastAPI(title="maki-stem", version="0.0.1", lifespan=lifespan)
-
-
-class TurnRequest(BaseModel):
-    message: str
-
-
-async def _process_turn(
-    message: str,
-    *,
-    forward_to: dict | None = None,
-) -> tuple[str, str]:
-    """Core turn logic with streaming. Returns (turn_id, full_response_text).
-
-    If forward_to is provided (dict with message_id, channel_id),
-    streams each chunk to EARS_OUT as it arrives from cortex.
-    """
-    await kv_put_float(_lock_kv, "stem.last_activity", time.time())
-
-    turn_id = new_turn_id("turn")
-    _active_turns[turn_id] = time.time()
-    log.info("Turn started", extra={"turn_id": turn_id, "message_len": len(message)})
-
-    try:
-        entry = await _kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = DEFAULT_IDENTITY
-
-    memories, graph_context = await _search_memories(message)
-    system_state = await _gather_system_state()
-
-    # Include full system state only for health-related queries; otherwise send a summary
-    if _is_health_query(message):
-        turn_system_state = system_state
-        turn_system_state_summary = None
-    else:
-        turn_system_state = None
-        turn_system_state_summary = _summarize_system_state(system_state)
-
-    config = await load_kv_config(_config_kv, DEFAULT_CORTEX_CONFIG)
-    chat_model = config.get("chat_model", "")
-
-    turn_payload = {
-        "turn_id": turn_id,
-        "identity": identity,
-        "conversation": _get_recent_conversation(),
-        "session_summary": _build_session_summary(),
-        "memories": memories,
-        "graph_context": graph_context,
-        "system_state": turn_system_state,
-        "system_state_summary": turn_system_state_summary,
-        "prompt": message,
-        **({"model": chat_model} if chat_model else {}),
-    }
-
-    full_response = []
-
-    try:
-        log.info("Turn request publishing", extra={"turn_id": turn_id})
-        # ``submit_turn_streaming`` handles publish + queue lifecycle and
-        # publishes CORTEX_STUCK on timeout uniformly across all callers (#125).
-        async for data in submit_turn_streaming(
-            _stem_ctx,
-            turn_id=turn_id,
-            payload=turn_payload,
-            timeout=TURN_TIMEOUT,
-            mode="normal",
-            user_waiting=True,
-        ):
-            if data.get("cancelled"):
-                log.warning(
-                    "Turn cancelled by cortex restart",
-                    extra={"turn_id": turn_id, "partial_chunks": len(full_response)},
-                )
-                # Raise so the caller's RuntimeError handler runs:
-                # no memory write, no conversation stream publish, and ears
-                # receives the "lost my train of thought" message instead of
-                # a phantom empty done chunk.
-                raise RuntimeError("cortex_restart_cancelled")
-
-            chunk_text = data.get("response", "")
-            done = data.get("done", False)
-
-            if chunk_text:
-                full_response.append(chunk_text)
-
-            if forward_to and (chunk_text or done):
-                ears_msg = {
-                    "message_id": forward_to["message_id"],
-                    "channel_id": forward_to["channel_id"],
-                    "turn_id": turn_id,
-                    "response": chunk_text,
-                    "done": done,
-                }
-                await _nc.publish(EARS_OUT, json.dumps(ears_msg).encode())
-
-        cortex_response = "".join(full_response)
-        clean_response = strip_tags(cortex_response)
-        config_updates = parse_config_tags(cortex_response)
-        if config_updates:
-            await apply_config_updates(_config_kv, config_updates, allowed_keys=set(DEFAULT_CORTEX_CONFIG.keys()))
-
-        spawn_background(
-            _publish_turn_to_stream(turn_id, message, clean_response),
-            name="stem.publish_turn_to_stream",
-        )
-        spawn_background(_feed_memories(message, clean_response), name="stem.feed_memories")
-
-        return turn_id, clean_response
-
-    except TimeoutError:
-        log.error("Turn timed out", extra={"turn_id": turn_id})
-        raise
-    finally:
-        _active_turns.pop(turn_id, None)
-
-
-async def _store_memory(content: str, source: str, user_id: str, metadata: dict | None):
-    """Store a single memory via recall REST API (runs as background task)."""
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    f"{RECALL_URL}/memories",
-                    json={
-                        "messages": [{"role": "user", "content": content}],
-                        "user_id": user_id,
-                        "metadata": metadata or {},
-                    },
-                )
-                resp.raise_for_status()
-                log.info("Memory stored", extra={"source": source, "attempt": attempt + 1})
-                return
-        except httpx.ReadTimeout:
-            log.warning("Memory store timed out", extra={"source": source, "attempt": attempt + 1})
-            if attempt == 0:
-                await asyncio.sleep(2.0)
-        except Exception:
-            log.exception("Failed to store memory", extra={"source": source})
-            return
-
-
-async def _handle_memory_store(msg) -> None:
-    """Spawn a background task to store one memory."""
-    try:
-        data = json.loads(msg.data.decode())
-        content = data.get("content", "").strip()
-        if not content:
-            return
-
-        user_id = data.get("user_id", MEMORY_USER_ID)
-        source = data.get("source", "unknown")
-        metadata = data.get("metadata")
-
-        spawn_background(
-            _store_memory(content, source, user_id, metadata),
-            name="stem.store_memory",
-        )
-    except Exception:
-        log.exception("Error in memory store listener")
-
-
-async def _memory_store_listener():
-    """Listen for memory store requests from any component via NATS.
-
-    Any component can publish to MEMORY_STORE with:
-    {"content": "...", "user_id": "...", "metadata": {...}}
-    Each memory is stored concurrently as a background task.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of silently dropping every subsequent memory
-    write (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        MEMORY_STORE,
-        _handle_memory_store,
-        queue=STEM_QUEUE,
-        name="stem.memory_store",
-    )
-
-
-async def _run_manual_loop(spec: LoopSpec, loop_name: str) -> None:
-    """Run a loop body in the background (fire-and-forget from !loop command)."""
-    try:
-        config = await load_kv_config(_stem_ctx.config_kv, _stem_ctx.default_config)
-        await spec.body(spec, config, _stem_ctx)
-    except Exception:
-        log.exception("Manual loop trigger failed", extra={"loop": loop_name})
-
-
-async def _trigger_loop(loop_name: str, forward_to: dict) -> None:
-    """Manually trigger a named loop, bypassing cron/guards."""
-    spec = next((s for s in _loop_specs if s.name == loop_name), None)
-    if spec is None:
-        names = ", ".join(s.name for s in _loop_specs)
-        reply = {"response": f"Unknown loop '{loop_name}'. Available: {names}", "done": True, **forward_to}
-        await _nc.publish(EARS_OUT, json.dumps(reply).encode())
-        return
-    reply = {"response": f"Triggering loop: {loop_name}", "done": True, **forward_to}
-    await _nc.publish(EARS_OUT, json.dumps(reply).encode())
-    spawn_background(_run_manual_loop(spec, loop_name), name=f"stem.manual_loop.{loop_name}")
-
-
-async def _handle_discord_message(data: dict):
-    """Handle a single Discord message (runs as independent task)."""
-    channel_id = data.get("channel_id", "")
-    message_id = data.get("message_id", "")
-    content = data.get("content", "")
-    forward_to = {"message_id": message_id, "channel_id": channel_id}
-
-    # !loop <name> — manually trigger a named loop
-    if content.strip().startswith("!loop "):
-        loop_name = content.strip().removeprefix("!loop ").strip()
-        await _trigger_loop(loop_name, forward_to)
-        return
-
-    async with _turn_semaphore:
-        try:
-            await _process_turn(content, forward_to=forward_to)
-        except TimeoutError:
-            error_msg = {
-                "message_id": message_id,
-                "channel_id": channel_id,
-                "response": "Sorry, I took too long thinking about that. Try again?",
-                "done": True,
-            }
-            try:
-                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
-            except Exception:
-                log.exception("Failed to send timeout error to ears")
-        except RuntimeError as e:
-            log.warning("Turn cancelled", extra={"error": str(e)})
-            try:
-                error_msg = {
-                    "message_id": message_id,
-                    "channel_id": channel_id,
-                    "response": "I lost my train of thought (my brain restarted). What were you saying?",
-                    "done": True,
-                }
-                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
-            except Exception:
-                log.exception("Failed to send cancellation error to ears")
-        except Exception:
-            log.exception("Turn failed")
-            try:
-                error_msg = {
-                    "message_id": message_id,
-                    "channel_id": channel_id,
-                    "response": "",
-                    "done": True,
-                }
-                await _nc.publish(EARS_OUT, json.dumps(error_msg).encode())
-            except Exception:
-                log.exception("Failed to send error to ears")
-
-
-async def _handle_ears_message(msg) -> None:
-    """Dispatch one EARS_IN Discord message into a background task."""
-    try:
-        data = json.loads(msg.data.decode())
-        username = data.get("username", "unknown")
-        log.info("Discord message", extra={"username": username, "content_len": len(data.get("content", ""))})
-        spawn_background(_handle_discord_message(data), name="stem.handle_discord_message")
-    except Exception:
-        log.exception("Error dispatching Discord message")
-
-
-async def _ears_listener():
-    """Listen for incoming Discord messages via NATS and dispatch as tasks.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of silently dropping every subsequent Discord
-    message (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        EARS_IN,
-        _handle_ears_message,
-        queue=STEM_QUEUE,
-        name="stem.ears_in",
-    )
 
 
 async def _handle_config_sync(msg) -> None:
@@ -1140,261 +149,130 @@ async def _config_sync_listener():
     )
 
 
-async def _handle_db_query(msg) -> None:
-    """Run one DB query and respond via NATS request/reply.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _nc, _js, _kv, _config_kv, _lock_kv, _github, _db_pool, _stem_ctx, _loop_specs
+    log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
-    Safety: only SELECT/WITH (CTE) queries pass the first-word check, then the
-    query is executed inside a Postgres ``READ ONLY`` transaction so any DML
-    smuggled inside a CTE (``WITH x AS (DELETE ... RETURNING *) SELECT ...``)
-    is rejected by the server at execution time. See issue #288.
-    """
-    from maki_common.tools.utils import mcp_result
+    _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
+    _js = _nc.jetstream()
 
-    try:
-        data = json.loads(msg.data.decode())
-        sql = data.get("sql", "").strip()
+    _kv = await seed_identity(_js)
+    await init_conversation_stream(_js)
 
-        # Validate: SELECT or WITH only (first-word check is a cheap reject,
-        # the READ ONLY transaction below is the real safety boundary).
-        first_word = sql.split()[0].upper() if sql.split() else ""
-        if first_word not in ("SELECT", "WITH"):
-            await msg.respond(
-                json.dumps(
-                    mcp_result(
-                        "Only SELECT and WITH (CTE) queries are allowed — "
-                        "executed inside a READ ONLY transaction, so any DML "
-                        "(INSERT/UPDATE/DELETE) nested in a CTE will be rejected."
-                    )
-                ).encode()
-            )
-            return
+    _config_kv = await init_kv(_js, CONFIG_BUCKET)
+    _lock_kv = await init_kv(_js, LOCK_BUCKET)
 
-        # Reject multi-statement queries
-        if ";" in sql.rstrip(";"):
-            await msg.respond(json.dumps(mcp_result("Multi-statement queries are not allowed.")).encode())
-            return
+    _db_pool = await asyncpg.create_pool(dsn=build_pg_dsn(), min_size=1, max_size=3)
+    log.info("PostgreSQL pool created")
 
-        sql = sql.rstrip(";")
+    from maki_common.tools.trading_portfolio import make_trading_portfolio_tools
 
-        # Inject LIMIT if missing
-        if "limit" not in sql.lower():
-            sql += " LIMIT 50"
+    _permanent_trading_tools.update(make_trading_portfolio_tools(_lock_kv))
+    log.info("Permanent trading tools registered", extra={"tools": list(_permanent_trading_tools)})
 
-        log.info("Executing DB query", extra={"sql": sql[:200]})
+    _github = init_github_client()
 
-        async with _db_pool.acquire() as conn:
-            # READ ONLY transaction: Postgres rejects DML at execution time even
-            # when the statement starts with WITH and hides INSERT/UPDATE/DELETE
-            # inside a CTE. Without this, the first-word check is bypassable
-            # (issue #288).
-            async with conn.transaction(readonly=True):
-                rows = await asyncio.wait_for(conn.fetch(sql), timeout=10.0)
+    # Assemble StemContext once — loops and the interactive turn path both
+    # share it. Callables are wired to the extracted modules; the identity/
+    # system-state summary helpers not on StemContext are imported directly
+    # by ``cortex_io.process_turn``.
+    ctx = StemContext(
+        nc=_nc,
+        js=_js,
+        kv=_kv,
+        lock_kv=_lock_kv,
+        config_kv=_config_kv,
+        pending=_pending,
+        github=_github,
+        instance_id=INSTANCE_ID,
+        default_config=DEFAULT_CORTEX_CONFIG,
+        search_memories=search_memories,
+        feed_memories=feed_memories,
+        gather_system_state=lambda: gather_system_state(
+            _nc,
+            conversation_history_size=history_size(),
+            health_endpoints=HEALTH_ENDPOINTS,
+        ),
+        format_system_state=format_system_state,
+        get_recent_conversation=get_recent_conversation,
+        in_quiet_hours=in_quiet_hours,
+        in_work_hours=in_work_hours,
+    )
+    _stem_ctx = ctx
 
-        if not rows:
-            await msg.respond(json.dumps(mcp_result("Query returned 0 rows.")).encode())
-            return
-
-        # Format as text table
-        columns = list(rows[0].keys())
-        lines = [" | ".join(columns)]
-        lines.append("-" * len(lines[0]))
-        for row in rows:
-            lines.append(" | ".join(str(row[c]) for c in columns))
-        lines.append(f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})")
-
-        await msg.respond(json.dumps(mcp_result("\n".join(lines))).encode())
-
-    except TimeoutError:
-        log.warning("DB query timed out")
-        try:
-            await msg.respond(json.dumps(mcp_result("Query timed out (10s limit).")).encode())
-        except Exception:
-            pass
-    except Exception:
-        log.exception("DB query error")
-        try:
-            await msg.respond(json.dumps(mcp_result("DB query failed — check logs.")).encode())
-        except Exception:
-            pass
-
-
-async def _db_query_listener():
-    """Handle generic DB query requests from cortex via NATS request/reply.
-
-    Safety: only SELECT/WITH queries pass the first-word check, the query
-    runs inside a Postgres READ ONLY transaction (so DML hidden in a CTE
-    is rejected by the server — issue #288), LIMIT 50 is injected if
-    missing, and a 10s query timeout is enforced.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of silently dropping every subsequent DB query
-    from cortex (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        DB_QUERY,
-        _handle_db_query,
-        queue=STEM_QUEUE,
-        name="stem.db_query",
+    # Track every supervised listener so the readiness probe can fail if any
+    # of them dies — see ``_critical_listener_tasks`` and #175/#192.
+    _critical_listener_tasks["response"] = asyncio.create_task(
+        response_listener(_nc, _pending), name="stem.response_listener"
+    )
+    _critical_listener_tasks["cortex_heartbeat"] = asyncio.create_task(
+        cortex_heartbeat_watcher(_nc, _pending), name="stem.cortex_heartbeat_watcher"
+    )
+    _critical_listener_tasks["conversation_sync"] = asyncio.create_task(
+        conversation_sync_listener(_nc, _js, INSTANCE_ID), name="stem.conversation_sync_listener"
+    )
+    _critical_listener_tasks["ears_in"] = asyncio.create_task(
+        ears_listener(
+            ctx,
+            _loop_specs,  # populated below before ears actually dispatches — closure captures the list
+            default_identity=DEFAULT_IDENTITY,
+            health_endpoints=HEALTH_ENDPOINTS,
+            conversation_history_size_fn=history_size,
+            queue=STEM_QUEUE,
+        ),
+        name="stem.ears_listener",
+    )
+    _critical_listener_tasks["memory_store"] = asyncio.create_task(
+        memory_store_listener(_nc, queue=STEM_QUEUE), name="stem.memory_store_listener"
+    )
+    _critical_listener_tasks["config_sync"] = asyncio.create_task(
+        _config_sync_listener(), name="stem.config_sync_listener"
+    )
+    _critical_listener_tasks["db_query"] = asyncio.create_task(
+        db_query_listener(_nc, _db_pool, queue=STEM_QUEUE), name="stem.db_query_listener"
+    )
+    _critical_listener_tasks["pattern_query"] = asyncio.create_task(
+        pattern_query_listener(_nc, _db_pool, queue=STEM_QUEUE), name="stem.pattern_query_listener"
+    )
+    _critical_listener_tasks["pattern_update"] = asyncio.create_task(
+        pattern_update_listener(_nc, _db_pool, queue=STEM_QUEUE), name="stem.pattern_update_listener"
+    )
+    _critical_listener_tasks["pattern_write"] = asyncio.create_task(
+        pattern_write_listener(_nc, _db_pool, queue=STEM_QUEUE), name="stem.pattern_write_listener"
+    )
+    _critical_listener_tasks["trading_signal"] = asyncio.create_task(
+        trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener"
+    )
+    _critical_listener_tasks["trading_manual"] = asyncio.create_task(
+        trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener"
+    )
+    _critical_listener_tasks["trading_tool"] = asyncio.create_task(
+        trading_tool_listener(_nc, _trading_tool_registry, _permanent_trading_tools),
+        name="stem.trading_tool_listener",
     )
 
+    # Discover and start all loops (builtin + external via entry points).
+    # ``_loop_specs`` is the list the ears listener closes over above — we
+    # mutate in place so that closure sees the discovered specs without
+    # having to re-spawn the listener.
+    loops = discover_loops()
+    _loop_specs.extend(loops)
+    for spec in loops:
+        spawn_background(_run_loop(spec, ctx), name=f"stem.loop.{spec.name}")
 
-async def _handle_pattern_query(msg) -> None:
-    """Serve one error_patterns query for immune's passive loop."""
-    try:
-        data = json.loads(msg.data.decode())
-        component = data.get("component", "")
+    yield
 
-        if not component or not _db_pool:
-            await msg.respond(json.dumps({"patterns": []}).encode())
-            return
-
-        async with _db_pool.acquire() as conn:
-            rows = await asyncio.wait_for(
-                conn.fetch(
-                    "SELECT id, component, pattern, classification, confidence, "
-                    "occurrence_count, notes "
-                    "FROM error_patterns WHERE component = $1",
-                    component,
-                ),
-                timeout=5.0,
-            )
-
-        patterns = [
-            {
-                "id": str(row["id"]),
-                "component": row["component"],
-                "pattern": row["pattern"],
-                "classification": row["classification"],
-                "confidence": row["confidence"],
-                "occurrence_count": row["occurrence_count"],
-                "notes": row["notes"],
-            }
-            for row in rows
-        ]
-
-        await msg.respond(json.dumps({"patterns": patterns}).encode())
-
-    except Exception:
-        log.exception("Pattern query error")
-        try:
-            await msg.respond(json.dumps({"patterns": []}).encode())
-        except Exception:
-            pass
+    if _db_pool:
+        await _db_pool.close()
+    await _nc.close()
 
 
-async def _pattern_query_listener():
-    """Serve error_patterns queries for immune's passive loop.
-
-    Returns JSON list of patterns for a given component. Wrapped in
-    ``subscribe_supervised`` so a NATS reconnect / stream drain re-subscribes
-    instead of silently dropping every subsequent immune query (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        PATTERN_QUERY,
-        _handle_pattern_query,
-        queue=STEM_QUEUE,
-        name="stem.pattern_query",
-    )
+app = FastAPI(title="maki-stem", version="0.0.1", lifespan=lifespan)
 
 
-async def _handle_pattern_update(msg) -> None:
-    """Apply one fire-and-forget pattern stats bump."""
-    try:
-        data = json.loads(msg.data.decode())
-        pattern_id = data.get("id")
-        confidence_delta = data.get("confidence_delta", 0.0)
-        if not pattern_id or not _db_pool:
-            return
-
-        async with _db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE error_patterns "
-                "SET occurrence_count = occurrence_count + 1, "
-                "    confidence = LEAST(confidence + $1, 1.0), "
-                "    last_seen_at = now() "
-                "WHERE id = $2",
-                confidence_delta,
-                uuid.UUID(pattern_id),
-            )
-
-        log.debug("Pattern stats updated", extra={"pattern_id": pattern_id})
-
-    except Exception:
-        log.exception("Pattern update error")
-
-
-async def _pattern_update_listener():
-    """Handle fire-and-forget updates to error_patterns from immune.
-
-    Supports bumping occurrence_count/confidence/last_seen_at for known
-    patterns. Wrapped in ``subscribe_supervised`` so a NATS reconnect /
-    stream drain re-subscribes instead of silently dropping every update
-    (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        PATTERN_UPDATE,
-        _handle_pattern_update,
-        queue=STEM_QUEUE,
-        name="stem.pattern_update",
-    )
-
-
-async def _handle_pattern_write(msg) -> None:
-    """Insert one new error_patterns row from immune's Claude escalation."""
-    try:
-        data = json.loads(msg.data.decode())
-        component = data.get("component", "")
-        pattern = data.get("pattern", "")
-        classification = data.get("classification", "escalate")
-        confidence = float(data.get("confidence", 0.5))
-        notes = data.get("notes", "")
-
-        if not component or not pattern or not _db_pool:
-            return
-
-        async with _db_pool.acquire() as conn:
-            await asyncio.wait_for(
-                conn.execute(
-                    "INSERT INTO error_patterns "
-                    "(component, pattern, classification, confidence, occurrence_count, notes) "
-                    "VALUES ($1, $2, $3, $4, 1, $5) "
-                    "ON CONFLICT (component, pattern) DO NOTHING",
-                    component,
-                    pattern,
-                    classification,
-                    confidence,
-                    notes,
-                ),
-                timeout=5.0,
-            )
-
-        log.info(
-            "Pattern written",
-            extra={"component": component, "pattern": pattern[:60], "classification": classification},
-        )
-
-    except Exception:
-        log.exception("Pattern write error")
-
-
-async def _pattern_write_listener():
-    """Handle write requests for new error_patterns from immune's Claude escalation.
-
-    Inserts a new classified pattern. Skips silently if the
-    component+pattern already exists. Wrapped in ``subscribe_supervised``
-    so a NATS reconnect / stream drain re-subscribes instead of silently
-    dropping every subsequent pattern write (issue #175).
-    """
-    await subscribe_supervised(
-        _nc,
-        PATTERN_WRITE,
-        _handle_pattern_write,
-        queue=STEM_QUEUE,
-        name="stem.pattern_write",
-    )
+class TurnRequest(BaseModel):
+    message: str
 
 
 @app.get("/health")
@@ -1416,20 +294,26 @@ def health():
         )
 
     now = time.time()
-    for turn_id, started in _active_turns.items():
+    for turn_id, started in active_turns.items():
         if now - started > TURN_TIMEOUT:
             return JSONResponse(
                 status_code=503,
                 content={"status": "stuck", "turn_id": turn_id, "running_seconds": int(now - started)},
             )
-    return {"status": "ok", "active_turns": len(_active_turns)}
+    return {"status": "ok", "active_turns": len(active_turns)}
 
 
 @app.post("/turn")
 async def turn(req: TurnRequest):
-    if not _nc or not _nc.is_connected:
+    if not _nc or not _nc.is_connected or _stem_ctx is None:
         raise HTTPException(status_code=503, detail="NATS not connected")
-    _, response = await _process_turn(req.message)
+    _, response = await process_turn(
+        _stem_ctx,
+        req.message,
+        default_identity=DEFAULT_IDENTITY,
+        health_endpoints=HEALTH_ENDPOINTS,
+        conversation_history_size=history_size(),
+    )
     return {"response": response}
 
 
