@@ -10,13 +10,27 @@ from nats.js.kv import KeyValue
 
 log = logging.getLogger(__name__)
 
+# Canonical [TAG:content] matcher. Lazy content match with DOTALL so tags may
+# span newlines — immune's DIGEST/ALERT payloads are routinely multi-paragraph.
+# All tag helpers below share this one shape so parse_tagged and strip_tags
+# cannot silently disagree about what "content" means.
+_TAG_RE = re.compile(r"\[(\w+):(.*?)\]", re.DOTALL)
+
 
 def parse_config_tags(text: str) -> list[tuple[str, str]]:
     """Parse [CONFIG:key=value] tags from text.
 
     Returns list of (key, raw_value_string) tuples.
     """
-    return re.findall(r"\[CONFIG:(\w+)=([^\]]+)\]", text)
+    out: list[tuple[str, str]] = []
+    for tag, content in _TAG_RE.findall(text):
+        if tag != "CONFIG":
+            continue
+        key, sep, raw_value = content.partition("=")
+        if not sep:
+            continue
+        out.append((key, raw_value))
+    return out
 
 
 def parse_tagged(text: str, tag: str) -> list[str]:
@@ -28,12 +42,12 @@ def parse_tagged(text: str, tag: str) -> list[str]:
 
     Returns list of content strings found.
     """
-    return [m.strip() for m in re.findall(rf"\[{re.escape(tag)}:(.*?)\]", text, re.DOTALL)]
+    return [content.strip() for found_tag, content in _TAG_RE.findall(text) if found_tag == tag]
 
 
 def strip_tags(text: str) -> str:
     """Remove all [TAG:...] sections from text."""
-    return re.sub(r"\[\w+:[^\]]*\]", "", text).strip()
+    return _TAG_RE.sub("", text).strip()
 
 
 async def apply_config_updates(
