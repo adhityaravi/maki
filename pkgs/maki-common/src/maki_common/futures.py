@@ -33,7 +33,7 @@ class PendingFutures:
 
     def create(self, key: str) -> asyncio.Future:
         """Create and register a future for the given key."""
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self._futures[key] = future
         return future
 
