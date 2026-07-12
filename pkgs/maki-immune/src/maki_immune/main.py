@@ -14,7 +14,14 @@ from functools import partial
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-from maki_common import configure_logging, connect_nats, init_kv, load_kv_config, spawn_background
+from maki_common import (
+    configure_logging,
+    connect_nats,
+    default_health_endpoints,
+    init_kv,
+    load_kv_config,
+    spawn_background,
+)
 from maki_common.health import tcp_health_server
 from maki_common.subjects import (
     CORTEX_STUCK,
@@ -50,13 +57,13 @@ RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
 REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
-HEALTH_ENDPOINTS = {
-    "maki-stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
-    "maki-cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
-    "maki-recall": os.environ.get("RECALL_URL", "http://maki-recall:8000"),
-    "maki-synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
-    "maki-finbert": os.environ.get("FINBERT_URL", "http://maki-finbert:8080"),
-}
+# ``maki-`` prefix is required here: immune's HTTP verdicts are merged with
+# k8s pod verdicts (keyed on ``app=`` labels, which are ``maki-*``) inside
+# ``_merge_and_update_health``. Bare-name keys would produce ghost entries
+# in ``_component_health`` and prevent the composite ``http_ok AND k8s_ok``
+# verdict from firing. Ports + env-var overrides come from the shared table
+# in ``maki_common.endpoints`` — see #137.
+HEALTH_ENDPOINTS = default_health_endpoints(prefix="maki-")
 
 VITALS_STREAM = "maki-vitals"
 DEPLOY_STREAM = "maki-deploy"

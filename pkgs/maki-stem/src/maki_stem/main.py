@@ -28,6 +28,7 @@ from maki_common import (
     build_pg_dsn,
     configure_logging,
     connect_nats,
+    default_health_endpoints,
     init_kv,
     spawn_background,
     subscribe_supervised,
@@ -88,12 +89,11 @@ LOCK_BUCKET = "maki-lock"
 INSTANCE_ID = f"stem-{uuid.uuid4().hex[:8]}"
 
 # Component health probes used by ``system_state.gather_system_state`` when
-# immune is unreachable. Keep in sync with the deployed service DNS names.
-HEALTH_ENDPOINTS = {
-    "recall": os.environ.get("RECALL_URL", "http://maki-recall:8000"),
-    "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
-    "cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
-}
+# immune is unreachable, and by the ``check_component`` tool for a fresh
+# single-shot HTTP reading. Ports + env-var overrides come from the shared
+# table in ``maki_common.endpoints`` — see #137 for the three-copy drift this
+# consolidates. Bare-name convention matches cortex and the tool-facing dict.
+HEALTH_ENDPOINTS = default_health_endpoints()
 
 # Idle loop frequency is controlled by IDLE_CRON + the distributed TTL lock in idle.py.
 # No per-loop "max per day" counter — that's redundant, not distributed, and a foot-gun.

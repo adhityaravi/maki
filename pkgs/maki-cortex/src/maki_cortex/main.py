@@ -18,6 +18,7 @@ from typing import Any
 from maki_common import (
     configure_logging,
     connect_nats,
+    default_health_endpoints,
     format_graph_block,
     format_memories_block,
     format_system_state_lines,
@@ -61,10 +62,13 @@ REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 # ``git -c http.extraheader=...`` inside ``maki_common.repo`` (issue #347).
 CLONE_URL = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
 
+# Bare-name registry (matches the tool-facing convention used elsewhere in
+# cortex/stem). Ports + env-var overrides come from the shared table in
+# ``maki_common.endpoints`` — see #137 for the drift this consolidates. Self
+# entry is overridden to hit the local process directly so ``check_component``
+# gets a fresh single-shot reading rather than a Service round-robin hop.
 HEALTH_ENDPOINTS = {
-    "recall": RECALL_URL,
-    "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
-    "stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
+    **default_health_endpoints(),
     "cortex": f"http://localhost:{HEALTH_PORT}",
 }
 
