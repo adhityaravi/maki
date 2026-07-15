@@ -209,7 +209,12 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
 
     identity = await load_identity(ctx.kv)
 
-    idle_query = _IDLE_MEMORY_QUERIES[int(time.time() / 3600) % len(_IDLE_MEMORY_QUERIES)]
+    # Rotate by 4h slot (matches IDLE_CRON = "0 */4 * * *") so the index advances
+    # by exactly 1 per fire. Indexing by hour would collide with the 4h cadence
+    # (gcd(24, len) matters): with len==8 only indices {0, 4} were ever picked.
+    # If you change IDLE_CRON or len(_IDLE_MEMORY_QUERIES), keep the divisor in
+    # sync with the fire interval, or pick a list length coprime with it.
+    idle_query = _IDLE_MEMORY_QUERIES[int(time.time() // 14400) % len(_IDLE_MEMORY_QUERIES)]
     memories, graph_context = await ctx.search_memories(idle_query)
     system_state = await ctx.gather_system_state()
 
