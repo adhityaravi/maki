@@ -8,7 +8,7 @@ import re
 import time
 from typing import Any
 
-from maki_common import load_kv_config, parse_config_tags, spawn_background
+from maki_common import DEFAULT_CLAUDE_MODEL, load_kv_config, parse_config_tags, spawn_background
 from maki_common.claude import invoke_claude
 from maki_common.config import apply_config_updates, parse_tagged
 from maki_common.nats import try_claim_loop
@@ -17,7 +17,7 @@ from maki_common.subjects import IMMUNE_ACTION
 log = logging.getLogger(__name__)
 
 MAX_CLAUDE_TURNS = int(os.environ.get("IMMUNE_MAX_TURNS", "8"))
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
 
 # Set by init()
 _nc: Any = None

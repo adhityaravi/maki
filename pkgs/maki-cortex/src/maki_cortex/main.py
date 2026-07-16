@@ -16,6 +16,7 @@ import uuid
 from typing import Any
 
 from maki_common import (
+    DEFAULT_CLAUDE_MODEL,
     configure_logging,
     connect_nats,
     default_health_endpoints,
@@ -37,7 +38,7 @@ log = logging.getLogger(__name__)
 NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
 NATS_TOKEN = os.environ.get("NATS_TOKEN")
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")

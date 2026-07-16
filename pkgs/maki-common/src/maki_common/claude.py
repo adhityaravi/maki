@@ -10,6 +10,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from maki_common.models import DEFAULT_CLAUDE_MODEL
+
 log = logging.getLogger(__name__)
 
 
@@ -174,7 +176,7 @@ async def _run_query(
 
 async def invoke_claude(
     prompt: str,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = DEFAULT_CLAUDE_MODEL,
     semaphore: asyncio.Semaphore | None = None,
     max_turns: int = 1,
     mcp_servers: dict[str, Any] | None = None,
@@ -253,7 +255,7 @@ async def invoke_claude(
 
 async def stream_claude(
     prompt: str,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = DEFAULT_CLAUDE_MODEL,
     semaphore: asyncio.Semaphore | None = None,
     max_turns: int = 10,
     mcp_servers: dict[str, Any] | None = None,

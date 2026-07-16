@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from maki_common import configure_logging
+from maki_common import DEFAULT_CLAUDE_MODEL, configure_logging
 from maki_common.claude import TokenUsage, invoke_claude
 from pydantic import BaseModel
 
@@ -55,7 +55,7 @@ log = logging.getLogger(__name__)
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_QUERIES", "3"))
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
 
 SUPPORTED_TOOL_CHOICE = ("auto", "none", "required")
 

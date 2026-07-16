@@ -5,6 +5,7 @@ from maki_common.db import build_pg_dsn
 from maki_common.endpoints import DEFAULT_PORTS, default_health_endpoints
 from maki_common.futures import PendingFutures, PendingQueues
 from maki_common.logging import configure_logging, get_logger
+from maki_common.models import DEFAULT_CLAUDE_MODEL
 from maki_common.nats import (
     connect_nats,
     init_kv,
@@ -31,6 +32,7 @@ __all__ = [
     "build_pg_dsn",
     "configure_logging",
     "connect_nats",
+    "DEFAULT_CLAUDE_MODEL",
     "DEFAULT_PORTS",
     "default_health_endpoints",
     "format_graph_block",

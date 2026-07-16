@@ -16,7 +16,7 @@ import neo4j
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from maki_common import build_pg_dsn, configure_logging, connect_nats
+from maki_common import DEFAULT_CLAUDE_MODEL, build_pg_dsn, configure_logging, connect_nats
 from maki_common.subjects import IMMUNE_ALERT
 from mem0 import Memory
 from pydantic import BaseModel, Field
@@ -151,7 +151,7 @@ def _build_config() -> tuple[dict[str, Any], bool]:
         "llm": {
             "provider": os.environ.get("LLM_PROVIDER", "openai"),
             "config": {
-                "model": os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
+                "model": os.environ.get("LLM_MODEL", DEFAULT_CLAUDE_MODEL),
                 "temperature": 0,
                 "max_tokens": 2000,
                 "openai_base_url": os.environ.get("LLM_URL", "http://maki-synapse:8080/v1"),
