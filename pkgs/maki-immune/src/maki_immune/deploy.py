@@ -180,12 +180,52 @@ async def _restart_dependent(deployment_name: str, reason: str):
     log.info("Restarted dependent deployment", extra={"deployment": deployment_name, "reason": reason})
 
 
-def _record_action(action: dict):
-    """Append action to recent_actions, trim, and schedule persist."""
+async def _record_action(action: dict):
+    """Append action to recent_actions, trim, publish IMMUNE_ACTION, and schedule persist.
+
+    Single source of truth: local action history and the published action stream
+    are guaranteed to see the same payload — no risk of drift between two literals.
+    """
     _recent_actions.append(action)
     if len(_recent_actions) > _recent_actions_max:
         _recent_actions.pop(0)
     _schedule_persist()
+    try:
+        await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+    except Exception:
+        log.exception("Failed to publish IMMUNE_ACTION")
+
+
+async def _rollback_to(
+    deployment_name: str,
+    container_name: str,
+    previous_image: str,
+    image_tag: str,
+    alert_message: str,
+) -> None:
+    """Roll back a deployment to ``previous_image``, blacklist the failing tag, alert.
+
+    Shared between ``deploy_request_handler`` and ``_deploy_propagate_handler`` —
+    the only real difference between their rollback paths was the alert wording,
+    which is passed in. Rollback logs are appended to the alert automatically.
+    """
+    rollback_patch = {
+        "spec": {"template": {"spec": {"containers": [{"name": container_name, "image": previous_image}]}}}
+    }
+    await asyncio.to_thread(
+        _k8s_apps_v1.patch_namespaced_deployment,
+        name=deployment_name,
+        namespace=_namespace,
+        body=rollback_patch,
+    )
+    if image_tag and image_tag != "latest":
+        _failed_image_blacklist.add(image_tag)
+        log.warning(
+            "Image tag added to blacklist",
+            extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
+        )
+    rollback_logs = await _fetch_rollback_logs(deployment_name)
+    await _publish_alert(f"{alert_message}{rollback_logs}")
 
 
 # --- Rollout Monitoring ---
@@ -323,17 +363,14 @@ async def deploy_request_handler(msg):
                     "Use force=true to override."
                 ),
             }
-            await _nc.publish(
-                IMMUNE_ACTION,
-                json.dumps(
-                    {
-                        "type": "deploy_rejected",
-                        "deployment": deployment_name,
-                        "image_tag": image_tag,
-                        "reason": "blacklisted",
-                        "timestamp": time.time(),
-                    }
-                ).encode(),
+            await _record_action(
+                {
+                    "type": "deploy_rejected",
+                    "deployment": deployment_name,
+                    "image_tag": image_tag,
+                    "reason": "blacklisted",
+                    "timestamp": time.time(),
+                }
             )
             await msg.respond(json.dumps(result).encode())
             return
@@ -403,38 +440,20 @@ async def deploy_request_handler(msg):
                     )
                 else:
                     log.warning("Deploy unhealthy, rolling back", extra={"deployment": deployment_name})
-                    rollback_patch = {
-                        "spec": {
-                            "template": {
-                                "spec": {
-                                    "containers": [
-                                        {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                    await asyncio.to_thread(
-                        _k8s_apps_v1.patch_namespaced_deployment,
-                        name=deployment_name,
-                        namespace=_namespace,
-                        body=rollback_patch,
+                    await _rollback_to(
+                        deployment_name=deployment_name,
+                        container_name=dep.spec.template.spec.containers[0].name,
+                        previous_image=previous_image,
+                        image_tag=image_tag,
+                        alert_message=(
+                            f"Deploy of {deployment_name} → {image_tag} FAILED health check. "
+                            f"Rolled back to {previous_image}"
+                        ),
                     )
                     result = {
                         "status": "rolled_back",
                         "message": f"Deploy of {image} failed health check, rolled back to {previous_image}",
                     }
-                    if image_tag != "latest":
-                        _failed_image_blacklist.add(image_tag)
-                        log.warning(
-                            "Image tag added to blacklist",
-                            extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
-                        )
-                    _rollback_logs = await _fetch_rollback_logs(deployment_name)
-                    await _publish_alert(
-                        f"Deploy of {deployment_name} → {image_tag} FAILED health check. "
-                        f"Rolled back to {previous_image}{_rollback_logs}"
-                    )
 
                     if "cortex" in deployment_name:
                         try:
@@ -442,7 +461,7 @@ async def deploy_request_handler(msg):
                         except Exception:
                             log.exception("Failed to restart stem after cortex rollback")
 
-                _record_action(
+                await _record_action(
                     {
                         "type": "deploy",
                         "deployment": deployment_name,
@@ -450,18 +469,6 @@ async def deploy_request_handler(msg):
                         "result": result["status"],
                         "timestamp": time.time(),
                     }
-                )
-                await _nc.publish(
-                    IMMUNE_ACTION,
-                    json.dumps(
-                        {
-                            "type": "deploy",
-                            "deployment": deployment_name,
-                            "image": image,
-                            "result": result["status"],
-                            "timestamp": time.time(),
-                        }
-                    ).encode(),
                 )
                 await msg.respond(json.dumps(result).encode())
 
@@ -519,18 +526,15 @@ async def _deploy_propagate_handler(msg):
                 "Propagated deploy skipped: blacklisted",
                 extra={"image_tag": image_tag, "deployment": deployment_name, "canary": canary},
             )
-            await _nc.publish(
-                IMMUNE_ACTION,
-                json.dumps(
-                    {
-                        "type": "deploy_propagation_skipped",
-                        "deployment": deployment_name,
-                        "image_tag": image_tag,
-                        "reason": "blacklisted",
-                        "instance": _instance_id,
-                        "timestamp": time.time(),
-                    }
-                ).encode(),
+            await _record_action(
+                {
+                    "type": "deploy_propagation_skipped",
+                    "deployment": deployment_name,
+                    "image_tag": image_tag,
+                    "reason": "blacklisted",
+                    "instance": _instance_id,
+                    "timestamp": time.time(),
+                }
             )
             return
 
@@ -584,37 +588,18 @@ async def _deploy_propagate_handler(msg):
                 else:
                     result_status = "rolled_back"
                     log.warning("Propagated deploy unhealthy, rolling back", extra={"deployment": deployment_name})
-                    if image_tag and image_tag != "latest":
-                        _failed_image_blacklist.add(image_tag)
-                        log.warning(
-                            "Image tag added to blacklist",
-                            extra={"image_tag": image_tag, "blacklist_size": len(_failed_image_blacklist)},
-                        )
-                    rollback_patch = {
-                        "spec": {
-                            "template": {
-                                "spec": {
-                                    "containers": [
-                                        {"name": dep.spec.template.spec.containers[0].name, "image": previous_image}
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                    await asyncio.to_thread(
-                        _k8s_apps_v1.patch_namespaced_deployment,
-                        name=deployment_name,
-                        namespace=_namespace,
-                        body=rollback_patch,
-                    )
-                    _rollback_logs = await _fetch_rollback_logs(deployment_name)
-                    await _publish_alert(
-                        f"Propagated deploy of {deployment_name} → {image_tag} FAILED on {_instance_id}. "
-                        f"Rolled back to {previous_image}. Canary ({canary}) was healthy — investigate."
-                        f"{_rollback_logs}"
+                    await _rollback_to(
+                        deployment_name=deployment_name,
+                        container_name=dep.spec.template.spec.containers[0].name,
+                        previous_image=previous_image,
+                        image_tag=image_tag,
+                        alert_message=(
+                            f"Propagated deploy of {deployment_name} → {image_tag} FAILED on {_instance_id}. "
+                            f"Rolled back to {previous_image}. Canary ({canary}) was healthy — investigate."
+                        ),
                     )
 
-                _record_action(
+                await _record_action(
                     {
                         "type": "deploy_propagation",
                         "deployment": deployment_name,
@@ -624,20 +609,6 @@ async def _deploy_propagate_handler(msg):
                         "instance": _instance_id,
                         "timestamp": time.time(),
                     }
-                )
-                await _nc.publish(
-                    IMMUNE_ACTION,
-                    json.dumps(
-                        {
-                            "type": "deploy_propagation",
-                            "deployment": deployment_name,
-                            "image": image,
-                            "result": result_status,
-                            "canary_instance": canary,
-                            "instance": _instance_id,
-                            "timestamp": time.time(),
-                        }
-                    ).encode(),
                 )
         except LockNotAcquired:
             # When the lock is held, first check if the target image is already
@@ -769,7 +740,7 @@ async def restart_request_handler(msg):
                         f"Restart of {deployment_name} FAILED health check on {_instance_id} — not propagating"
                     )
 
-                _record_action(
+                await _record_action(
                     {
                         "type": "restart",
                         "deployment": deployment_name,
@@ -777,18 +748,6 @@ async def restart_request_handler(msg):
                         "result": result["status"],
                         "timestamp": time.time(),
                     }
-                )
-                await _nc.publish(
-                    IMMUNE_ACTION,
-                    json.dumps(
-                        {
-                            "type": "restart",
-                            "deployment": deployment_name,
-                            "reason": reason,
-                            "result": result["status"],
-                            "timestamp": time.time(),
-                        }
-                    ).encode(),
                 )
                 await msg.respond(json.dumps(result).encode())
 
@@ -885,7 +844,7 @@ async def _restart_propagate_handler(msg):
                         f"Canary ({canary}) was healthy — investigate."
                     )
 
-                _record_action(
+                await _record_action(
                     {
                         "type": "restart_propagation",
                         "deployment": deployment_name,
@@ -895,20 +854,6 @@ async def _restart_propagate_handler(msg):
                         "instance": _instance_id,
                         "timestamp": time.time(),
                     }
-                )
-                await _nc.publish(
-                    IMMUNE_ACTION,
-                    json.dumps(
-                        {
-                            "type": "restart_propagation",
-                            "deployment": deployment_name,
-                            "reason": reason,
-                            "result": result_status,
-                            "canary_instance": canary,
-                            "instance": _instance_id,
-                            "timestamp": time.time(),
-                        }
-                    ).encode(),
                 )
         except LockNotAcquired:
             await _publish_alert(f"Cannot propagate restart of {deployment_name} — lock held")
