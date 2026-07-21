@@ -8,6 +8,16 @@
     "enabled": true,
     "schedule": ["before 9am on monday"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update image tags stored as Terraform variable defaults, marked with `# renovate: datasource=... depName=...` above the default.",
+      "fileMatch": ["(^|/)infra/modules/[^/]+/variables\\.tf$"],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+?)\\s+depName=(?<depName>[^\\s]+?)(\\s+versioning=(?<versioning>[^\\s]+?))?\\s*\\r?\\n\\s*default\\s*=\\s*\"(?<currentValue>[^\"]+?)\""
+      ]
+    }
+  ],
   "packageRules": [
     {
       "description": "Group all Python dependencies",
