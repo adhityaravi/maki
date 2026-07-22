@@ -29,7 +29,7 @@ from maki_common import (
 )
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
-from maki_common.repo import SyncError, build_github_auth, hard_sync, init_repo
+from maki_common.repo import SyncError, build_github_auth, clean_remote_url, hard_sync, init_repo
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
@@ -61,7 +61,7 @@ REPO_NAME = os.environ.get("REPO_NAME", "maki")
 REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 # Token-free clone URL — auth is injected per-invocation via
 # ``git -c http.extraheader=...`` inside ``maki_common.repo`` (issue #347).
-CLONE_URL = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
+CLONE_URL = clean_remote_url(REPO_OWNER, REPO_NAME)
 
 # Bare-name registry (matches the tool-facing convention used elsewhere in
 # cortex/stem). Ports + env-var overrides come from the shared table in

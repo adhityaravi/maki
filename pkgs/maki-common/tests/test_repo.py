@@ -6,7 +6,15 @@ import asyncio
 from pathlib import Path
 from unittest import mock
 
-from maki_common.repo import RepoEntry, RepoRegistry, SyncError, hard_sync, redact_token
+from maki_common.repo import (
+    RepoEntry,
+    RepoRegistry,
+    SyncError,
+    clean_remote_url,
+    hard_sync,
+    redact_token,
+    set_origin,
+)
 
 
 def test_redact_token_strips_url_form() -> None:
@@ -403,6 +411,53 @@ def test_hard_sync_with_auth_requires_url_or_owner_name() -> None:
         assert "clone_url" in str(exc) or "owner" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("hard_sync should require owner/name or clone_url with github_auth")
+
+
+# ---------------------------------------------------------------------------
+# clean_remote_url / set_origin — the URL-construction primitive and its
+# set-url wrapper. Single source of truth for the remote URL form; every
+# clone/set-url call in hard_sync, init_repo, git_commit_and_push, git_pull
+# and RepoEntry.resolved_clone_url flows through these. See issue #153.
+# ---------------------------------------------------------------------------
+
+
+def test_clean_remote_url_returns_token_free_https_form() -> None:
+    """Issue #347 invariant: the URL must be token-free."""
+    url = clean_remote_url("adhityaravi", "maki")
+    assert url == "https://github.com/adhityaravi/maki.git"
+    assert "x-access-token" not in url
+    assert "@" not in url
+
+
+def test_clean_remote_url_composes_arbitrary_owner_and_name() -> None:
+    """Regression guard: change here shouldn't silently break other repos."""
+    assert clean_remote_url("some-org", "cool_repo") == "https://github.com/some-org/cool_repo.git"
+
+
+def test_repo_entry_resolved_clone_url_uses_helper() -> None:
+    """RepoEntry now delegates to clean_remote_url — pin the composition."""
+    entry = RepoEntry(path="/repo/x", owner="o", name="x")
+    assert entry.resolved_clone_url() == clean_remote_url("o", "x")
+
+
+def test_set_origin_runs_git_remote_set_url_with_given_url() -> None:
+    stub, calls = _fake_run_git((0, "", ""))
+    with mock.patch("maki_common.repo._run_git", stub):
+        rc, stderr = asyncio.run(set_origin("/repo/maki", "https://github.com/o/n.git"))
+    assert rc == 0
+    assert stderr == ""
+    assert calls == [("remote", "set-url", "origin", "https://github.com/o/n.git")]
+    # set-url is local; must never carry an auth token.
+    assert stub.token_calls == [None]  # type: ignore[attr-defined]
+
+
+def test_set_origin_returns_returncode_and_stderr_on_failure() -> None:
+    """Callers pick their own error semantics — helper just surfaces (rc, stderr)."""
+    stub, _ = _fake_run_git((128, "", "fatal: bad remote"))
+    with mock.patch("maki_common.repo._run_git", stub):
+        rc, stderr = asyncio.run(set_origin("/repo/maki", "https://github.com/o/n.git"))
+    assert rc == 128
+    assert "fatal: bad remote" in stderr
 
 
 def test_hard_sync_token_mint_failure_surfaces_as_sync_error() -> None:

@@ -745,9 +745,9 @@ async def main():
     await _load_recent_actions()
 
     # Clone or pull the repo for local code access (read-only)
-    from maki_common.repo import init_repo
+    from maki_common.repo import clean_remote_url, init_repo
 
-    await init_repo(REPO_PATH, clone_url="https://github.com/adhityaravi/maki.git")
+    await init_repo(REPO_PATH, clone_url=clean_remote_url("adhityaravi", "maki"))
 
     # K8s client
     try:

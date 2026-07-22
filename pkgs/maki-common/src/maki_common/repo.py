@@ -100,6 +100,38 @@ async def _run_git(
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
+def clean_remote_url(owner: str, name: str) -> str:
+    """Return the token-free HTTPS clone URL for a GitHub repo.
+
+    Single source of truth for the remote URL form. Change here to add SSH
+    support, GHE hosts, or a different naming scheme — every clone/set-url
+    call flows through this helper, so drift between call sites is impossible.
+
+    Tokens are NEVER embedded in the URL (issue #347); they inject
+    per-invocation via ``_run_git(..., token=...)`` which sets an in-memory
+    ``http.extraheader`` config. The URL that lands in ``.git/config`` is
+    always the plain ``https://github.com/owner/name.git`` form.
+    """
+    return f"https://github.com/{owner}/{name}.git"
+
+
+async def set_origin(repo_path: str, url: str) -> tuple[int, str]:
+    """Point ``origin`` at *url* via ``git remote set-url``.
+
+    Consolidates the fetch/push/pull setup pattern used by ``hard_sync``,
+    ``init_repo`` and the MCP git tools (``git_commit_and_push``,
+    ``git_pull``). Returns ``(returncode, stderr)`` so callers pick their
+    own failure semantics — raise ``SyncError``, log-and-continue, etc.
+    ``stderr`` is pre-redacted by ``_run_git``.
+
+    Pair with ``clean_remote_url(owner, name)`` when constructing the URL
+    from an owner/name; pass an already-known URL through directly (as
+    ``init_repo`` does with its ``clone_url`` argument).
+    """
+    rc, _, stderr = await _run_git(repo_path, "remote", "set-url", "origin", url)
+    return rc, stderr
+
+
 async def _run_git_no_cwd(
     *args: str,
     token: str | None = None,
@@ -197,8 +229,8 @@ async def hard_sync(
         # auths via -c http.extraheader instead) and scrubs any legacy
         # `x-access-token:...@github.com` URL written by older versions of
         # this module — see issue #347.
-        clean_url = clone_url if clone_url else f"https://github.com/{owner}/{name}.git"
-        rc, _, stderr = await _run_git(repo_path, "remote", "set-url", "origin", clean_url)
+        clean_url = clone_url if clone_url else clean_remote_url(owner, name)
+        rc, stderr = await set_origin(repo_path, clean_url)
         if rc != 0:
             raise SyncError("remote set-url", rc, stderr)
 
@@ -291,7 +323,7 @@ async def init_repo(
             # via -c http.extraheader) and scrubs any legacy
             # `x-access-token:...@github.com` URL written by older versions
             # of this module — see issue #347.
-            await _run_git(repo_path, "remote", "set-url", "origin", clone_url)
+            await set_origin(repo_path, clone_url)
         rc, _, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main", token=token)
         if rc != 0:
             log.warning("Git pull failed", extra={"stderr": stderr})
@@ -321,7 +353,7 @@ class RepoEntry:
     clone_url: str | None = None
 
     def resolved_clone_url(self) -> str:
-        return self.clone_url or f"https://github.com/{self.owner}/{self.name}.git"
+        return self.clone_url or clean_remote_url(self.owner, self.name)
 
 
 class RepoRegistry:

@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from maki_common.repo import RepoEntry, RepoRegistry, _auth_config_args, redact_token
+from maki_common.repo import RepoEntry, RepoRegistry, _auth_config_args, redact_token, set_origin
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -426,8 +426,7 @@ def make_code_edit_tools(
             push_token: str | None = None
             if entry.auth and entry.owner and entry.name:
                 push_token = await entry.auth.get_token()
-                clean_url = f"https://github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", clean_url)
+                await set_origin(entry.path, entry.resolved_clone_url())
 
             # Push
             rc, stdout, stderr = await _run_git(entry.path, "push", "origin", "main", token=push_token)
@@ -466,8 +465,7 @@ def make_code_edit_tools(
             pull_token: str | None = None
             if entry.auth and entry.owner and entry.name:
                 pull_token = await entry.auth.get_token()
-                clean_url = f"https://github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", clean_url)
+                await set_origin(entry.path, entry.resolved_clone_url())
 
             # Clear stuck rebase state before pulling — rebase --abort silently
             # fails in some states, so nuke the directory directly.
