@@ -505,6 +505,12 @@ async def deploy_propagate_listener():
         durable=f"immune-propagate-{_instance_id}",
         deliver_policy=DeliverPolicy.NEW,
         auto_ack=True,
+        # Space redeliveries so we don't hammer JS while a local deploy
+        # in flight (~90-150s under _monitor_rollout) is still holding
+        # the infra lock. 60s means ≤3 retries cover the full lock TTL.
+        # See issue #385 — without redelivery, propagation ACK-and-dropped
+        # silently on lock contention and hive sites diverged.
+        nak_delay=60.0,
         name="deploy_propagate",
     )
 
@@ -612,8 +618,8 @@ async def _deploy_propagate_handler(msg):
                 )
         except LockNotAcquired:
             # When the lock is held, first check if the target image is already
-            # deployed — no propagation needed and no alert warranted. Only if
-            # a real change is pending do we surface the "lock held" alert.
+            # deployed — no propagation needed and no retry warranted. Only if
+            # a real change is pending do we defer via NAK/redelivery.
             try:
                 dep = await asyncio.to_thread(
                     _k8s_apps_v1.read_namespaced_deployment, name=deployment_name, namespace=_namespace
@@ -623,9 +629,20 @@ async def _deploy_propagate_handler(msg):
                     return
             except Exception:
                 pass
-            await _publish_alert(f"Cannot propagate deploy of {deployment_name} — lock held")
-            return
+            # Re-raise so subscribe_supervised NAKs the message and JetStream
+            # redelivers after nak_delay. Without this, auto_ack silently
+            # ACKs the propagation and this site diverges from the canary
+            # (issue #385). The "already on target image" early-out above
+            # keeps redelivery idempotent on the eventual retry.
+            log.warning(
+                "Deploy propagation deferred — infra lock held, will retry",
+                extra={"deployment": deployment_name, "image": image, "canary": canary},
+            )
+            raise
 
+    except LockNotAcquired:
+        # Bubble up to subscribe_supervised so JetStream redelivers.
+        raise
     except Exception:
         log.exception("Deploy propagation error")
 
@@ -784,6 +801,8 @@ async def restart_propagate_listener():
         durable=f"immune-restart-{_instance_id}",
         deliver_policy=DeliverPolicy.NEW,
         auto_ack=True,
+        # See _deploy_propagate_handler for the rationale — issue #385.
+        nak_delay=60.0,
         name="restart_propagate",
     )
 
@@ -856,8 +875,21 @@ async def _restart_propagate_handler(msg):
                     }
                 )
         except LockNotAcquired:
-            await _publish_alert(f"Cannot propagate restart of {deployment_name} — lock held")
-            return
+            # Re-raise so subscribe_supervised NAKs and JetStream redelivers
+            # after nak_delay. Without this, auto_ack silently ACKs the
+            # propagation and the restart never lands here (issue #385).
+            # Unlike deploy, there's no idempotent early-out — restart is
+            # always an annotation bump, so every redelivery bumps again.
+            # That's acceptable: at worst we do a redundant rollout restart
+            # once the lock frees, which is safe.
+            log.warning(
+                "Restart propagation deferred — infra lock held, will retry",
+                extra={"deployment": deployment_name, "reason": reason, "canary": canary},
+            )
+            raise
 
+    except LockNotAcquired:
+        # Bubble up to subscribe_supervised so JetStream redelivers.
+        raise
     except Exception:
         log.exception("Restart propagation error")
