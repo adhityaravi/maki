@@ -385,10 +385,15 @@ async def _invoke_with_json_retry(
         OpenAI Usage we surface (fixes #107, which dropped first-call tokens).
 
     Wraps both invocations in a single try/except so upstream failures map
-    consistently to HTTP 502: TimeoutError → ``"upstream timeout"`` (opaque,
-    because the elapsed-seconds detail leaks deadline metadata; see #350),
-    other exceptions → ``str(e)``. A retry that still fails to parse JSON
-    also raises 502 with the accumulated usage logged for cost triage.
+    consistently to HTTP 502 with opaque bodies — ``"upstream timeout"`` for
+    TimeoutError, ``"upstream error"`` for everything else. Raw exception
+    text is kept out of the response because the Claude SDK / httpx / anyio
+    layers surface Postgres DSN fragments, provider paths, and traceback
+    hints in ``str(e)`` that leak straight to the caller (see #350 for the
+    timeout half of this reasoning, #158 for the generic half). Full
+    exception including traceback is preserved server-side via
+    ``log.exception``. A retry that still fails to parse JSON also raises
+    502 with the accumulated usage logged for cost triage.
     """
     try:
         text, token_usage = await invoke_claude(
@@ -452,9 +457,14 @@ async def _invoke_with_json_retry(
         # (mode, prompt_len, elapsed_ms). Also pairs with #158. See #350.
         log.warning("Claude invocation timed out")
         raise HTTPException(status_code=502, detail="upstream timeout")
-    except Exception as e:
+    except Exception:
+        # ``detail=str(e)`` used to be here; it leaked exception text from
+        # the Claude SDK / httpx / anyio layers straight into the response
+        # body (DSN fragments, provider file paths, traceback-adjacent
+        # detail). Full exception is preserved in the server log via
+        # ``log.exception``; the response body stays opaque. See #158.
         log.exception("Claude invocation failed")
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail="upstream error")
 
 
 def _parse_response(text: str, *, has_tools: bool) -> tuple[ResponseMessage, str]:
