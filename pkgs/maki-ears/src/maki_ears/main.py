@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import uuid
 
 import discord
@@ -70,6 +71,28 @@ _immune_channel_ids: set[int] = set()
 _trading_channel_ids: set[int] = set()
 
 _bot = None
+_shutdown_event: asyncio.Event | None = None
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
+    """Install SIGTERM/SIGINT handlers that set the shutdown event.
+
+    Without this, SIGTERM from Kubernetes goes straight to a forced kill:
+    the NATS connection drops mid-publish, in-flight Discord sends die, and
+    the dedup KV never sees a clean disconnect. Setting an asyncio.Event lets
+    the main loop break, close the bot, and close NATS cleanly.
+    """
+
+    def _handle(signame: str) -> None:
+        log.info("Shutdown signal received", extra={"signal": signame})
+        event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle, sig.name)
+        except NotImplementedError:
+            # Windows / restricted envs — ctrl-c still raises KeyboardInterrupt.
+            pass
 
 
 def _discover_channel(guild, channel_name: str, channel_ids: set[int], label: str):
@@ -697,9 +720,12 @@ async def _leader_renewal_loop():
 
 
 async def main():
-    global _nc, _js, _dedup_kv, _lock_kv, _bot
+    global _nc, _js, _dedup_kv, _lock_kv, _bot, _shutdown_event
 
     log.info("maki-ears starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
+
+    _shutdown_event = asyncio.Event()
+    _install_signal_handlers(asyncio.get_running_loop(), _shutdown_event)
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
@@ -723,44 +749,87 @@ async def main():
     spawn_background(_vitals_listener(), name="ears.vitals_listener")
     spawn_background(_alert_listener(), name="ears.alert_listener")
 
-    # Leader election loop — only the leader connects to Discord
-    while True:
-        if await _try_acquire_leadership():
-            log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
+    try:
+        # Leader election loop — only the leader connects to Discord.
+        # Breaks on _shutdown_event so SIGTERM triggers the cleanup below.
+        while not _shutdown_event.is_set():
+            if await _try_acquire_leadership():
+                log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
 
-            # Fresh client each time — discord.py closes the aiohttp session on
-            # bot.close(), making the old instance unusable.
-            _bot = _create_bot()
-            _general_channel_ids.clear()
-            _vitals_channel_ids.clear()
-            _immune_channel_ids.clear()
-            _trading_channel_ids.clear()
+                # Fresh client each time — discord.py closes the aiohttp session on
+                # bot.close(), making the old instance unusable.
+                _bot = _create_bot()
+                _general_channel_ids.clear()
+                _vitals_channel_ids.clear()
+                _immune_channel_ids.clear()
+                _trading_channel_ids.clear()
 
-            # ``spawn_background`` for renewal_task gives us exception logging;
-            # the returned Task is still assigned for the ``.cancel()`` call in
-            # the ``finally`` block below (issue #123). search_task keeps a bare
-            # create_task because its handle is both retained here and awaited
-            # via cancel — no risk of GC or silent exception loss.
-            renewal_task = spawn_background(_leader_renewal_loop(), name="ears.leader_renewal")
-            search_task = asyncio.create_task(_search_listener())
+                # ``spawn_background`` for renewal_task gives us exception logging;
+                # the returned Task is still assigned for the ``.cancel()`` call in
+                # the ``finally`` block below (issue #123). search_task keeps a bare
+                # create_task because its handle is both retained here and awaited
+                # via cancel — no risk of GC or silent exception loss.
+                renewal_task = spawn_background(_leader_renewal_loop(), name="ears.leader_renewal")
+                search_task = asyncio.create_task(_search_listener())
 
+                # Race the bot's lifetime against the shutdown signal so SIGTERM
+                # can unblock the otherwise indefinite _bot.start() call.
+                bot_task = asyncio.create_task(_bot.start(DISCORD_TOKEN))
+                shutdown_wait = asyncio.create_task(_shutdown_event.wait())
+
+                try:
+                    done, _ = await asyncio.wait(
+                        {bot_task, shutdown_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if bot_task in done:
+                        exc = bot_task.exception()
+                        if exc is not None:
+                            log.error("Discord bot disconnected", exc_info=exc)
+                    else:
+                        # Shutdown fired first — close the bot to unblock start().
+                        log.info("Shutdown requested, closing Discord bot")
+                        try:
+                            await _bot.close()
+                        except Exception:
+                            log.exception("Error closing Discord bot")
+                        try:
+                            await bot_task
+                        except Exception:
+                            log.exception("Discord bot shutdown error")
+                finally:
+                    if not shutdown_wait.done():
+                        shutdown_wait.cancel()
+                    # Cancel both tasks tied to this bot session. Leaving the
+                    # renewal loop alive across reconnects lets an orphaned task
+                    # close the *next* bot when its CAS happens to fail — the
+                    # global _bot rebinding makes the leak silently destructive.
+                    # See #177.
+                    renewal_task.cancel()
+                    search_task.cancel()
+                    log.info("Discord bot stopped, returning to standby")
+            else:
+                log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
+
+            # Interruptible sleep — shutdown breaks out immediately.
             try:
-                await _bot.start(DISCORD_TOKEN)
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=LEADER_TTL)
+            except TimeoutError:
+                pass
+    finally:
+        log.info("maki-ears shutting down")
+        if _bot is not None:
+            try:
+                if not _bot.is_closed():
+                    await _bot.close()
             except Exception:
-                log.exception("Discord bot disconnected")
-            finally:
-                # Cancel both tasks tied to this bot session. Leaving the
-                # renewal loop alive across reconnects lets an orphaned task
-                # close the *next* bot when its CAS happens to fail — the
-                # global _bot rebinding makes the leak silently destructive.
-                # See #177.
-                renewal_task.cancel()
-                search_task.cancel()
-                log.info("Discord bot stopped, returning to standby")
-        else:
-            log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
-
-        await asyncio.sleep(LEADER_TTL)
+                log.exception("Error closing Discord bot during shutdown")
+        if _nc is not None:
+            try:
+                await _nc.close()
+                log.info("NATS connection closed")
+            except Exception:
+                log.exception("Error closing NATS connection")
 
 
 def cli():
