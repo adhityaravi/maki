@@ -17,10 +17,15 @@ import httpx
 from maki_common import spawn_background, subscribe_supervised
 from maki_common.subjects import MEMORY_STORE
 
+# Owner identity for the whole memory pipeline lives in maki_common (see #160)
+# so stem, cortex, and immune can't drift on who "adi" actually is. Re-exported
+# here as a module-level name to keep the existing import surface (`from
+# maki_stem.memory import MEMORY_USER_ID`) working.
+from maki_common.tools.recall import MEMORY_USER_ID
+
 log = logging.getLogger(__name__)
 
 RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
-MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
 MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
 MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 

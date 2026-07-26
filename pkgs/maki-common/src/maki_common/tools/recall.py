@@ -1,9 +1,17 @@
-"""Memory tools — search, read, and store memories via maki-recall."""
+"""Memory tools — search, read, and store memories via maki-recall.
+
+Owner identity (``MEMORY_USER_ID``) is resolved once from the environment so
+every memory call — search, read, NATS-publish, REST-post — agrees on whose
+memories it's talking about. Stem imports the same constant from here so the
+env var flows through a single source of truth instead of being re-read (or
+hardcoded) in each site. See issue #160.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -12,6 +20,12 @@ from maki_common.subjects import MEMORY_STORE
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
+
+# Owner identity for every memory operation. Resolved once at import time —
+# this is the single source of truth for the entire memory pipeline. Stem's
+# ``memory.py`` imports it from here rather than re-reading the env var so
+# the two sites can't drift.
+MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
 
 
 def make_recall_tools(
@@ -29,14 +43,14 @@ def make_recall_tools(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 f"{recall_url}/search",
-                json={"query": query, "user_id": "adi"},
+                json={"query": query, "user_id": MEMORY_USER_ID},
             )
             return mcp_result(resp.text)
 
     async def get_all_memories(args: dict[str, Any]) -> dict[str, Any]:
         log.info("Tool: get_all_memories")
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{recall_url}/memories", params={"user_id": "adi"})
+            resp = await client.get(f"{recall_url}/memories", params={"user_id": MEMORY_USER_ID})
             return mcp_result(resp.text)
 
     if nc is not None:
@@ -44,7 +58,7 @@ def make_recall_tools(
         async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
             content = args.get("content", "")
             log.info("Tool: add_memory (NATS)", extra={"content_len": len(content)})
-            payload = {"content": content, "source": source, "user_id": "adi"}
+            payload = {"content": content, "source": source, "user_id": MEMORY_USER_ID}
             await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
             return mcp_result(f"Memory queued: {content[:100]}")
 
@@ -58,7 +72,7 @@ def make_recall_tools(
                     f"{recall_url}/memories",
                     json={
                         "messages": [{"role": "assistant", "content": content}],
-                        "user_id": "adi",
+                        "user_id": MEMORY_USER_ID,
                     },
                 )
                 return mcp_result(resp.text)
@@ -81,29 +95,5 @@ def make_recall_tools(
             "Store a new memory. Use this to remember important information.",
             {"content": str},
             add_memory,
-        ),
-    ]
-
-
-def make_nats_memory_tools(nc: Any, source: str) -> list[tuple[str, str, dict[str, type], Any]]:
-    """Memory store via NATS — for components without direct recall access.
-
-    Publishes to MEMORY_STORE subject. Stem subscribes and forwards to recall.
-    """
-
-    async def store_memory(args: dict[str, Any]) -> dict[str, Any]:
-        content = args.get("content", "")
-        log.info("Tool: store_memory (NATS)", extra={"source": source, "content_len": len(content)})
-        payload = {"content": content, "source": source, "user_id": "adi"}
-        await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
-        return mcp_result(f"Memory stored: {content[:100]}")
-
-    return [
-        (
-            "store_memory",
-            "Store a learning or observation into long-term memory. Use this when you discover "
-            "something worth remembering — patterns, root causes, fixes, operational insights.",
-            {"content": str},
-            store_memory,
         ),
     ]
