@@ -360,7 +360,15 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
     prompt = turn.get("prompt") or ""
     use_stream = turn.get("stream", True)
     max_turns = turn.get("max_turns", MAX_TURNS)
-    git_pull = turn.get("git_pull", True)
+    # Default OFF — callers must opt in. See issue #390.
+    #
+    # Only turns that will actually edit code need a fresh checkout (work loop
+    # is the only current opt-in). Chat and idle reflection do NOT touch the
+    # working tree, so paying the fetch+reset+clean cost on every message was
+    # pure latency — and worse, the abort-on-failure semantics below convert
+    # any transient git blip into a `cancelled=True` response with no answer,
+    # forcing Adi to retype "hey".
+    git_pull = turn.get("git_pull", False)
 
     # Auto-pull latest code if requested by the loop.
     #
