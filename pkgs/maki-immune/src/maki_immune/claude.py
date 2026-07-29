@@ -47,6 +47,13 @@ _k8s_v1: Any = None
 _lock_kv: Any = None
 _loop_heartbeats: dict[str, float] = {}  # name -> last successful run timestamp
 
+# Loop heartbeats older than this are considered retired/renamed and are
+# actively pruned from both the in-memory cache and the shared ``maki-lock``
+# KV bucket by ``loop_heartbeat_watcher`` (see #161). The threshold sits well
+# above the slowest loop cadence (the ``work`` loop runs daily) so a
+# legitimately quiet loop is never evicted mid-cycle.
+_LOOP_HEARTBEAT_TTL_S = 7 * 24 * 3600  # 7 days
+
 # How many recent escalation rows to render into the Claude system prompt. The
 # durable trail itself lives in _recent_actions (persisted to KV, gossiped via
 # hive_state) — this just caps the rendered slice.
@@ -551,6 +558,13 @@ async def loop_heartbeat_watcher() -> None:
     Stem writes loop.heartbeat.{name} after each successful body execution.
     We read these periodically so _build_system_state can surface loop health
     to Claude without blocking on async KV reads inside the sync state builder.
+
+    The cache is rebuilt from scratch each cycle (atomic swap) so renamed or
+    retired loops don't linger forever in the prompt Claude reads on every
+    escalation. Entries older than ``_LOOP_HEARTBEAT_TTL_S`` are additionally
+    deleted from the underlying KV — the ``maki-lock`` bucket has no
+    bucket-level TTL (it also holds long-lived trading state), so we prune
+    here. See #161.
     """
     global _loop_heartbeats
     log.info("Loop heartbeat watcher started")
@@ -558,19 +572,40 @@ async def loop_heartbeat_watcher() -> None:
         await asyncio.sleep(60)
         if _lock_kv is None:
             continue
+        now = time.time()
+        new_heartbeats: dict[str, float] = {}
         try:
             keys = await _lock_kv.keys()
-            for key in keys or []:
-                if not key.startswith("loop.heartbeat."):
-                    continue
-                name = key.removeprefix("loop.heartbeat.")
-                try:
-                    entry = await _lock_kv.get(key)
-                    _loop_heartbeats[name] = float(entry.value.decode())
-                except Exception:
-                    pass
         except Exception:
-            log.warning("Failed to read loop heartbeats from KV")
+            # No keys / bucket transient error — leave prior snapshot in place.
+            continue
+        for key in keys or []:
+            if not key.startswith("loop.heartbeat."):
+                continue
+            name = key.removeprefix("loop.heartbeat.")
+            try:
+                entry = await _lock_kv.get(key)
+                ts = float(entry.value.decode())
+            except Exception:
+                # Skip this key this cycle; it'll be reconsidered next round.
+                continue
+            if now - ts > _LOOP_HEARTBEAT_TTL_S:
+                # Retired/renamed loop — evict from KV so it stops polluting
+                # future reads, and exclude it from this cycle's cache.
+                try:
+                    await _lock_kv.delete(key)
+                    log.info(
+                        "Evicted stale loop heartbeat",
+                        extra={"loop": name, "age_s": round(now - ts)},
+                    )
+                except Exception:
+                    log.warning(
+                        "Failed to delete stale loop heartbeat",
+                        extra={"loop": name},
+                    )
+                continue
+            new_heartbeats[name] = ts
+        _loop_heartbeats = new_heartbeats
 
 
 # --- Immune Heartbeat Loop ---
