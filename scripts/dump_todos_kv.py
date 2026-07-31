@@ -6,16 +6,13 @@ Run inside the stem pod:
 
 import asyncio
 import json
-import os
 
 import nats
+from maki_common.settings import NATS_TOKEN, NATS_URL
 
 
 async def main():
-    url = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-    token = os.environ.get("NATS_TOKEN")
-
-    nc = await nats.connect(url, token=token)
+    nc = await nats.connect(NATS_URL, token=NATS_TOKEN)
     js = nc.jetstream()
 
     try:

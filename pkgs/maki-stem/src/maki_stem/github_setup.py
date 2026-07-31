@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import os
 
+from maki_common.settings import REPO_NAME, REPO_OWNER
+
 log = logging.getLogger(__name__)
 
 
@@ -19,13 +21,12 @@ def init_github_client():
 
     Required env: ``GITHUB_APP_ID``, ``GITHUB_PRIVATE_KEY_PATH``,
     ``GITHUB_INSTALLATION_ID``. Optional: ``REPO_OWNER`` (default
-    ``adhityaravi``), ``REPO_NAME`` (default ``maki``).
+    ``adhityaravi``), ``REPO_NAME`` (default ``maki``) — both resolved
+    once at import via :mod:`maki_common.settings`.
     """
     app_id = os.environ.get("GITHUB_APP_ID")
     private_key_path = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
     installation_id = os.environ.get("GITHUB_INSTALLATION_ID")
-    repo_owner = os.environ.get("REPO_OWNER", "adhityaravi")
-    repo_name = os.environ.get("REPO_NAME", "maki")
 
     if not (app_id and private_key_path and installation_id):
         log.info("GitHub credentials not configured — issue tracking disabled")
@@ -44,8 +45,8 @@ def init_github_client():
         app_id=app_id,
         private_key=private_key,
         installation_id=installation_id,
-        default_owner=repo_owner,
-        default_repo=repo_name,
+        default_owner=REPO_OWNER,
+        default_repo=REPO_NAME,
     )
     log.info("GitHub issue client initialized")
     return client

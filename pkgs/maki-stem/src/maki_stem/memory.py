@@ -15,6 +15,7 @@ from difflib import SequenceMatcher
 
 import httpx
 from maki_common import spawn_background, subscribe_supervised
+from maki_common.settings import RECALL_URL
 from maki_common.subjects import MEMORY_STORE
 
 # Owner identity for the whole memory pipeline lives in maki_common (see #160)
@@ -25,7 +26,6 @@ from maki_common.tools.recall import MEMORY_USER_ID
 
 log = logging.getLogger(__name__)
 
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 MEMORY_MAX_COUNT = int(os.environ.get("MEMORY_MAX_COUNT", "15"))
 MEMORY_MIN_RELEVANCE = float(os.environ.get("MEMORY_MIN_RELEVANCE", "0.5"))
 

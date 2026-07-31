@@ -21,6 +21,7 @@ from maki_common import (
     spawn_background,
     subscribe_supervised,
 )
+from maki_common.settings import NATS_TOKEN, NATS_URL
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
@@ -40,8 +41,6 @@ from maki_ears.trading import (
 configure_logging()
 log = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))

@@ -23,6 +23,14 @@ from maki_common import (
     spawn_background,
 )
 from maki_common.health import tcp_health_server
+from maki_common.settings import (
+    NATS_TOKEN,
+    NATS_URL,
+    RECALL_URL,
+    REPO_NAME,
+    REPO_OWNER,
+    REPO_PATH,
+)
 from maki_common.subjects import (
     CORTEX_STUCK,
     DEPLOY_PROPAGATE,
@@ -49,13 +57,9 @@ log = logging.getLogger(__name__)
 
 # --- Config ---
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
-REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
 # ``maki-`` prefix is required here: immune's HTTP verdicts are merged with
 # k8s pod verdicts (keyed on ``app=`` labels, which are ``maki-*``) inside
@@ -747,7 +751,7 @@ async def main():
     # Clone or pull the repo for local code access (read-only)
     from maki_common.repo import clean_remote_url, init_repo
 
-    await init_repo(REPO_PATH, clone_url=clean_remote_url("adhityaravi", "maki"))
+    await init_repo(REPO_PATH, clone_url=clean_remote_url(REPO_OWNER, REPO_NAME))
 
     # K8s client
     try:

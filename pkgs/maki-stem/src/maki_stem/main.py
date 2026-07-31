@@ -15,7 +15,6 @@ All feature logic lives in single-responsibility submodules (``conversation``,
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -33,6 +32,7 @@ from maki_common import (
     spawn_background,
     subscribe_supervised,
 )
+from maki_common.settings import NATS_TOKEN, NATS_URL
 from maki_common.subjects import CONFIG_SYNC
 from pydantic import BaseModel
 
@@ -71,9 +71,6 @@ from maki_stem.trading import (
 
 configure_logging()
 log = logging.getLogger(__name__)
-
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 
 # Single source of truth for the NATS queue group name shared across all stem
 # pods. Every write-side or request/reply listener MUST subscribe with this

@@ -30,18 +30,23 @@ from maki_common import (
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
 from maki_common.repo import SyncError, build_github_auth, clean_remote_url, hard_sync, init_repo
+from maki_common.settings import (
+    NATS_TOKEN,
+    NATS_URL,
+    RECALL_URL,
+    REPO_NAME,
+    REPO_OWNER,
+    REPO_PATH,
+)
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
 log = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
 MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
 # Hard turn-duration watchdog. If a turn doesn't return within this window we
 # cancel it from inside the cortex so the tracked turn state is cleared, slot
@@ -56,9 +61,6 @@ CORTEX_MAX_TURN_SECONDS = int(os.environ.get("CORTEX_MAX_TURN_SECONDS", "1200"))
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
 GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
 GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
-REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
-REPO_NAME = os.environ.get("REPO_NAME", "maki")
-REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 # Token-free clone URL — auth is injected per-invocation via
 # ``git -c http.extraheader=...`` inside ``maki_common.repo`` (issue #347).
 CLONE_URL = clean_remote_url(REPO_OWNER, REPO_NAME)

@@ -17,15 +17,13 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from maki_common import DEFAULT_CLAUDE_MODEL, build_pg_dsn, configure_logging, connect_nats
+from maki_common.settings import NATS_TOKEN, NATS_URL
 from maki_common.subjects import IMMUNE_ALERT
 from mem0 import Memory
 from pydantic import BaseModel, Field
 
 configure_logging()
 log = logging.getLogger(__name__)
-
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 
 
 # Background init/retry tunables. Conservative — the dependency outages we've
