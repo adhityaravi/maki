@@ -373,6 +373,7 @@ async def _invoke_with_json_retry(
     system_prompt: str,
     *,
     json_mode: bool,
+    request_id: str,
 ) -> tuple[str, TokenUsage]:
     """Invoke Claude, retrying once with a corrective suffix on JSON parse failure.
 
@@ -403,7 +404,7 @@ async def _invoke_with_json_retry(
             system_prompt=system_prompt or None,
             mode="synapse_proxy",
         )
-        log.info("Claude response", extra={"response_len": len(text)})
+        log.info("Claude response", extra={"request_id": request_id, "response_len": len(text)})
 
         if not json_mode:
             return text, token_usage
@@ -415,7 +416,10 @@ async def _invoke_with_json_retry(
         if parsed is not None:
             return cleaned, token_usage
 
-        log.warning("JSON extraction failed, retrying", extra={"raw_preview": text[:200]})
+        log.warning(
+            "JSON extraction failed, retrying",
+            extra={"request_id": request_id, "raw_preview": text[:200]},
+        )
         retry_prompt = (
             f"{user_prompt}\n\n"
             "Your previous response was not valid JSON. "
@@ -431,7 +435,7 @@ async def _invoke_with_json_retry(
         # Both calls were billed — accumulate so the OpenAI Usage we return
         # reflects the real cost, not just the retry's.
         token_usage = _add_token_usages(token_usage, retry_usage)
-        log.info("Retry response", extra={"response_len": len(retry_text)})
+        log.info("Retry response", extra={"request_id": request_id, "response_len": len(retry_text)})
 
         retry_parsed, retry_cleaned = try_parse_json_lenient(retry_text)
         if retry_parsed is not None:
@@ -442,6 +446,7 @@ async def _invoke_with_json_retry(
         log.error(
             "JSON retry also failed, returning 502",
             extra={
+                "request_id": request_id,
                 "raw_preview": retry_text[:200],
                 "token_usage": token_usage.to_log_dict(),
             },
@@ -455,7 +460,7 @@ async def _invoke_with_json_retry(
         # into a public-ish error body. Keep the body opaque ("upstream timeout")
         # and rely on the structured log inside invoke_claude for triage
         # (mode, prompt_len, elapsed_ms). Also pairs with #158. See #350.
-        log.warning("Claude invocation timed out")
+        log.warning("Claude invocation timed out", extra={"request_id": request_id})
         raise HTTPException(status_code=502, detail="upstream timeout")
     except Exception:
         # ``detail=str(e)`` used to be here; it leaked exception text from
@@ -463,7 +468,7 @@ async def _invoke_with_json_retry(
         # body (DSN fragments, provider file paths, traceback-adjacent
         # detail). Full exception is preserved in the server log via
         # ``log.exception``; the response body stays opaque. See #158.
-        log.exception("Claude invocation failed")
+        log.exception("Claude invocation failed", extra={"request_id": request_id})
         raise HTTPException(status_code=502, detail="upstream error")
 
 
@@ -526,12 +531,13 @@ async def chat_completions(req: ChatCompletionRequest):
     helper so this body fits on one screen and the helpers are unit-testable
     without spinning up FastAPI or mocking NATS (see #112).
     """
-    prompt = _build_system_and_user(req)
     request_id = f"synapse-{uuid.uuid4().hex[:12]}"
+    prompt = _build_system_and_user(req)
 
     log.info(
         "Invoking Claude",
         extra={
+            "request_id": request_id,
             "tool_choice": prompt.tool_choice,
             "has_tools": prompt.has_tools,
             "json_mode": prompt.json_mode,
@@ -542,6 +548,7 @@ async def chat_completions(req: ChatCompletionRequest):
         prompt.user,
         prompt.system,
         json_mode=prompt.json_mode,
+        request_id=request_id,
     )
     message, finish_reason = _parse_response(text, has_tools=prompt.has_tools)
 
