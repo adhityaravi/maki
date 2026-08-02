@@ -78,6 +78,26 @@ HEALTH_ENDPOINTS = {
 # Unique per startup — lets stem detect cortex restarts
 SESSION_ID = uuid.uuid4().hex[:12]
 
+# Stable per-pod identity — stamped onto every CORTEX_TURN_RESPONSE chunk so
+# stem can build a turn_id → instance_id map and selectively cancel only the
+# turns owned by a restarted cortex instance instead of every in-flight turn
+# on the fleet (issue #394). Same source as the heartbeat's instance_id so
+# both signals agree; falls back to "unknown" outside k8s.
+INSTANCE_ID = os.environ.get("HOSTNAME", "unknown")
+
+
+def _turn_response(payload: dict) -> bytes:
+    """Encode a CORTEX_TURN_RESPONSE payload with this instance's id stamped in.
+
+    Every publish site MUST use this helper — stem's per-instance cancellation
+    (issue #394) depends on ``instance_id`` being present on every chunk. A
+    single call site that forgot to add it would silently degrade to the old
+    "cancel everything on any cortex restart" behaviour for turns owned by
+    this pod.
+    """
+    return json.dumps({**payload, "instance_id": INSTANCE_ID}).encode()
+
+
 _semaphore = asyncio.Semaphore(1)
 
 # Hoisted from main() so handle_turn_request can use it for auto-pull
@@ -410,7 +430,7 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 "error": f"git {exc.step} failed (rc={exc.returncode})",
             }
             try:
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
             except Exception:
                 log.exception(
                     "Failed to publish auto-sync-failure done signal",
@@ -435,7 +455,7 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 "reason": "cortex_auto_sync_failed",
             }
             try:
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
             except Exception:
                 log.exception(
                     "Failed to publish auto-sync-failure done signal",
@@ -497,7 +517,7 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
             },
         )
         response = {"turn_id": turn_id, "response": response_text, "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(response))
         log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
         await _publish_token_usage(nc, turn_id, usage)
     else:
@@ -525,12 +545,12 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 system_prompt=static_context or None,
             ):
                 response = {"turn_id": turn_id, "response": chunk, "done": False}
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(response))
                 log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
 
         # Signal done
         done_msg = {"turn_id": turn_id, "response": "", "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
         log.info(
             "Turn stream complete",
             extra={
@@ -632,7 +652,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "cancelled": True,
                     "reason": "cortex_turn_timeout",
                 }
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
             except Exception:
                 log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
 
@@ -640,7 +660,7 @@ async def handle_turn_request(msg, nc, mcp_server):
             log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
             done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
             try:
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
             except Exception:
                 log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
             # Re-raise so the cancelling caller sees the cancellation propagate.
@@ -657,7 +677,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                 )
                 # Still send done signal so ears cleans up, but with empty response
                 done_msg = {"turn_id": turn_id, "response": "", "done": True}
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
             else:
                 # Genuine unexpected error — send a brief message
                 error_response = {
@@ -665,7 +685,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "response": "Something went wrong on my end. I'll try again next turn.",
                     "done": True,
                 }
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(error_response))
         finally:
             _turn_state.clear()
 
@@ -680,7 +700,7 @@ async def heartbeat_loop(nc):
                     "timestamp": time.time(),
                     "model": MODEL,
                     "session_id": SESSION_ID,
-                    "instance_id": os.environ.get("HOSTNAME", "unknown"),
+                    "instance_id": INSTANCE_ID,
                     "active_turn": _turn_state.turn_id,
                     "turn_mode": _turn_state.mode,
                     "turn_started": _turn_state.started,

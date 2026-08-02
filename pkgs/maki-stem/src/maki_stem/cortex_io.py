@@ -65,6 +65,15 @@ KV_KEY = "identity"
 # instance_id → session_id (session_id changes when cortex restarts mid-turn).
 _cortex_sessions: dict[str, str] = {}
 
+# turn_id → cortex instance_id owning the turn. Populated by the response
+# listener on the first chunk we see for a turn (every CORTEX_TURN_RESPONSE
+# chunk carries instance_id — issue #394). Consulted by the heartbeat watcher
+# to cancel ONLY the turns owned by a restarted cortex instance instead of
+# nuking every in-flight turn on the fleet. Entries are dropped when the
+# owning turn's done chunk arrives, or (belt-and-suspenders) by process_turn's
+# finally block.
+_turn_to_instance: dict[str, str] = {}
+
 # turn_id → wall-clock start. Read by the readiness probe in main.
 active_turns: dict[str, float] = {}
 
@@ -73,15 +82,27 @@ turn_semaphore = asyncio.Semaphore(2)
 
 
 async def _handle_response(msg, pending) -> None:
-    """Push one cortex response chunk into the pending queue."""
+    """Push one cortex response chunk into the pending queue.
+
+    Also records ``turn_id → instance_id`` so the heartbeat watcher can
+    selectively cancel only the turns owned by a restarted cortex instance
+    (issue #394). The mapping is cleaned up on the terminal ``done`` chunk;
+    ``process_turn`` also pops it in ``finally`` in case done never arrives.
+    """
     try:
         data = json.loads(msg.data.decode())
         turn_id = data.get("turn_id")
+        instance_id = data.get("instance_id")
+        done = data.get("done", False)
         if turn_id and pending.push(turn_id, data):
+            if instance_id:
+                _turn_to_instance[turn_id] = instance_id
             log.info(
                 "Response chunk pushed",
-                extra={"turn_id": turn_id, "done": data.get("done", False)},
+                extra={"turn_id": turn_id, "done": done, "instance_id": instance_id},
             )
+            if done:
+                _turn_to_instance.pop(turn_id, None)
         else:
             log.warning("Response for unknown turn", extra={"turn_id": turn_id})
     except Exception:
@@ -127,23 +148,56 @@ async def _handle_cortex_heartbeat(msg, pending) -> None:
         if session_id != old_session:
             _cortex_sessions[instance_id] = session_id
             pending_keys = pending.pending_keys()
-            if pending_keys:
-                cancelled = pending.cancel_all()
-                log.warning(
-                    "Cortex restarted — cancelled stale turns",
-                    extra={
-                        "instance_id": instance_id,
-                        "old_session": old_session,
-                        "new_session": session_id,
-                        "cancelled_turns": cancelled,
-                        "turn_ids": pending_keys,
-                    },
-                )
-            else:
+            if not pending_keys:
                 log.info(
                     "Cortex instance restarted (no pending turns)",
                     extra={"instance_id": instance_id, "old_session": old_session, "new_session": session_id},
                 )
+                return
+
+            # Selective cancellation (issue #394): the fleet runs multiple
+            # cortex replicas load-balanced via NATS queue group, so a
+            # restart on instance A must NOT nuke turns being streamed by
+            # healthy instance B. Split pending turns into three buckets:
+            #
+            #   - owned:    turn_id → this instance_id (must cancel)
+            #   - other:    turn_id → some other instance_id (leave alone)
+            #   - unmapped: no first chunk yet, so ownership unknown
+            #
+            # For the unmapped bucket we cancel too — stem can't prove the
+            # turn isn't on the restarted instance, and leaving it hanging
+            # for TURN_TIMEOUT (30 min) is the worse failure mode. Logged
+            # distinctly so the "false-cancel unmapped turn" case is
+            # visible in metrics/logs if it starts happening at scale.
+            owned: list[str] = []
+            other: list[str] = []
+            unmapped: list[str] = []
+            for turn_id in pending_keys:
+                mapped = _turn_to_instance.get(turn_id)
+                if mapped is None:
+                    unmapped.append(turn_id)
+                elif mapped == instance_id:
+                    owned.append(turn_id)
+                else:
+                    other.append(turn_id)
+
+            to_cancel = owned + unmapped
+            cancelled = pending.cancel_keys(to_cancel)
+            for turn_id in to_cancel:
+                _turn_to_instance.pop(turn_id, None)
+
+            log.warning(
+                "Cortex restarted — cancelled owned/unmapped turns",
+                extra={
+                    "instance_id": instance_id,
+                    "old_session": old_session,
+                    "new_session": session_id,
+                    "cancelled_turns": cancelled,
+                    "owned_turn_ids": owned,
+                    "unmapped_turn_ids": unmapped,
+                    "other_instance_turn_ids": other,
+                },
+            )
     except Exception:
         log.exception("Error in cortex heartbeat watcher")
 
@@ -291,3 +345,9 @@ async def process_turn(
         raise
     finally:
         active_turns.pop(turn_id, None)
+        # Belt-and-suspenders: _handle_response drops the mapping on the
+        # done chunk, but pop again here so a turn that never received a
+        # terminal chunk (TimeoutError, TurnPublishError, RuntimeError from
+        # cortex_restart_cancelled, etc.) doesn't leak into
+        # _turn_to_instance forever (issue #394).
+        _turn_to_instance.pop(turn_id, None)

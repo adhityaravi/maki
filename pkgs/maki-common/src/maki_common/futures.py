@@ -120,8 +120,24 @@ class PendingQueues:
 
         Returns the number of queues cancelled.
         """
+        return self.cancel_keys(list(self._queues))
+
+    def cancel_keys(self, keys: list[str]) -> int:
+        """Inject a done signal into a specific subset of pending queues.
+
+        Same sentinel as :meth:`cancel_all` (``{"response": "", "done": True,
+        "cancelled": True}``) but only for the given ``keys``. Unknown keys
+        are silently skipped so callers can pass a snapshot list without
+        worrying about the race where a queue was already removed.
+
+        Used by stem's cortex-heartbeat watcher (issue #394) to cancel only
+        the turns that belong to the restarted cortex instance instead of
+        nuking every in-flight turn across the fleet.
+
+        Returns the number of queues actually cancelled.
+        """
         cancelled = 0
-        for key in list(self._queues):
+        for key in keys:
             queue = self._queues.get(key)
             if queue is not None:
                 queue.put_nowait({"response": "", "done": True, "cancelled": True})

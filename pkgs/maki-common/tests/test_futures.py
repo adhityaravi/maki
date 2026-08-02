@@ -297,6 +297,47 @@ def test_pending_queues_cancel_all_on_empty_is_zero() -> None:
     assert pending.cancel_all() == 0
 
 
+def test_pending_queues_cancel_keys_only_hits_requested_keys() -> None:
+    """cancel_keys wakes only the named queues; the rest keep waiting."""
+    pending = PendingQueues()
+
+    async def scenario() -> None:
+        q_a = pending.create("a")
+        q_b = pending.create("b")
+        q_c = pending.create("c")
+        cancelled = pending.cancel_keys(["a", "c"])
+        assert cancelled == 2
+        # Named queues get the sentinel.
+        chunk_a = await q_a.get()
+        chunk_c = await q_c.get()
+        assert chunk_a == {"response": "", "done": True, "cancelled": True}
+        assert chunk_c == {"response": "", "done": True, "cancelled": True}
+        # The unnamed queue is untouched — no sentinel to consume.
+        assert q_b.empty()
+
+    _run(scenario())
+
+
+def test_pending_queues_cancel_keys_ignores_unknown_keys() -> None:
+    """Unknown keys are silently skipped so callers can pass a stale snapshot."""
+    pending = PendingQueues()
+
+    async def scenario() -> None:
+        q_a = pending.create("a")
+        cancelled = pending.cancel_keys(["a", "does-not-exist"])
+        assert cancelled == 1
+        chunk = await q_a.get()
+        assert chunk == {"response": "", "done": True, "cancelled": True}
+
+    _run(scenario())
+
+
+def test_pending_queues_cancel_keys_empty_list_is_zero() -> None:
+    pending = PendingQueues()
+    pending.create("a")
+    assert pending.cancel_keys([]) == 0
+
+
 def test_pending_queues_contains_and_has_agree() -> None:
     pending = PendingQueues()
 
