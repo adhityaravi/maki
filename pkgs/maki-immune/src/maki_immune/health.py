@@ -1,4 +1,15 @@
-"""Health monitoring, reflex engine, gossip ring, and cortex heartbeat for maki-immune."""
+"""Health monitoring, reflex engine, gossip ring, and cortex heartbeat for maki-immune.
+
+Replaces the pre-#102/#167 pattern of ``init()`` + module-level globals with
+:class:`ImmuneHealthMonitor` — dependencies (including the
+``escalate_to_claude`` callback that used to sit as a global to dodge an
+imagined circular import) now enter through ``__init__`` and live on the
+instance. All the per-incident trackers (``_stuck_alerted``,
+``_long_unhealthy_alerted``, ``_stuck_recovery_attempts``,
+``_self_health_alerted``, ``_cortex_stuck_alerted``, ``_token_stats``) are
+instance attributes too, so a test suite can spin up a fresh monitor without
+process-global state bleeding in.
+"""
 
 import asyncio
 import json
@@ -137,879 +148,878 @@ SELF_HEALTH_REALERT_INTERVAL_S = int(os.environ.get("SELF_HEALTH_REALERT_INTERVA
 
 log = logging.getLogger(__name__)
 
-# Set by init()
-_nc: Any = None
-_k8s_v1: Any = None
-_k8s_apps_v1: Any = None
-_namespace: str = ""
-_instance_id: str = ""
-_site_name: str = ""
-_check_interval: int = 30
-_gossip_stale_threshold: int = 90
-_health_endpoints: dict[str, str] = {}
-_default_config: dict[str, Any] = {}
-_config_kv: Any = None
-_cortex_config_kv: Any = None  # stem's cortex config (chat_model etc.)
-_component_health: Any = None
-_pod_metrics: Any = None
-_restart_history: Any = None
-_recent_actions: Any = None
-_recent_actions_max: int = 100
-_running_images: Any = None
-_hive_state: Any = None
-_failed_image_blacklist: Any = None
-_cortex_state: Any = None  # dict with last_heartbeat, active_turn, turn_mode, turn_started
-_infra_lock: Any = None
-_publish_alert: Any = None
-_publish_vitals: Any = None
-_schedule_persist: Any = None
-_escalate_to_claude: Any = None  # callback, avoids circular import with claude.py
-_last_incident_time: float = 0
 
-# Token usage tracking — accumulated per day, reset on date change
-_token_stats: dict[str, Any] = {
-    "date": "",
-    "total_tokens": 0,
-    "total_cost_usd": 0.0,
-    "turns": 0,
-    "by_model": {},  # model -> {tokens, cost_usd, turns}
-}
+class ImmuneHealthMonitor:
+    """Owns component health tracking, reflexes, gossip and cortex watchdogs.
 
-# Track which (turn_id, started_at) we've already published CORTEX_STUCK for so
-# the watchdog doesn't re-fire every health-check tick. We re-arm on a
-# ``CORTEX_STUCK_THRESHOLD_S`` cadence: if the first escalation fails to
-# recover the pod (Claude path stalls, restart blocked, etc.) we keep
-# alerting until either the turn clears or kubelet restarts the pod via
-# the cortex liveness probe. See issue #185 — previous behaviour was
-# one-shot per turn_id, which left the system silently wedged for hours.
-_cortex_stuck_alerted: dict[str, Any] = {
-    "turn_id": None,
-    "turn_started": None,
-    "last_fired_at": 0.0,
-    "fire_count": 0,
-}
-
-# Track which components we've raised a "stuck" escalation for. Keyed by component
-# name -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
-# ``last_state_change`` at the time we first escalated, so a fresh outage (new
-# state change) re-arms cleanly rather than being suppressed by a stale entry.
-# Entries are dropped the moment the component recovers or stops being stuck. See #245.
-_stuck_alerted: dict[str, dict[str, Any]] = {}
-
-# Track long-unhealthy re-escalations (#260). Same shape as ``_stuck_alerted``
-# but covers the broader case: any component unhealthy past
-# LONG_UNHEALTHY_RE_ESCALATE_HOURS, regardless of pod phase. Keyed by component
-# -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
-# ``last_state_change`` at the time we first re-escalated so a recover-and-
-# fail-again cycle re-arms cleanly. In-memory only — a restart of immune costs
-# at most one extra alert per stuck component, which is acceptable.
-_long_unhealthy_alerted: dict[str, dict[str, Any]] = {}
-
-# Track Tier-3 auto-recovery attempts (#264). Keyed by component name ->
-# {incident, last_attempted_at, count}. ``incident`` is the component's
-# ``last_state_change`` so a fresh outage re-arms cleanly. Dropped when the
-# component recovers. In-memory only — if immune restarts mid-incident we
-# might fire one extra recovery, which is the safe direction (the whole point
-# is to unwedge a pod that's been dead for a day).
-_stuck_recovery_attempts: dict[str, dict[str, Any]] = {}
-
-# Track immune-self-failure alerts (#270). Keyed by component name ->
-# {first_seen_stale_at, last_fired_at, fire_count}. Cleared when the
-# component's ``last_check`` advances again. In-memory only; if immune
-# restarts during a wedge we'll re-fire one alert per stuck component, which
-# is fine — that's the whole point.
-_self_health_alerted: dict[str, dict[str, Any]] = {}
-
-
-def init(
-    *,
-    nc,
-    k8s_v1,
-    k8s_apps_v1,
-    namespace,
-    instance_id,
-    site_name,
-    check_interval,
-    gossip_stale_threshold,
-    health_endpoints,
-    default_config,
-    config_kv,
-    cortex_config_kv,
-    component_health,
-    pod_metrics,
-    restart_history,
-    recent_actions,
-    recent_actions_max,
-    running_images,
-    hive_state,
-    failed_image_blacklist,
-    cortex_state,
-    infra_lock,
-    publish_alert,
-    publish_vitals,
-    schedule_persist_recent_actions,
-    escalate_to_claude,
-):
-    global _nc, _k8s_v1, _k8s_apps_v1, _namespace, _instance_id, _site_name
-    global _check_interval, _gossip_stale_threshold, _health_endpoints, _default_config, _config_kv, _cortex_config_kv
-    global _component_health, _pod_metrics, _restart_history, _recent_actions, _recent_actions_max
-    global _running_images, _hive_state, _failed_image_blacklist, _cortex_state
-    global _infra_lock, _publish_alert, _publish_vitals, _schedule_persist
-    global _escalate_to_claude
-    _nc = nc
-    _k8s_v1 = k8s_v1
-    _k8s_apps_v1 = k8s_apps_v1
-    _namespace = namespace
-    _instance_id = instance_id
-    _site_name = site_name
-    _check_interval = check_interval
-    _gossip_stale_threshold = gossip_stale_threshold
-    _health_endpoints = health_endpoints
-    _default_config = default_config
-    _config_kv = config_kv
-    _cortex_config_kv = cortex_config_kv
-    _component_health = component_health
-    _pod_metrics = pod_metrics
-    _restart_history = restart_history
-    _recent_actions = recent_actions
-    _recent_actions_max = recent_actions_max
-    _running_images = running_images
-    _hive_state = hive_state
-    _failed_image_blacklist = failed_image_blacklist
-    _cortex_state = cortex_state
-    _infra_lock = infra_lock
-    _publish_alert = publish_alert
-    _publish_vitals = publish_vitals
-    _schedule_persist = schedule_persist_recent_actions
-    _escalate_to_claude = escalate_to_claude
-
-
-# --- Health State Tracking ---
-
-
-def _update_health(component: str, healthy: bool, details: dict | None = None):
-    """Update component health state and detect transitions."""
-    global _last_incident_time
-    now = time.time()
-
-    if component not in _component_health:
-        _component_health[component] = {
-            "healthy": healthy,
-            "last_check": now,
-            "last_state_change": now,
-            "consecutive_failures": 0 if healthy else 1,
-            "details": details or {},
-        }
-        return
-
-    state = _component_health[component]
-    was_healthy = state["healthy"]
-
-    if was_healthy and not healthy:
-        state["last_state_change"] = now
-        state["consecutive_failures"] = 1
-        _last_incident_time = now
-        log.warning("Component unhealthy", extra={"component": component})
-    elif not was_healthy and healthy:
-        state["last_state_change"] = now
-        state["consecutive_failures"] = 0
-        log.info("Component recovered", extra={"component": component})
-    elif not healthy:
-        state["consecutive_failures"] += 1
-
-    state["healthy"] = healthy
-    state["last_check"] = now
-    state["details"] = details or state["details"]
-
-
-def get_last_incident_time() -> float:
-    return _last_incident_time
-
-
-# --- Health Checks ---
-
-
-async def _check_http_health() -> dict[str, tuple[bool, dict[str, Any]]]:
-    """Check HTTP health endpoints and return per-component verdicts.
-
-    Returns ``{component: (healthy, details)}`` rather than writing to
-    ``_component_health`` directly. The monitor loop combines this with the
-    K8s pod verdict via :func:`_merge_and_update_health` before calling
-    :func:`_update_health` once per component — see #249. Previously both
-    checkers wrote to the same key and the one that fired last clobbered the
-    other's verdict, which kept ``consecutive_failures`` flapping at 1–2 and
-    silently suppressed the reflex engine when HTTP and K8s disagreed.
-
-    On a non-200 response we capture a truncated body excerpt and log it so the
-    actual failure mode is visible — this is the asking-the-server-what-it-said
-    fix from #270, where the immune monitor reported recall as 503-for-5-days
-    while a one-shot probe from cortex returned 200. Without the body we had no
-    way to distinguish "Mem0 graph init failed" from "Kubernetes routed the
-    probe at the wrong pod" — we just saw a number tick up.
-
-    On a transport exception (timeout, connection refused, DNS) we record the
-    exception class on details so the same investigation works for the
-    unreachable case.
+    Every per-incident tracker that used to sit as a module-level dict lives
+    on the instance now, which means a fresh monitor really is fresh — no
+    residual ``_stuck_alerted`` entries from a previous test run, no
+    ``_token_stats`` cross-talk between simulated sites. The
+    ``escalate_to_claude`` callback (formerly the ``_escalate_to_claude``
+    module global used to sidestep a would-be import cycle) is just another
+    dependency injected here; ``main.py`` hands us
+    ``ImmuneClaudeReasoner.escalate_to_claude`` as a bound method.
     """
-    verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        for component, url in _health_endpoints.items():
-            try:
-                start = time.time()
-                resp = await client.get(f"{url}/health")
-                latency_ms = round((time.time() - start) * 1000, 1)
-                healthy = resp.status_code == 200
-                details: dict[str, Any] = {
-                    "latency_ms": latency_ms,
-                    "status_code": resp.status_code,
-                }
-                if not healthy:
-                    # Truncate to keep logs/state small; the failure mode is
-                    # usually obvious in the first ~200 chars (status string,
-                    # exception type). Body may be html, json, or plain text —
-                    # don't try to parse, just preserve verbatim.
-                    body = resp.text[:200]
-                    details["body_excerpt"] = body
+
+    def __init__(
+        self,
+        *,
+        nc: Any,
+        k8s_v1: Any,
+        k8s_apps_v1: Any,
+        namespace: str,
+        instance_id: str,
+        site_name: str,
+        check_interval: int,
+        gossip_stale_threshold: int,
+        health_endpoints: dict[str, str],
+        default_config: dict[str, Any],
+        config_kv: Any,
+        cortex_config_kv: Any,
+        component_health: dict,
+        pod_metrics: dict,
+        restart_history: dict,
+        recent_actions: list,
+        recent_actions_max: int,
+        running_images: dict,
+        hive_state: dict,
+        failed_image_blacklist: set,
+        cortex_state: dict,
+        infra_lock: Any,
+        publish_alert: Any,
+        publish_vitals: Any,
+        schedule_persist_recent_actions: Any,
+        escalate_to_claude: Any,
+    ) -> None:
+        self._nc = nc
+        self._k8s_v1 = k8s_v1
+        self._k8s_apps_v1 = k8s_apps_v1
+        self._namespace = namespace
+        self._instance_id = instance_id
+        self._site_name = site_name
+        self._check_interval = check_interval
+        self._gossip_stale_threshold = gossip_stale_threshold
+        self._health_endpoints = health_endpoints
+        self._default_config = default_config
+        self._config_kv = config_kv
+        self._cortex_config_kv = cortex_config_kv  # stem's cortex config (chat_model etc.)
+        self._component_health = component_health
+        self._pod_metrics = pod_metrics
+        self._restart_history = restart_history
+        self._recent_actions = recent_actions
+        self._recent_actions_max = recent_actions_max
+        self._running_images = running_images
+        self._hive_state = hive_state
+        self._failed_image_blacklist = failed_image_blacklist
+        self._cortex_state = cortex_state
+        self._infra_lock = infra_lock
+        self._publish_alert = publish_alert
+        self._publish_vitals = publish_vitals
+        self._schedule_persist = schedule_persist_recent_actions
+        # ``escalate_to_claude`` is injected as a bound method from
+        # :class:`ImmuneClaudeReasoner` — the ex-workaround-callback is now
+        # just a normal collaborator with no circular-import baggage.
+        self._escalate_to_claude = escalate_to_claude
+
+        # --- Per-instance mutable state ---
+        self._last_incident_time: float = 0
+
+        # Token usage tracking — accumulated per day, reset on date change
+        self._token_stats: dict[str, Any] = {
+            "date": "",
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "turns": 0,
+            "by_model": {},  # model -> {tokens, cost_usd, turns}
+        }
+
+        # Track which (turn_id, started_at) we've already published CORTEX_STUCK for so
+        # the watchdog doesn't re-fire every health-check tick. We re-arm on a
+        # ``CORTEX_STUCK_THRESHOLD_S`` cadence: if the first escalation fails to
+        # recover the pod (Claude path stalls, restart blocked, etc.) we keep
+        # alerting until either the turn clears or kubelet restarts the pod via
+        # the cortex liveness probe. See issue #185 — previous behaviour was
+        # one-shot per turn_id, which left the system silently wedged for hours.
+        self._cortex_stuck_alerted: dict[str, Any] = {
+            "turn_id": None,
+            "turn_started": None,
+            "last_fired_at": 0.0,
+            "fire_count": 0,
+        }
+
+        # Track which components we've raised a "stuck" escalation for. Keyed by component
+        # name -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
+        # ``last_state_change`` at the time we first escalated, so a fresh outage (new
+        # state change) re-arms cleanly rather than being suppressed by a stale entry.
+        # Entries are dropped the moment the component recovers or stops being stuck. See #245.
+        self._stuck_alerted: dict[str, dict[str, Any]] = {}
+
+        # Track long-unhealthy re-escalations (#260). Same shape as ``_stuck_alerted``
+        # but covers the broader case: any component unhealthy past
+        # LONG_UNHEALTHY_RE_ESCALATE_HOURS, regardless of pod phase. Keyed by component
+        # -> {incident, last_fired_at, fire_count}. ``incident`` is the component's
+        # ``last_state_change`` at the time we first re-escalated so a recover-and-
+        # fail-again cycle re-arms cleanly. In-memory only — a restart of immune costs
+        # at most one extra alert per stuck component, which is acceptable.
+        self._long_unhealthy_alerted: dict[str, dict[str, Any]] = {}
+
+        # Track Tier-3 auto-recovery attempts (#264). Keyed by component name ->
+        # {incident, last_attempted_at, count}. ``incident`` is the component's
+        # ``last_state_change`` so a fresh outage re-arms cleanly. Dropped when the
+        # component recovers. In-memory only — if immune restarts mid-incident we
+        # might fire one extra recovery, which is the safe direction (the whole point
+        # is to unwedge a pod that's been dead for a day).
+        self._stuck_recovery_attempts: dict[str, dict[str, Any]] = {}
+
+        # Track immune-self-failure alerts (#270). Keyed by component name ->
+        # {first_seen_stale_at, last_fired_at, fire_count}. Cleared when the
+        # component's ``last_check`` advances again. In-memory only; if immune
+        # restarts during a wedge we'll re-fire one alert per stuck component, which
+        # is fine — that's the whole point.
+        self._self_health_alerted: dict[str, dict[str, Any]] = {}
+
+    # --- Health State Tracking ---
+
+    def _update_health(self, component: str, healthy: bool, details: dict | None = None) -> None:
+        """Update component health state and detect transitions."""
+        now = time.time()
+
+        if component not in self._component_health:
+            self._component_health[component] = {
+                "healthy": healthy,
+                "last_check": now,
+                "last_state_change": now,
+                "consecutive_failures": 0 if healthy else 1,
+                "details": details or {},
+            }
+            return
+
+        state = self._component_health[component]
+        was_healthy = state["healthy"]
+
+        if was_healthy and not healthy:
+            state["last_state_change"] = now
+            state["consecutive_failures"] = 1
+            self._last_incident_time = now
+            log.warning("Component unhealthy", extra={"component": component})
+        elif not was_healthy and healthy:
+            state["last_state_change"] = now
+            state["consecutive_failures"] = 0
+            log.info("Component recovered", extra={"component": component})
+        elif not healthy:
+            state["consecutive_failures"] += 1
+
+        state["healthy"] = healthy
+        state["last_check"] = now
+        state["details"] = details or state["details"]
+
+    def get_last_incident_time(self) -> float:
+        return self._last_incident_time
+
+    # --- Health Checks ---
+
+    async def _check_http_health(self) -> dict[str, tuple[bool, dict[str, Any]]]:
+        """Check HTTP health endpoints and return per-component verdicts.
+
+        Returns ``{component: (healthy, details)}`` rather than writing to
+        ``_component_health`` directly. The monitor loop combines this with the
+        K8s pod verdict via :meth:`_merge_and_update_health` before calling
+        :meth:`_update_health` once per component — see #249. Previously both
+        checkers wrote to the same key and the one that fired last clobbered
+        the other's verdict, which kept ``consecutive_failures`` flapping at
+        1–2 and silently suppressed the reflex engine when HTTP and K8s
+        disagreed.
+
+        On a non-200 response we capture a truncated body excerpt and log it so
+        the actual failure mode is visible — this is the asking-the-server-
+        what-it-said fix from #270, where the immune monitor reported recall as
+        503-for-5-days while a one-shot probe from cortex returned 200. Without
+        the body we had no way to distinguish "Mem0 graph init failed" from
+        "Kubernetes routed the probe at the wrong pod" — we just saw a number
+        tick up.
+
+        On a transport exception (timeout, connection refused, DNS) we record
+        the exception class on details so the same investigation works for the
+        unreachable case.
+        """
+        verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            for component, url in self._health_endpoints.items():
+                try:
+                    start = time.time()
+                    resp = await client.get(f"{url}/health")
+                    latency_ms = round((time.time() - start) * 1000, 1)
+                    healthy = resp.status_code == 200
+                    details: dict[str, Any] = {
+                        "latency_ms": latency_ms,
+                        "status_code": resp.status_code,
+                    }
+                    if not healthy:
+                        # Truncate to keep logs/state small; the failure mode is
+                        # usually obvious in the first ~200 chars (status string,
+                        # exception type). Body may be html, json, or plain text —
+                        # don't try to parse, just preserve verbatim.
+                        body = resp.text[:200]
+                        details["body_excerpt"] = body
+                        log.warning(
+                            "HTTP health probe failed",
+                            extra={
+                                "component": component,
+                                "url": f"{url}/health",
+                                "status_code": resp.status_code,
+                                "latency_ms": latency_ms,
+                                "body_excerpt": body,
+                            },
+                        )
+                    verdicts[component] = (healthy, details)
+                except Exception as e:
+                    err_type = type(e).__name__
+                    err_msg = str(e)[:200]
                     log.warning(
-                        "HTTP health probe failed",
+                        "HTTP health probe errored",
                         extra={
                             "component": component,
                             "url": f"{url}/health",
-                            "status_code": resp.status_code,
-                            "latency_ms": latency_ms,
-                            "body_excerpt": body,
+                            "error_type": err_type,
+                            "error": err_msg,
                         },
                     )
-                verdicts[component] = (healthy, details)
-            except Exception as e:
-                err_type = type(e).__name__
-                err_msg = str(e)[:200]
-                log.warning(
-                    "HTTP health probe errored",
+                    verdicts[component] = (
+                        False,
+                        {"latency_ms": -1, "error_type": err_type, "error": err_msg},
+                    )
+        return verdicts
+
+    async def _check_k8s_pods(self) -> dict[str, tuple[bool, dict[str, Any]]]:
+        """Check K8s pod status in maki namespace and return per-app verdicts.
+
+        Returns ``{app_label: (healthy, details)}`` instead of mutating
+        ``_component_health`` directly. The monitor loop merges this with the
+        HTTP verdict via :meth:`_merge_and_update_health` so a single composite
+        call decides each component's health per tick — see #249 for the race
+        the old direct-write pattern caused (consecutive_failures pinned to
+        1–2 when HTTP and K8s disagreed, reflex engine silently suppressed).
+
+        :meth:`_check_pod_metrics` is still called serially at the end so the
+        metrics map stays fresh for whoever observes it.
+        """
+        verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
+        if not self._k8s_v1:
+            return verdicts
+        try:
+            pods = await asyncio.to_thread(self._k8s_v1.list_namespaced_pod, namespace=self._namespace)
+
+            app_pods: dict[str, list[dict]] = {}
+            for pod in pods.items:
+                app_label = pod.metadata.labels.get("app", "") if pod.metadata.labels else ""
+                if not app_label:
+                    continue
+
+                # Skip pods that aren't part of the live serving set so the verdict
+                # tracks the same reality the Service routes to (#297). Without this,
+                # stuck Terminating pods (finalizer wedge, kubelet GC lag) and old
+                # ReplicaSet leftovers in Succeeded/Failed keep appearing as
+                # "unhealthy" replicas of the app long after the current live pod
+                # has taken over. The motivating case: maki-recall reported
+                # ``phase=Running, ready=False, waiting_reason=CrashLoopBackOff,
+                # total_pods=2, unhealthy_pods=2`` for 22 days while ``/health``
+                # returned 200 from the actual live pod — immune was merging the
+                # live pod with a stale one whose containers had been wedged in
+                # CrashLoopBackOff since the previous rollout, picking the stale
+                # one as the "report pod" (first unhealthy), and the composite
+                # ``http_ok AND k8s_ok`` verdict came out False on every tick.
+                #
+                # ``deletion_timestamp`` covers Terminating pods (even ones stuck
+                # for days); phase ``Succeeded``/``Failed`` covers terminally
+                # completed pods that haven't been GC'd yet. Pods still in flight
+                # (Pending/PodInitializing/Running) stay — the existing
+                # ``_check_stuck_components`` path already handles the case of a
+                # legitimately-stuck Pending pod.
+                if pod.metadata.deletion_timestamp is not None:
+                    continue
+                if pod.status.phase in ("Succeeded", "Failed"):
+                    continue
+
+                phase = pod.status.phase
+                ready = True
+                restarts = 0
+                waiting_reason = None
+                if pod.status.container_statuses:
+                    for cs in pod.status.container_statuses:
+                        if not cs.ready:
+                            ready = False
+                        restarts += cs.restart_count
+                        if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                            waiting_reason = cs.state.waiting.reason
+
+                mem_limit = None
+                cpu_limit = None
+                container = pod.spec.containers[0] if pod.spec.containers else None
+                if container and container.resources:
+                    limits = container.resources.limits or {}
+                    mem_limit = limits.get("memory")
+                    cpu_limit = limits.get("cpu")
+
+                pod_info = {
+                    "phase": phase,
+                    "ready": ready,
+                    "restarts": restarts,
+                    "pod_name": pod.metadata.name,
+                    "mem_limit": mem_limit,
+                    "cpu_limit": cpu_limit,
+                    "waiting_reason": waiting_reason,
+                    "healthy": phase == "Running" and ready and waiting_reason is None,
+                }
+
+                if app_label not in app_pods:
+                    app_pods[app_label] = []
+                app_pods[app_label].append(pod_info)
+
+            for app_label, pod_list in app_pods.items():
+                all_healthy = all(p["healthy"] for p in pod_list)
+                unhealthy_pods = [p for p in pod_list if not p["healthy"]]
+                report_pod = unhealthy_pods[0] if unhealthy_pods else pod_list[0]
+                details = {
+                    "phase": report_pod["phase"],
+                    "ready": report_pod["ready"],
+                    "restarts": report_pod["restarts"],
+                    "pod_name": report_pod["pod_name"],
+                    "mem_limit": report_pod["mem_limit"],
+                    "cpu_limit": report_pod["cpu_limit"],
+                }
+                if report_pod["waiting_reason"]:
+                    details["waiting_reason"] = report_pod["waiting_reason"]
+                if len(pod_list) > 1:
+                    details["total_pods"] = len(pod_list)
+                    details["unhealthy_pods"] = len(unhealthy_pods)
+
+                verdicts[app_label] = (all_healthy, details)
+        except Exception:
+            log.exception("K8s pod check failed")
+
+        await self._check_pod_metrics()
+        return verdicts
+
+    def _merge_and_update_health(
+        self,
+        http_verdicts: dict[str, tuple[bool, dict[str, Any]]],
+        k8s_verdicts: dict[str, tuple[bool, dict[str, Any]]],
+    ) -> None:
+        """Fold HTTP and K8s verdicts into one ``_update_health`` call per component.
+
+        ``healthy`` is ``http_ok AND k8s_ok`` when both probes apply, otherwise
+        whichever single verdict exists. Details from both checkers are merged
+        so observers see the full picture even when the verdicts disagree (e.g.
+        ``status_code=200`` alongside ``waiting_reason=CrashLoopBackOff,
+        restarts=12``). HTTP keys take precedence on the rare overlap; in
+        practice the two detail sets are disjoint.
+
+        Background: previously ``_check_http_health`` and ``_check_k8s_pods``
+        each called ``_update_health(component, ...)`` directly. When they
+        disagreed — HTTP 200 vs ``CrashLoopBackOff`` between restarts,
+        transient mem0 503 on an otherwise-healthy pod, kubelet readiness lag —
+        whichever checker fired last clobbered the other,
+        ``consecutive_failures`` reset to 1 every tick, and the reflex
+        pipeline's ``>= 2`` gate never engaged. The composite verdict here is
+        the cleanest of the three fixes sketched in #249 because a disagreement
+        now produces an honest "unhealthy" with both signals recorded —
+        exactly what the reflex engine needs to act on, and what Claude needs
+        to read in :class:`ImmuneClaudeReasoner`.
+        """
+        components = set(http_verdicts) | set(k8s_verdicts)
+        for component in components:
+            http = http_verdicts.get(component)
+            k8s = k8s_verdicts.get(component)
+            if http is not None and k8s is not None:
+                healthy = http[0] and k8s[0]
+                # k8s details first so HTTP keys (status_code, latency_ms,
+                # body_excerpt) override on the unlikely overlap and the pod_name
+                # the reflex engine needs is preserved.
+                details: dict[str, Any] = {**k8s[1], **http[1]}
+                if http[0] != k8s[0]:
+                    # Surface the disagreement to whoever reads details (Claude
+                    # via the reasoner, the snapshot publisher). Without this
+                    # the composite verdict hides which probe disagreed.
+                    details["http_ok"] = http[0]
+                    details["k8s_ok"] = k8s[0]
+            elif http is not None:
+                healthy, details = http
+            else:
+                # Mypy/ty: at least one of http/k8s is non-None because component
+                # came from the union of their keys.
+                assert k8s is not None
+                healthy, details = k8s
+            self._update_health(component, healthy, details)
+
+    async def _check_pod_metrics(self) -> None:
+        """Fetch pod resource usage from K8s metrics API."""
+        try:
+            custom_api = k8s_client.CustomObjectsApi()
+            metrics = await asyncio.to_thread(
+                custom_api.list_namespaced_custom_object,
+                group="metrics.k8s.io",
+                version="v1beta1",
+                namespace=self._namespace,
+                plural="pods",
+            )
+            self._pod_metrics.clear()
+            for item in metrics.get("items", []):
+                pod_name = item["metadata"]["name"]
+                containers = item.get("containers", [])
+                if containers:
+                    self._pod_metrics[pod_name] = {
+                        "cpu": containers[0].get("usage", {}).get("cpu", "0"),
+                        "memory": containers[0].get("usage", {}).get("memory", "0"),
+                    }
+        except Exception:
+            pass
+
+    # --- Cortex Heartbeat ---
+
+    def _hive_cortex_status(self) -> tuple[int, int]:
+        """Count how many hive sites (local + remote peers) have healthy cortex."""
+        # Include local site
+        total = 1
+        local_last = self._cortex_state["last_heartbeat"]
+        healthy = 1 if local_last and (time.time() - local_last) < 60 else 0
+        # Include remote peers from hive gossip
+        for _site, state in self._hive_state.items():
+            total += 1
+            cortex_info = state.get("cortex", {})
+            age = cortex_info.get("last_heartbeat_age_s")
+            if age is not None and age < 60:
+                healthy += 1
+        return total, healthy
+
+    def component_healthy_in_hive(self, component: str) -> list[str]:
+        """Return list of hive site names where this component is healthy."""
+        healthy_sites = []
+        for site, state in self._hive_state.items():
+            peer_health = state.get("component_health", {})
+            comp_state = peer_health.get(component, {})
+            if comp_state.get("healthy"):
+                healthy_sites.append(site)
+        return healthy_sites
+
+    def _check_cortex_heartbeat(self) -> None:
+        """Check if cortex heartbeat is recent and include turn state + hive context.
+
+        Also acts as the layer-2 stuck-turn watchdog: if a turn has been
+        running longer than ``CORTEX_STUCK_THRESHOLD_S`` we publish
+        ``CORTEX_STUCK`` so the existing escalation path
+        (``cortex_stuck_handler`` on the reasoner) can decide what to do —
+        restart the pod, page Adi, etc. This is the safety net for the case
+        where cortex's own internal timeout failed to fire (e.g., uncancellable
+        native call). Only the active turn is tracked, and we alert once per
+        (turn_id, turn_started) tuple to avoid spamming every tick.
+        """
+        if self._cortex_state["last_heartbeat"] == 0:
+            return
+        now = time.time()
+        age = now - self._cortex_state["last_heartbeat"]
+        hive_total, hive_healthy = self._hive_cortex_status()
+        details: dict = {
+            "last_heartbeat_age_s": round(age, 1),
+            "hive_cortex_total": hive_total,
+            "hive_cortex_healthy": hive_healthy,
+        }
+        active_turn = self._cortex_state["active_turn"]
+        turn_mode = self._cortex_state["turn_mode"]
+        turn_started = self._cortex_state["turn_started"]
+        turn_running_s: float | None = None
+        if active_turn:
+            details["active_turn"] = active_turn
+            details["turn_mode"] = turn_mode
+            if turn_started:
+                turn_running_s = now - turn_started
+                details["turn_running_s"] = round(turn_running_s, 1)
+
+        local_healthy = age < 60
+        if not local_healthy and hive_healthy > 0:
+            details["hive_note"] = f"cortex healthy on {hive_healthy} other site(s) — local issue only"
+
+        self._update_health("maki-cortex-heartbeat", local_healthy, details)
+
+        # Reset stuck-alerted tracking when the active turn changes (or clears).
+        if (
+            self._cortex_stuck_alerted["turn_id"] != active_turn
+            or self._cortex_stuck_alerted["turn_started"] != turn_started
+        ):
+            self._cortex_stuck_alerted["turn_id"] = active_turn
+            self._cortex_stuck_alerted["turn_started"] = turn_started
+            self._cortex_stuck_alerted["last_fired_at"] = 0.0
+            self._cortex_stuck_alerted["fire_count"] = 0
+
+        # Layer-2 watchdog: cortex turn ran past the threshold. Heartbeat must
+        # still be live — if heartbeat itself is stale, the regular health-check
+        # path handles the unhealthy state and a restart reflex can kick in.
+        #
+        # Re-arming: the previous one-shot-per-turn_id behaviour meant a single
+        # failed escalation left the system silently wedged for hours (#185).
+        # Now we re-fire CORTEX_STUCK on a ``CORTEX_STUCK_THRESHOLD_S`` cadence
+        # until the turn clears or the pod is restarted.
+        if (
+            active_turn
+            and turn_running_s is not None
+            and turn_running_s > CORTEX_STUCK_THRESHOLD_S
+            and local_healthy
+            and self._nc is not None
+        ):
+            last_fired = self._cortex_stuck_alerted.get("last_fired_at") or 0.0
+            time_since_last = now - last_fired
+            first_fire = last_fired == 0.0
+            # Fire on first crossing, then re-arm every threshold interval.
+            if first_fire or time_since_last >= CORTEX_STUCK_THRESHOLD_S:
+                fire_count = int(self._cortex_stuck_alerted.get("fire_count") or 0) + 1
+                log.error(
+                    "Cortex turn exceeded stuck threshold — publishing CORTEX_STUCK",
                     extra={
-                        "component": component,
-                        "url": f"{url}/health",
-                        "error_type": err_type,
-                        "error": err_msg,
+                        "turn_id": active_turn,
+                        "turn_mode": turn_mode,
+                        "turn_running_s": round(turn_running_s, 1),
+                        "threshold_s": CORTEX_STUCK_THRESHOLD_S,
+                        "fire_count": fire_count,
+                        "time_since_last_fire_s": round(time_since_last, 1) if not first_fire else None,
                     },
                 )
-                verdicts[component] = (
-                    False,
-                    {"latency_ms": -1, "error_type": err_type, "error": err_msg},
-                )
-    return verdicts
+                payload = json.dumps(
+                    {
+                        "turn_id": active_turn,
+                        "mode": turn_mode or "unknown",
+                        "timeout_seconds": int(turn_running_s),
+                        "user_waiting": False,
+                        "source": "immune_watchdog",
+                        "fire_count": fire_count,
+                    }
+                ).encode()
+                # Fire-and-forget so the synchronous check doesn't block the loop.
+                # ``spawn_background`` anchors the publish task against GC and
+                # logs any uncaught exception (issue #123).
+                try:
+                    spawn_background(self._nc.publish(CORTEX_STUCK, payload), name="immune.cortex_stuck_publish")
+                except Exception:
+                    log.exception("Failed to schedule CORTEX_STUCK publish")
+                self._cortex_stuck_alerted["last_fired_at"] = now
+                self._cortex_stuck_alerted["fire_count"] = fire_count
 
+    async def _handle_cortex_heartbeat(self, msg) -> None:
+        self._cortex_state["last_heartbeat"] = time.time()
+        payload = json.loads(msg.data.decode())
+        self._cortex_state["active_turn"] = payload.get("active_turn")
+        self._cortex_state["turn_mode"] = payload.get("turn_mode")
+        self._cortex_state["turn_started"] = payload.get("turn_started")
 
-async def _check_k8s_pods() -> dict[str, tuple[bool, dict[str, Any]]]:
-    """Check K8s pod status in maki namespace and return per-app verdicts.
+    async def cortex_heartbeat_listener(self) -> None:
+        """Subscribe to cortex health heartbeat and parse enriched turn state.
 
-    Returns ``{app_label: (healthy, details)}`` instead of mutating
-    ``_component_health`` directly. The monitor loop merges this with the HTTP
-    verdict via :func:`_merge_and_update_health` so a single composite call
-    decides each component's health per tick — see #249 for the race the old
-    direct-write pattern caused (consecutive_failures pinned to 1–2 when HTTP
-    and K8s disagreed, reflex engine silently suppressed).
+        Wrapped in ``subscribe_supervised`` so a silent subscription drop or a
+        NATS client close re-subscribes with backoff instead of leaving the task
+        finished and ``_cortex_state["last_heartbeat"]`` frozen — which would
+        flip ``maki-cortex-heartbeat`` unhealthy and could trigger a reflex
+        restart on a perfectly healthy cortex (issue #175).
+        """
+        from maki_common.subjects import CORTEX_HEALTH
 
-    ``_check_pod_metrics`` is still called serially at the end so the metrics
-    map stays fresh for whoever observes it.
-    """
-    verdicts: dict[str, tuple[bool, dict[str, Any]]] = {}
-    if not _k8s_v1:
-        return verdicts
-    try:
-        pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=_namespace)
-
-        app_pods: dict[str, list[dict]] = {}
-        for pod in pods.items:
-            app_label = pod.metadata.labels.get("app", "") if pod.metadata.labels else ""
-            if not app_label:
-                continue
-
-            # Skip pods that aren't part of the live serving set so the verdict
-            # tracks the same reality the Service routes to (#297). Without this,
-            # stuck Terminating pods (finalizer wedge, kubelet GC lag) and old
-            # ReplicaSet leftovers in Succeeded/Failed keep appearing as
-            # "unhealthy" replicas of the app long after the current live pod
-            # has taken over. The motivating case: maki-recall reported
-            # ``phase=Running, ready=False, waiting_reason=CrashLoopBackOff,
-            # total_pods=2, unhealthy_pods=2`` for 22 days while ``/health``
-            # returned 200 from the actual live pod — immune was merging the
-            # live pod with a stale one whose containers had been wedged in
-            # CrashLoopBackOff since the previous rollout, picking the stale
-            # one as the "report pod" (first unhealthy), and the composite
-            # ``http_ok AND k8s_ok`` verdict came out False on every tick.
-            #
-            # ``deletion_timestamp`` covers Terminating pods (even ones stuck
-            # for days); phase ``Succeeded``/``Failed`` covers terminally
-            # completed pods that haven't been GC'd yet. Pods still in flight
-            # (Pending/PodInitializing/Running) stay — the existing
-            # ``_check_stuck_components`` path already handles the case of a
-            # legitimately-stuck Pending pod.
-            if pod.metadata.deletion_timestamp is not None:
-                continue
-            if pod.status.phase in ("Succeeded", "Failed"):
-                continue
-
-            phase = pod.status.phase
-            ready = True
-            restarts = 0
-            waiting_reason = None
-            if pod.status.container_statuses:
-                for cs in pod.status.container_statuses:
-                    if not cs.ready:
-                        ready = False
-                    restarts += cs.restart_count
-                    if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                        waiting_reason = cs.state.waiting.reason
-
-            mem_limit = None
-            cpu_limit = None
-            container = pod.spec.containers[0] if pod.spec.containers else None
-            if container and container.resources:
-                limits = container.resources.limits or {}
-                mem_limit = limits.get("memory")
-                cpu_limit = limits.get("cpu")
-
-            pod_info = {
-                "phase": phase,
-                "ready": ready,
-                "restarts": restarts,
-                "pod_name": pod.metadata.name,
-                "mem_limit": mem_limit,
-                "cpu_limit": cpu_limit,
-                "waiting_reason": waiting_reason,
-                "healthy": phase == "Running" and ready and waiting_reason is None,
-            }
-
-            if app_label not in app_pods:
-                app_pods[app_label] = []
-            app_pods[app_label].append(pod_info)
-
-        for app_label, pod_list in app_pods.items():
-            all_healthy = all(p["healthy"] for p in pod_list)
-            unhealthy_pods = [p for p in pod_list if not p["healthy"]]
-            report_pod = unhealthy_pods[0] if unhealthy_pods else pod_list[0]
-            details = {
-                "phase": report_pod["phase"],
-                "ready": report_pod["ready"],
-                "restarts": report_pod["restarts"],
-                "pod_name": report_pod["pod_name"],
-                "mem_limit": report_pod["mem_limit"],
-                "cpu_limit": report_pod["cpu_limit"],
-            }
-            if report_pod["waiting_reason"]:
-                details["waiting_reason"] = report_pod["waiting_reason"]
-            if len(pod_list) > 1:
-                details["total_pods"] = len(pod_list)
-                details["unhealthy_pods"] = len(unhealthy_pods)
-
-            verdicts[app_label] = (all_healthy, details)
-    except Exception:
-        log.exception("K8s pod check failed")
-
-    await _check_pod_metrics()
-    return verdicts
-
-
-def _merge_and_update_health(
-    http_verdicts: dict[str, tuple[bool, dict[str, Any]]],
-    k8s_verdicts: dict[str, tuple[bool, dict[str, Any]]],
-) -> None:
-    """Fold HTTP and K8s verdicts into one ``_update_health`` call per component.
-
-    ``healthy`` is ``http_ok AND k8s_ok`` when both probes apply, otherwise
-    whichever single verdict exists. Details from both checkers are merged so
-    observers see the full picture even when the verdicts disagree (e.g.
-    ``status_code=200`` alongside ``waiting_reason=CrashLoopBackOff,
-    restarts=12``). HTTP keys take precedence on the rare overlap; in practice
-    the two detail sets are disjoint.
-
-    Background: previously ``_check_http_health`` and ``_check_k8s_pods`` each
-    called ``_update_health(component, ...)`` directly. When they disagreed —
-    HTTP 200 vs ``CrashLoopBackOff`` between restarts, transient mem0 503 on
-    an otherwise-healthy pod, kubelet readiness lag — whichever checker fired
-    last clobbered the other, ``consecutive_failures`` reset to 1 every tick,
-    and the reflex pipeline's ``>= 2`` gate never engaged. The composite
-    verdict here is the cleanest of the three fixes sketched in #249 because
-    a disagreement now produces an honest "unhealthy" with both signals
-    recorded — exactly what the reflex engine needs to act on, and what Claude
-    needs to read in :func:`claude.py`.
-    """
-    components = set(http_verdicts) | set(k8s_verdicts)
-    for component in components:
-        http = http_verdicts.get(component)
-        k8s = k8s_verdicts.get(component)
-        if http is not None and k8s is not None:
-            healthy = http[0] and k8s[0]
-            # k8s details first so HTTP keys (status_code, latency_ms,
-            # body_excerpt) override on the unlikely overlap and the pod_name
-            # the reflex engine needs is preserved.
-            details: dict[str, Any] = {**k8s[1], **http[1]}
-            if http[0] != k8s[0]:
-                # Surface the disagreement to whoever reads details (Claude
-                # via claude.py, the snapshot publisher). Without this the
-                # composite verdict hides which probe disagreed.
-                details["http_ok"] = http[0]
-                details["k8s_ok"] = k8s[0]
-        elif http is not None:
-            healthy, details = http
-        else:
-            # Mypy/ty: at least one of http/k8s is non-None because component
-            # came from the union of their keys.
-            assert k8s is not None
-            healthy, details = k8s
-        _update_health(component, healthy, details)
-
-
-async def _check_pod_metrics():
-    """Fetch pod resource usage from K8s metrics API."""
-    try:
-        custom_api = k8s_client.CustomObjectsApi()
-        metrics = await asyncio.to_thread(
-            custom_api.list_namespaced_custom_object,
-            group="metrics.k8s.io",
-            version="v1beta1",
-            namespace=_namespace,
-            plural="pods",
+        await subscribe_supervised(
+            self._nc,
+            CORTEX_HEALTH,
+            self._handle_cortex_heartbeat,
+            name="cortex_heartbeat",
         )
-        _pod_metrics.clear()
-        for item in metrics.get("items", []):
-            pod_name = item["metadata"]["name"]
-            containers = item.get("containers", [])
-            if containers:
-                _pod_metrics[pod_name] = {
-                    "cpu": containers[0].get("usage", {}).get("cpu", "0"),
-                    "memory": containers[0].get("usage", {}).get("memory", "0"),
-                }
-    except Exception:
-        pass
 
+    async def _handle_token_usage(self, msg) -> None:
+        payload = json.loads(msg.data.decode())
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._token_stats["date"] != today:
+            self._token_stats["date"] = today
+            self._token_stats["total_tokens"] = 0
+            self._token_stats["total_cost_usd"] = 0.0
+            self._token_stats["turns"] = 0
+            self._token_stats["by_model"] = {}
 
-# --- Cortex Heartbeat ---
+        tokens = payload.get("total_tokens", 0)
+        cost = payload.get("total_cost_usd", 0.0)
+        model = payload.get("model", "unknown")
 
+        self._token_stats["total_tokens"] += tokens
+        self._token_stats["total_cost_usd"] += cost
+        self._token_stats["turns"] += 1
 
-def _hive_cortex_status() -> tuple[int, int]:
-    """Count how many hive sites (local + remote peers) have healthy cortex."""
-    # Include local site
-    total = 1
-    local_last = _cortex_state["last_heartbeat"]
-    healthy = 1 if local_last and (time.time() - local_last) < 60 else 0
-    # Include remote peers from hive gossip
-    for _site, state in _hive_state.items():
-        total += 1
-        cortex_info = state.get("cortex", {})
-        age = cortex_info.get("last_heartbeat_age_s")
-        if age is not None and age < 60:
-            healthy += 1
-    return total, healthy
+        if model not in self._token_stats["by_model"]:
+            self._token_stats["by_model"][model] = {"tokens": 0, "cost_usd": 0.0, "turns": 0}
+        self._token_stats["by_model"][model]["tokens"] += tokens
+        self._token_stats["by_model"][model]["cost_usd"] += cost
+        self._token_stats["by_model"][model]["turns"] += 1
 
+    async def token_usage_listener(self) -> None:
+        """Subscribe to cortex token usage and accumulate daily stats."""
+        subject = f"{CORTEX_TOKEN_USAGE}.{self._site_name}"
+        await subscribe_supervised(
+            self._nc,
+            subject,
+            self._handle_token_usage,
+            name="token_usage",
+        )
 
-def component_healthy_in_hive(component: str) -> list[str]:
-    """Return list of hive site names where this component is healthy."""
-    healthy_sites = []
-    for site, state in _hive_state.items():
-        peer_health = state.get("component_health", {})
-        comp_state = peer_health.get(component, {})
-        if comp_state.get("healthy"):
-            healthy_sites.append(site)
-    return healthy_sites
+    # --- Health Monitor Loop ---
 
+    async def health_monitor_loop(self) -> None:
+        """Continuous health monitoring — no Claude, triggers reflexes."""
+        log.info(
+            "Health monitor loop started", extra={"interval": self._check_interval, "instance_id": self._instance_id}
+        )
 
-def _check_cortex_heartbeat():
-    """Check if cortex heartbeat is recent and include turn state + hive context.
-
-    Also acts as the layer-2 stuck-turn watchdog: if a turn has been running
-    longer than ``CORTEX_STUCK_THRESHOLD_S`` we publish ``CORTEX_STUCK`` so
-    the existing escalation path (``cortex_stuck_handler`` in claude.py) can
-    decide what to do — restart the pod, page Adi, etc. This is the safety net
-    for the case where cortex's own internal timeout failed to fire (e.g.,
-    uncancellable native call). Only the active turn is tracked, and we alert
-    once per (turn_id, turn_started) tuple to avoid spamming every tick.
-    """
-    if _cortex_state["last_heartbeat"] == 0:
-        return
-    now = time.time()
-    age = now - _cortex_state["last_heartbeat"]
-    hive_total, hive_healthy = _hive_cortex_status()
-    details: dict = {
-        "last_heartbeat_age_s": round(age, 1),
-        "hive_cortex_total": hive_total,
-        "hive_cortex_healthy": hive_healthy,
-    }
-    active_turn = _cortex_state["active_turn"]
-    turn_mode = _cortex_state["turn_mode"]
-    turn_started = _cortex_state["turn_started"]
-    turn_running_s: float | None = None
-    if active_turn:
-        details["active_turn"] = active_turn
-        details["turn_mode"] = turn_mode
-        if turn_started:
-            turn_running_s = now - turn_started
-            details["turn_running_s"] = round(turn_running_s, 1)
-
-    local_healthy = age < 60
-    if not local_healthy and hive_healthy > 0:
-        details["hive_note"] = f"cortex healthy on {hive_healthy} other site(s) — local issue only"
-
-    _update_health("maki-cortex-heartbeat", local_healthy, details)
-
-    # Reset stuck-alerted tracking when the active turn changes (or clears).
-    if _cortex_stuck_alerted["turn_id"] != active_turn or _cortex_stuck_alerted["turn_started"] != turn_started:
-        _cortex_stuck_alerted["turn_id"] = active_turn
-        _cortex_stuck_alerted["turn_started"] = turn_started
-        _cortex_stuck_alerted["last_fired_at"] = 0.0
-        _cortex_stuck_alerted["fire_count"] = 0
-
-    # Layer-2 watchdog: cortex turn ran past the threshold. Heartbeat must
-    # still be live — if heartbeat itself is stale, the regular health-check
-    # path handles the unhealthy state and a restart reflex can kick in.
-    #
-    # Re-arming: the previous one-shot-per-turn_id behaviour meant a single
-    # failed escalation left the system silently wedged for hours (#185).
-    # Now we re-fire CORTEX_STUCK on a ``CORTEX_STUCK_THRESHOLD_S`` cadence
-    # until the turn clears or the pod is restarted.
-    if (
-        active_turn
-        and turn_running_s is not None
-        and turn_running_s > CORTEX_STUCK_THRESHOLD_S
-        and local_healthy
-        and _nc is not None
-    ):
-        last_fired = _cortex_stuck_alerted.get("last_fired_at") or 0.0
-        time_since_last = now - last_fired
-        first_fire = last_fired == 0.0
-        # Fire on first crossing, then re-arm every threshold interval.
-        if first_fire or time_since_last >= CORTEX_STUCK_THRESHOLD_S:
-            fire_count = int(_cortex_stuck_alerted.get("fire_count") or 0) + 1
-            log.error(
-                "Cortex turn exceeded stuck threshold — publishing CORTEX_STUCK",
-                extra={
-                    "turn_id": active_turn,
-                    "turn_mode": turn_mode,
-                    "turn_running_s": round(turn_running_s, 1),
-                    "threshold_s": CORTEX_STUCK_THRESHOLD_S,
-                    "fire_count": fire_count,
-                    "time_since_last_fire_s": round(time_since_last, 1) if not first_fire else None,
-                },
-            )
-            payload = json.dumps(
-                {
-                    "turn_id": active_turn,
-                    "mode": turn_mode or "unknown",
-                    "timeout_seconds": int(turn_running_s),
-                    "user_waiting": False,
-                    "source": "immune_watchdog",
-                    "fire_count": fire_count,
-                }
-            ).encode()
-            # Fire-and-forget so the synchronous check doesn't block the loop.
-            # ``spawn_background`` anchors the publish task against GC and
-            # logs any uncaught exception (issue #123).
+        while True:
             try:
-                spawn_background(_nc.publish(CORTEX_STUCK, payload), name="immune.cortex_stuck_publish")
+                # Gather both verdicts before writing — see #249 and
+                # _merge_and_update_health for why the direct-write pattern was
+                # racy. Sequential for now; #231 tracks parallelising the HTTP
+                # fan-out separately.
+                http_verdicts = await self._check_http_health()
+                k8s_verdicts = await self._check_k8s_pods()
+                self._merge_and_update_health(http_verdicts, k8s_verdicts)
+                self._check_cortex_heartbeat()
+
+                config = await load_kv_config(self._config_kv, self._default_config)
+                for component, state in self._component_health.items():
+                    if not state["healthy"] and state["consecutive_failures"] >= 2:
+                        await self._trigger_reflex(component, state, config)
+
+                await self._check_stuck_components(config)
+                await self._check_long_unhealthy_components(config)
+                await self._check_immune_self_health(config)
+                await self._check_stuck_recovery(config)
+
             except Exception:
-                log.exception("Failed to schedule CORTEX_STUCK publish")
-            _cortex_stuck_alerted["last_fired_at"] = now
-            _cortex_stuck_alerted["fire_count"] = fire_count
+                log.exception("Health monitor error")
 
+            await asyncio.sleep(self._check_interval)
 
-async def _handle_cortex_heartbeat(msg) -> None:
-    _cortex_state["last_heartbeat"] = time.time()
-    payload = json.loads(msg.data.decode())
-    _cortex_state["active_turn"] = payload.get("active_turn")
-    _cortex_state["turn_mode"] = payload.get("turn_mode")
-    _cortex_state["turn_started"] = payload.get("turn_started")
+    # --- Reflex Engine ---
 
+    async def _trigger_reflex(self, component: str, state: dict, config: dict) -> None:
+        """Autonomous pod restart reflex (Tier 1)."""
+        if component.endswith("-heartbeat"):
+            return
 
-async def cortex_heartbeat_listener():
-    """Subscribe to cortex health heartbeat and parse enriched turn state.
+        pod_name = state.get("details", {}).get("pod_name")
+        if not pod_name:
+            return
 
-    Wrapped in ``subscribe_supervised`` so a silent subscription drop or a
-    NATS client close re-subscribes with backoff instead of leaving the task
-    finished and ``_cortex_state["last_heartbeat"]`` frozen — which would
-    flip ``maki-cortex-heartbeat`` unhealthy and could trigger a reflex
-    restart on a perfectly healthy cortex (issue #175).
-    """
-    from maki_common.subjects import CORTEX_HEALTH
+        now = time.time()
+        hour_ago = now - 3600
+        max_restarts = config.get("reflex_restart_max", 3)
 
-    await subscribe_supervised(
-        _nc,
-        CORTEX_HEALTH,
-        _handle_cortex_heartbeat,
-        name="cortex_heartbeat",
-    )
+        history = self._restart_history.get(component, [])
+        history = [t for t in history if t > hour_ago]
+        self._restart_history[component] = history
 
+        if len(history) >= max_restarts:
+            hive_healthy_elsewhere = self.component_healthy_in_hive(component)
+            if hive_healthy_elsewhere:
+                log.warning(
+                    "Reflex limit reached but component healthy on other sites — skipping escalation",
+                    extra={
+                        "component": component,
+                        "restarts": len(history),
+                        "hive_healthy_sites": hive_healthy_elsewhere,
+                    },
+                )
+                return
 
-async def _handle_token_usage(msg) -> None:
-    payload = json.loads(msg.data.decode())
-    today = datetime.now().strftime("%Y-%m-%d")
-    if _token_stats["date"] != today:
-        _token_stats["date"] = today
-        _token_stats["total_tokens"] = 0
-        _token_stats["total_cost_usd"] = 0.0
-        _token_stats["turns"] = 0
-        _token_stats["by_model"] = {}
-
-    tokens = payload.get("total_tokens", 0)
-    cost = payload.get("total_cost_usd", 0.0)
-    model = payload.get("model", "unknown")
-
-    _token_stats["total_tokens"] += tokens
-    _token_stats["total_cost_usd"] += cost
-    _token_stats["turns"] += 1
-
-    if model not in _token_stats["by_model"]:
-        _token_stats["by_model"][model] = {"tokens": 0, "cost_usd": 0.0, "turns": 0}
-    _token_stats["by_model"][model]["tokens"] += tokens
-    _token_stats["by_model"][model]["cost_usd"] += cost
-    _token_stats["by_model"][model]["turns"] += 1
-
-
-async def token_usage_listener():
-    """Subscribe to cortex token usage and accumulate daily stats."""
-    subject = f"{CORTEX_TOKEN_USAGE}.{_site_name}"
-    await subscribe_supervised(
-        _nc,
-        subject,
-        _handle_token_usage,
-        name="token_usage",
-    )
-
-
-# --- Health Monitor Loop ---
-
-
-async def health_monitor_loop():
-    """Continuous health monitoring — no Claude, triggers reflexes."""
-    log.info("Health monitor loop started", extra={"interval": _check_interval, "instance_id": _instance_id})
-
-    while True:
-        try:
-            # Gather both verdicts before writing — see #249 and
-            # _merge_and_update_health for why the direct-write pattern was
-            # racy. Sequential for now; #231 tracks parallelising the HTTP
-            # fan-out separately.
-            http_verdicts = await _check_http_health()
-            k8s_verdicts = await _check_k8s_pods()
-            _merge_and_update_health(http_verdicts, k8s_verdicts)
-            _check_cortex_heartbeat()
-
-            config = await load_kv_config(_config_kv, _default_config)
-            for component, state in _component_health.items():
-                if not state["healthy"] and state["consecutive_failures"] >= 2:
-                    await _trigger_reflex(component, state, config)
-
-            await _check_stuck_components(config)
-            await _check_long_unhealthy_components(config)
-            await _check_immune_self_health(config)
-            await _check_stuck_recovery(config)
-
-        except Exception:
-            log.exception("Health monitor error")
-
-        await asyncio.sleep(_check_interval)
-
-
-# --- Reflex Engine ---
-
-
-async def _trigger_reflex(component: str, state: dict, config: dict):
-    """Autonomous pod restart reflex (Tier 1)."""
-    if component.endswith("-heartbeat"):
-        return
-
-    pod_name = state.get("details", {}).get("pod_name")
-    if not pod_name:
-        return
-
-    now = time.time()
-    hour_ago = now - 3600
-    max_restarts = config.get("reflex_restart_max", 3)
-
-    history = _restart_history.get(component, [])
-    history = [t for t in history if t > hour_ago]
-    _restart_history[component] = history
-
-    if len(history) >= max_restarts:
-        hive_healthy_elsewhere = component_healthy_in_hive(component)
-        if hive_healthy_elsewhere:
             log.warning(
-                "Reflex limit reached but component healthy on other sites — skipping escalation",
-                extra={"component": component, "restarts": len(history), "hive_healthy_sites": hive_healthy_elsewhere},
+                "Reflex limit reached, escalating to Claude",
+                extra={"component": component, "restarts": len(history), "max": max_restarts},
+            )
+            await self._publish_alert(
+                f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"
+            )
+            spawn_background(
+                self._escalate_to_claude(
+                    component,
+                    state,
+                    f"Reflex restart limit reached ({len(history)}/{max_restarts} restarts in last hour)",
+                ),
+                name="immune.reflex_limit_escalation",
             )
             return
 
-        log.warning(
-            "Reflex limit reached, escalating to Claude",
-            extra={"component": component, "restarts": len(history), "max": max_restarts},
-        )
-        await _publish_alert(
-            f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"
-        )
-        spawn_background(
-            _escalate_to_claude(
-                component, state, f"Reflex restart limit reached ({len(history)}/{max_restarts} restarts in last hour)"
-            ),
-            name="immune.reflex_limit_escalation",
-        )
-        return
+        try:
+            async with self._infra_lock("immune-reflex", ttl=60):
+                try:
+                    history.append(now)
+                    self._restart_history[component] = history
 
-    try:
-        async with _infra_lock("immune-reflex", ttl=60):
-            try:
-                history.append(now)
-                _restart_history[component] = history
+                    await asyncio.to_thread(
+                        self._k8s_v1.delete_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                        grace_period_seconds=10,
+                    )
 
-                await asyncio.to_thread(
-                    _k8s_v1.delete_namespaced_pod,
-                    name=pod_name,
-                    namespace=_namespace,
-                    grace_period_seconds=10,
-                )
-
-                action = {
-                    "type": "reflex_restart",
-                    "component": component,
-                    "pod_name": pod_name,
-                    "restart_number": len(history),
-                    "max_restarts": max_restarts,
-                    "timestamp": now,
-                }
-                _recent_actions.append(action)
-                if len(_recent_actions) > _recent_actions_max:
-                    _recent_actions.pop(0)
-                _schedule_persist()
-
-                log.info(
-                    "Reflex restart",
-                    extra={
+                    action = {
+                        "type": "reflex_restart",
                         "component": component,
                         "pod_name": pod_name,
                         "restart_number": len(history),
-                        "max": max_restarts,
-                    },
-                )
-                await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+                        "max_restarts": max_restarts,
+                        "timestamp": now,
+                    }
+                    self._recent_actions.append(action)
+                    if len(self._recent_actions) > self._recent_actions_max:
+                        self._recent_actions.pop(0)
+                    self._schedule_persist()
 
-            except Exception:
-                log.exception("Failed to restart pod", extra={"pod_name": pod_name})
-    except LockNotAcquired:
-        log.warning("Cannot acquire lock for reflex restart", extra={"component": component})
-        return
+                    log.info(
+                        "Reflex restart",
+                        extra={
+                            "component": component,
+                            "pod_name": pod_name,
+                            "restart_number": len(history),
+                            "max": max_restarts,
+                        },
+                    )
+                    await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
 
+                except Exception:
+                    log.exception("Failed to restart pod", extra={"pod_name": pod_name})
+        except LockNotAcquired:
+            log.warning("Cannot acquire lock for reflex restart", extra={"component": component})
+            return
 
-# --- Stuck-Component Detection (Tier 1.5) ---
+    # --- Stuck-Component Detection (Tier 1.5) ---
 
+    @staticmethod
+    def _healthy_replica_count(details: dict) -> tuple[int, int]:
+        """Return (healthy_replicas, total_replicas) for an unhealthy component.
 
-def _healthy_replica_count(details: dict) -> tuple[int, int]:
-    """Return (healthy_replicas, total_replicas) for an unhealthy component.
+        The k8s pod check records ``total_pods``/``unhealthy_pods`` only when a
+        component has more than one pod. For a single-pod component those keys are
+        absent — and since this is only called for an *unhealthy* component, that
+        single pod is by definition not healthy, so we report (0, 1).
+        """
+        total = details.get("total_pods")
+        if total is None:
+            return 0, 1
+        unhealthy = details.get("unhealthy_pods") or 0
+        return max(total - unhealthy, 0), total
 
-    The k8s pod check records ``total_pods``/``unhealthy_pods`` only when a
-    component has more than one pod. For a single-pod component those keys are
-    absent — and since this is only called for an *unhealthy* component, that
-    single pod is by definition not healthy, so we report (0, 1).
-    """
-    total = details.get("total_pods")
-    if total is None:
-        return 0, 1
-    unhealthy = details.get("unhealthy_pods") or 0
-    return max(total - unhealthy, 0), total
+    async def _check_stuck_components(self, config: dict) -> None:
+        """Escalate components stuck unhealthy in a non-Running phase with no healthy replica.
 
+        The restart reflex (``_trigger_reflex``) handles pods that crash and restart,
+        but a pod that *never finishes initializing* (phase=Pending,
+        waiting_reason=PodInitializing, restarts=0) produces no crash signal and can
+        sit dead for days while only ``consecutive_failures`` ticks up — exactly the
+        autonomy gap in #245. Here we classify that as "stuck" off ``last_state_change``
+        (wall-clock duration, not failure count) and escalate:
 
-async def _check_stuck_components(config: dict) -> None:
-    """Escalate components stuck unhealthy in a non-Running phase with no healthy replica.
+        - **Human escalation** — publish an ALERT, which reaches Adi via ears. This is
+          the path that was missing: a foundational component could be dead for days
+          with nobody notified.
+        - **Judgment-driven remediation** — hand the incident to immune's own Claude,
+          which can read logs/events and decide whether deleting the stuck pod is safe
+          (blindly deleting a single-replica secrets StatefulSet is risky), rather than
+          a blind reflex restart.
 
-    The restart reflex (``_trigger_reflex``) handles pods that crash and restart,
-    but a pod that *never finishes initializing* (phase=Pending,
-    waiting_reason=PodInitializing, restarts=0) produces no crash signal and can
-    sit dead for days while only ``consecutive_failures`` ticks up — exactly the
-    autonomy gap in #245. Here we classify that as "stuck" off ``last_state_change``
-    (wall-clock duration, not failure count) and escalate:
+        Guards that keep this from firing on healthy rollouts (#77) or localized
+        issues: we only escalate when the pod is in a non-Running/initializing phase,
+        has been stuck longer than the threshold, has **zero** healthy replicas, and
+        is not healthy on any other hive site.
+        """
+        if self._nc is None:
+            return
 
-    - **Human escalation** — publish an ALERT, which reaches Adi via ears. This is
-      the path that was missing: a foundational component could be dead for days
-      with nobody notified.
-    - **Judgment-driven remediation** — hand the incident to immune's own Claude,
-      which can read logs/events and decide whether deleting the stuck pod is safe
-      (blindly deleting a single-replica secrets StatefulSet is risky), rather than
-      a blind reflex restart.
+        threshold = config.get("stuck_escalation_threshold_s", STUCK_ESCALATION_THRESHOLD_S)
+        realert = config.get("stuck_realert_interval_s", STUCK_REALERT_INTERVAL_S)
+        now = time.time()
 
-    Guards that keep this from firing on healthy rollouts (#77) or localized
-    issues: we only escalate when the pod is in a non-Running/initializing phase,
-    has been stuck longer than the threshold, has **zero** healthy replicas, and
-    is not healthy on any other hive site.
-    """
-    if _nc is None:
-        return
+        for component, state in list(self._component_health.items()):
+            if component.endswith("-heartbeat"):
+                continue
 
-    threshold = config.get("stuck_escalation_threshold_s", STUCK_ESCALATION_THRESHOLD_S)
-    realert = config.get("stuck_realert_interval_s", STUCK_REALERT_INTERVAL_S)
-    now = time.time()
+            if state["healthy"]:
+                self._stuck_alerted.pop(component, None)
+                continue
 
-    for component, state in list(_component_health.items()):
-        if component.endswith("-heartbeat"):
-            continue
+            details = state.get("details", {})
+            phase = details.get("phase")
+            waiting_reason = details.get("waiting_reason")
 
-        if state["healthy"]:
-            _stuck_alerted.pop(component, None)
-            continue
+            # Only the never-finishes-initializing / non-Running pod case. A pod that
+            # is Running+Ready but failing its HTTP health check is a different failure
+            # mode that the restart reflex already handles; escalating it here too would
+            # double up. Components with no phase at all (pure HTTP endpoints) are
+            # likewise left to the reflex path.
+            is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
+            if not is_pod_stuck:
+                self._stuck_alerted.pop(component, None)
+                continue
 
-        details = state.get("details", {})
-        phase = details.get("phase")
-        waiting_reason = details.get("waiting_reason")
+            stuck_for = now - state["last_state_change"]
+            if stuck_for < threshold:
+                continue
 
-        # Only the never-finishes-initializing / non-Running pod case. A pod that
-        # is Running+Ready but failing its HTTP health check is a different failure
-        # mode that the restart reflex already handles; escalating it here too would
-        # double up. Components with no phase at all (pure HTTP endpoints) are
-        # likewise left to the reflex path.
-        is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
-        if not is_pod_stuck:
-            _stuck_alerted.pop(component, None)
-            continue
+            # #77 guard: only escalate when NO replica is serving. A healthy rolling
+            # update keeps other pods ready, so healthy_replicas > 0 and we bail.
+            healthy_replicas, total_replicas = self._healthy_replica_count(details)
+            if healthy_replicas > 0:
+                self._stuck_alerted.pop(component, None)
+                continue
 
-        stuck_for = now - state["last_state_change"]
-        if stuck_for < threshold:
-            continue
+            # Hive guard: if the component is healthy on another site it's a local
+            # problem, not a system-wide outage — matches the reflex escalation policy.
+            if self.component_healthy_in_hive(component):
+                continue
 
-        # #77 guard: only escalate when NO replica is serving. A healthy rolling
-        # update keeps other pods ready, so healthy_replicas > 0 and we bail.
-        healthy_replicas, total_replicas = _healthy_replica_count(details)
-        if healthy_replicas > 0:
-            _stuck_alerted.pop(component, None)
-            continue
+            # Re-arm tracking: fire once on first crossing for this incident, then every
+            # ``realert`` interval until it recovers — so a single ignored escalation
+            # doesn't go silent, without spamming on every 30s tick.
+            incident = state["last_state_change"]
+            tracker = self._stuck_alerted.get(component)
+            if tracker is None or tracker.get("incident") != incident:
+                tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
+                self._stuck_alerted[component] = tracker
 
-        # Hive guard: if the component is healthy on another site it's a local
-        # problem, not a system-wide outage — matches the reflex escalation policy.
-        if component_healthy_in_hive(component):
-            continue
+            last_fired = tracker.get("last_fired_at") or 0.0
+            first_fire = last_fired == 0.0
+            if not first_fire and (now - last_fired) < realert:
+                continue
 
-        # Re-arm tracking: fire once on first crossing for this incident, then every
-        # ``realert`` interval until it recovers — so a single ignored escalation
-        # doesn't go silent, without spamming on every 30s tick.
-        incident = state["last_state_change"]
-        tracker = _stuck_alerted.get(component)
-        if tracker is None or tracker.get("incident") != incident:
-            tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
-            _stuck_alerted[component] = tracker
+            fire_count = int(tracker.get("fire_count") or 0) + 1
+            tracker["last_fired_at"] = now
+            tracker["fire_count"] = fire_count
 
-        last_fired = tracker.get("last_fired_at") or 0.0
-        first_fire = last_fired == 0.0
-        if not first_fire and (now - last_fired) < realert:
-            continue
+            stuck_min = round(stuck_for / 60, 1)
+            pod_name = details.get("pod_name", "?")
+            restarts = details.get("restarts", 0)
+            replica_note = f"{healthy_replicas}/{total_replicas} replicas healthy"
 
-        fire_count = int(tracker.get("fire_count") or 0) + 1
-        tracker["last_fired_at"] = now
-        tracker["fire_count"] = fire_count
+            log.error(
+                "Stuck component detected — escalating",
+                extra={
+                    "component": component,
+                    "pod_name": pod_name,
+                    "stuck_for_min": stuck_min,
+                    "phase": phase,
+                    "waiting_reason": waiting_reason,
+                    "restarts": restarts,
+                    "fire_count": fire_count,
+                },
+            )
 
-        stuck_min = round(stuck_for / 60, 1)
-        pod_name = details.get("pod_name", "?")
-        restarts = details.get("restarts", 0)
-        replica_note = f"{healthy_replicas}/{total_replicas} replicas healthy"
+            # Human escalation via ears (#245's missing piece).
+            await self._publish_alert(
+                f"STUCK: {component} ({pod_name}) has been {phase or 'not Running'}"
+                f"/{waiting_reason or 'unhealthy'} for {stuck_min}min with {replica_note} — "
+                f"it never finished initializing (restarts={restarts}), no crash signal. "
+                f"Escalation #{fire_count}; needs attention."
+            )
 
-        log.error(
-            "Stuck component detected — escalating",
-            extra={
+            # Audit the escalation as a recent action.
+            action = {
+                "type": "stuck_escalation",
                 "component": component,
                 "pod_name": pod_name,
                 "stuck_for_min": stuck_min,
@@ -1017,164 +1027,174 @@ async def _check_stuck_components(config: dict) -> None:
                 "waiting_reason": waiting_reason,
                 "restarts": restarts,
                 "fire_count": fire_count,
-            },
-        )
+                "timestamp": now,
+            }
+            self._recent_actions.append(action)
+            if len(self._recent_actions) > self._recent_actions_max:
+                self._recent_actions.pop(0)
+            self._schedule_persist()
+            try:
+                await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish stuck escalation action")
 
-        # Human escalation via ears (#245's missing piece).
-        await _publish_alert(
-            f"STUCK: {component} ({pod_name}) has been {phase or 'not Running'}"
-            f"/{waiting_reason or 'unhealthy'} for {stuck_min}min with {replica_note} — "
-            f"it never finished initializing (restarts={restarts}), no crash signal. "
-            f"Escalation #{fire_count}; needs attention."
-        )
+            # Judgment-driven remediation: only on the first fire per incident, so we
+            # don't spawn a Claude turn every re-alert. Claude can investigate and, if
+            # safe, restart the pod via its tools.
+            if first_fire and self._escalate_to_claude is not None:
+                reason = (
+                    f"Stuck classification: {component} ({pod_name}) has been unhealthy for "
+                    f"{stuck_min}min in phase={phase}, waiting_reason={waiting_reason}, "
+                    f"restarts={restarts}, with {replica_note}. No crash signal — it never "
+                    f"finished initializing, so the restart reflex never fired. Investigate "
+                    f"(logs, events, init containers, dependencies) and remediate if safe."
+                )
+                spawn_background(
+                    self._escalate_to_claude(component, state, reason),
+                    name="immune.stuck_escalation",
+                )
 
-        # Audit the escalation as a recent action.
-        action = {
-            "type": "stuck_escalation",
-            "component": component,
-            "pod_name": pod_name,
-            "stuck_for_min": stuck_min,
-            "phase": phase,
-            "waiting_reason": waiting_reason,
-            "restarts": restarts,
-            "fire_count": fire_count,
-            "timestamp": now,
-        }
-        _recent_actions.append(action)
-        if len(_recent_actions) > _recent_actions_max:
-            _recent_actions.pop(0)
-        _schedule_persist()
-        try:
-            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-        except Exception:
-            log.exception("Failed to publish stuck escalation action")
+    async def _check_long_unhealthy_components(self, config: dict) -> None:
+        """Re-escalate components that have been unhealthy for a long time (#260).
 
-        # Judgment-driven remediation: only on the first fire per incident, so we
-        # don't spawn a Claude turn every re-alert. Claude can investigate and, if
-        # safe, restart the pod via its tools.
-        if first_fire and _escalate_to_claude is not None:
-            reason = (
-                f"Stuck classification: {component} ({pod_name}) has been unhealthy for "
-                f"{stuck_min}min in phase={phase}, waiting_reason={waiting_reason}, "
-                f"restarts={restarts}, with {replica_note}. No crash signal — it never "
-                f"finished initializing, so the restart reflex never fired. Investigate "
-                f"(logs, events, init containers, dependencies) and remediate if safe."
+        Plugs the autonomy gap exposed by #259: the restart reflex (`_trigger_reflex`)
+        only fires ``_escalate_to_claude`` once per restart-budget exhaustion. After
+        that, ``consecutive_failures`` ticks up forever with no further alert. If the
+        resulting incident issue gets closed without a root-cause fix (or escalation
+        never reaches a human), the component can sit broken for days — exactly how
+        maki-recall went 3.5d silent in this incident series (#251 → #257 → #259).
+
+        Distinct from ``_check_stuck_components``: that one only fires for pods in a
+        non-Running / initializing phase. This catches the broader case — *anything*
+        immune classifies as unhealthy, whether it's an HTTP probe returning 503, a
+        CrashLoopBackOff, or anything else — once it has been unhealthy past
+        ``LONG_UNHEALTHY_RE_ESCALATE_HOURS`` since the last state change.
+
+        Cooldown via ``_long_unhealthy_alerted`` keyed by component ensures one alert
+        per ``long_unhealthy_realert_interval_s`` window, not one per 30s tick. The
+        tracker is keyed on the component's ``last_state_change`` so a recover-and-
+        fail-again cycle re-arms cleanly.
+
+        Hive guard is tiered (#311). For the first
+        ``long_unhealthy_local_only_escalate_hours`` (default 72h) we suppress when
+        a peer site has the component healthy — matches the reflex/stuck-escalation
+        "local-only, don't page" policy. Past that, we escalate anyway with a
+        distinct ``LOCAL-ONLY-LONG-UNHEALTHY`` label, because the original
+        suppression implicitly assumed *something* else would heal the local
+        instance; for components without an autonomous recovery path nothing ever
+        does, and the silence itself becomes the bug (recall sat in CrashLoopBackOff
+        locally for 13 days before this gap was closed).
+        """
+        if self._nc is None:
+            return
+
+        threshold_s = config.get("long_unhealthy_re_escalate_hours", LONG_UNHEALTHY_RE_ESCALATE_HOURS) * 3600
+        realert_s = config.get("long_unhealthy_realert_interval_s", LONG_UNHEALTHY_REALERT_INTERVAL_S)
+        local_only_threshold_s = (
+            config.get(
+                "long_unhealthy_local_only_escalate_hours",
+                LONG_UNHEALTHY_LOCAL_ONLY_ESCALATE_HOURS,
             )
-            spawn_background(
-                _escalate_to_claude(component, state, reason),
-                name="immune.stuck_escalation",
-            )
-
-
-async def _check_long_unhealthy_components(config: dict) -> None:
-    """Re-escalate components that have been unhealthy for a long time (#260).
-
-    Plugs the autonomy gap exposed by #259: the restart reflex (`_trigger_reflex`)
-    only fires ``_escalate_to_claude`` once per restart-budget exhaustion. After
-    that, ``consecutive_failures`` ticks up forever with no further alert. If the
-    resulting incident issue gets closed without a root-cause fix (or escalation
-    never reaches a human), the component can sit broken for days — exactly how
-    maki-recall went 3.5d silent in this incident series (#251 → #257 → #259).
-
-    Distinct from ``_check_stuck_components``: that one only fires for pods in a
-    non-Running / initializing phase. This catches the broader case — *anything*
-    immune classifies as unhealthy, whether it's an HTTP probe returning 503, a
-    CrashLoopBackOff, or anything else — once it has been unhealthy past
-    ``LONG_UNHEALTHY_RE_ESCALATE_HOURS`` since the last state change.
-
-    Cooldown via ``_long_unhealthy_alerted`` keyed by component ensures one alert
-    per ``long_unhealthy_realert_interval_s`` window, not one per 30s tick. The
-    tracker is keyed on the component's ``last_state_change`` so a recover-and-
-    fail-again cycle re-arms cleanly.
-
-    Hive guard is tiered (#311). For the first
-    ``long_unhealthy_local_only_escalate_hours`` (default 72h) we suppress when
-    a peer site has the component healthy — matches the reflex/stuck-escalation
-    "local-only, don't page" policy. Past that, we escalate anyway with a
-    distinct ``LOCAL-ONLY-LONG-UNHEALTHY`` label, because the original
-    suppression implicitly assumed *something* else would heal the local
-    instance; for components without an autonomous recovery path nothing ever
-    does, and the silence itself becomes the bug (recall sat in CrashLoopBackOff
-    locally for 13 days before this gap was closed).
-    """
-    if _nc is None:
-        return
-
-    threshold_s = config.get("long_unhealthy_re_escalate_hours", LONG_UNHEALTHY_RE_ESCALATE_HOURS) * 3600
-    realert_s = config.get("long_unhealthy_realert_interval_s", LONG_UNHEALTHY_REALERT_INTERVAL_S)
-    local_only_threshold_s = (
-        config.get(
-            "long_unhealthy_local_only_escalate_hours",
-            LONG_UNHEALTHY_LOCAL_ONLY_ESCALATE_HOURS,
+            * 3600
         )
-        * 3600
-    )
-    now = time.time()
+        now = time.time()
 
-    for component, state in list(_component_health.items()):
-        # Heartbeat-derived components don't have pods to act on; their own
-        # alerting path (CORTEX_STUCK, cortex-rollback) handles the bad cases.
-        if component.endswith("-heartbeat"):
-            continue
-
-        if state["healthy"]:
-            _long_unhealthy_alerted.pop(component, None)
-            continue
-
-        stuck_for = now - state["last_state_change"]
-        if stuck_for < threshold_s:
-            continue
-
-        # Tiered hive guard (#311): if some other site has this component
-        # healthy, the system as a whole is fine and we don't want to wake
-        # Adi up for what looks like a local-only outage — but only up to a
-        # point. The original "always suppress on healthy peers" policy
-        # implicitly assumed *something* else would heal the local instance;
-        # for components without an autonomous recovery path (not on the
-        # stuck-recovery allowlist, or with a failure mode it doesn't fit)
-        # nothing ever does, and the silence becomes the bug. So:
-        #
-        # - Under ``local_only_threshold_s`` (default 72h): suppress as
-        #   before. Matches `_trigger_reflex` / `_check_stuck_components`.
-        # - Past it: escalate anyway, but tag the alert and action with
-        #   ``LOCAL-ONLY-LONG-UNHEALTHY`` so the policy is legible in the
-        #   audit trail and Adi can tell at a glance that this isn't a
-        #   system-wide outage — it's a hive dead-zone breakthrough.
-        healthy_in_hive = component_healthy_in_hive(component)
-        local_only_breakthrough = False
-        if healthy_in_hive:
-            if stuck_for < local_only_threshold_s:
+        for component, state in list(self._component_health.items()):
+            # Heartbeat-derived components don't have pods to act on; their own
+            # alerting path (CORTEX_STUCK, cortex-rollback) handles the bad cases.
+            if component.endswith("-heartbeat"):
                 continue
-            local_only_breakthrough = True
 
-        incident = state["last_state_change"]
-        tracker = _long_unhealthy_alerted.get(component)
-        if tracker is None or tracker.get("incident") != incident:
-            tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
-            _long_unhealthy_alerted[component] = tracker
+            if state["healthy"]:
+                self._long_unhealthy_alerted.pop(component, None)
+                continue
 
-        last_fired = tracker.get("last_fired_at") or 0.0
-        first_fire = last_fired == 0.0
-        if not first_fire and (now - last_fired) < realert_s:
-            continue
+            stuck_for = now - state["last_state_change"]
+            if stuck_for < threshold_s:
+                continue
 
-        fire_count = int(tracker.get("fire_count") or 0) + 1
-        tracker["last_fired_at"] = now
-        tracker["fire_count"] = fire_count
+            # Tiered hive guard (#311): if some other site has this component
+            # healthy, the system as a whole is fine and we don't want to wake
+            # Adi up for what looks like a local-only outage — but only up to a
+            # point. The original "always suppress on healthy peers" policy
+            # implicitly assumed *something* else would heal the local instance;
+            # for components without an autonomous recovery path (not on the
+            # stuck-recovery allowlist, or with a failure mode it doesn't fit)
+            # nothing ever does, and the silence becomes the bug. So:
+            #
+            # - Under ``local_only_threshold_s`` (default 72h): suppress as
+            #   before. Matches `_trigger_reflex` / `_check_stuck_components`.
+            # - Past it: escalate anyway, but tag the alert and action with
+            #   ``LOCAL-ONLY-LONG-UNHEALTHY`` so the policy is legible in the
+            #   audit trail and Adi can tell at a glance that this isn't a
+            #   system-wide outage — it's a hive dead-zone breakthrough.
+            healthy_in_hive = self.component_healthy_in_hive(component)
+            local_only_breakthrough = False
+            if healthy_in_hive:
+                if stuck_for < local_only_threshold_s:
+                    continue
+                local_only_breakthrough = True
 
-        stuck_hours = round(stuck_for / 3600, 1)
-        details = state.get("details", {})
-        pod_name = details.get("pod_name", "?")
-        phase = details.get("phase")
-        waiting_reason = details.get("waiting_reason")
-        restarts = details.get("restarts", 0)
-        consecutive_failures = state.get("consecutive_failures", 0)
+            incident = state["last_state_change"]
+            tracker = self._long_unhealthy_alerted.get(component)
+            if tracker is None or tracker.get("incident") != incident:
+                tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
+                self._long_unhealthy_alerted[component] = tracker
 
-        alert_label = "LOCAL-ONLY-LONG-UNHEALTHY" if local_only_breakthrough else "LONG-UNHEALTHY"
+            last_fired = tracker.get("last_fired_at") or 0.0
+            first_fire = last_fired == 0.0
+            if not first_fire and (now - last_fired) < realert_s:
+                continue
 
-        log.error(
-            "Long-unhealthy component — re-escalating",
-            extra={
+            fire_count = int(tracker.get("fire_count") or 0) + 1
+            tracker["last_fired_at"] = now
+            tracker["fire_count"] = fire_count
+
+            stuck_hours = round(stuck_for / 3600, 1)
+            details = state.get("details", {})
+            pod_name = details.get("pod_name", "?")
+            phase = details.get("phase")
+            waiting_reason = details.get("waiting_reason")
+            restarts = details.get("restarts", 0)
+            consecutive_failures = state.get("consecutive_failures", 0)
+
+            alert_label = "LOCAL-ONLY-LONG-UNHEALTHY" if local_only_breakthrough else "LONG-UNHEALTHY"
+
+            log.error(
+                "Long-unhealthy component — re-escalating",
+                extra={
+                    "component": component,
+                    "pod_name": pod_name,
+                    "stuck_for_hours": stuck_hours,
+                    "consecutive_failures": consecutive_failures,
+                    "phase": phase,
+                    "waiting_reason": waiting_reason,
+                    "restarts": restarts,
+                    "fire_count": fire_count,
+                    "alert_label": alert_label,
+                    "healthy_in_hive": healthy_in_hive,
+                },
+            )
+
+            if local_only_breakthrough:
+                local_only_note = (
+                    f" Hive shows healthy peers on {healthy_in_hive} — this is a "
+                    f"local-only outage that has slipped past the normal hive-guard "
+                    f"suppression (>{round(local_only_threshold_s / 3600, 1)}h)."
+                )
+            else:
+                local_only_note = ""
+
+            await self._publish_alert(
+                f"{alert_label}: {component} ({pod_name}) has been unhealthy for {stuck_hours}h "
+                f"(consecutive_failures={consecutive_failures}, phase={phase}, "
+                f"waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
+                f"Re-escalation #{fire_count} — initial reflex/escalation did not resolve."
+                f"{local_only_note}"
+            )
+
+            action = {
+                "type": "long_unhealthy_re_escalation",
                 "component": component,
                 "pod_name": pod_name,
                 "stuck_for_hours": stuck_hours,
@@ -1185,324 +1205,307 @@ async def _check_long_unhealthy_components(config: dict) -> None:
                 "fire_count": fire_count,
                 "alert_label": alert_label,
                 "healthy_in_hive": healthy_in_hive,
-            },
-        )
-
-        if local_only_breakthrough:
-            local_only_note = (
-                f" Hive shows healthy peers on {healthy_in_hive} — this is a "
-                f"local-only outage that has slipped past the normal hive-guard "
-                f"suppression (>{round(local_only_threshold_s / 3600, 1)}h)."
-            )
-        else:
-            local_only_note = ""
-
-        await _publish_alert(
-            f"{alert_label}: {component} ({pod_name}) has been unhealthy for {stuck_hours}h "
-            f"(consecutive_failures={consecutive_failures}, phase={phase}, "
-            f"waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
-            f"Re-escalation #{fire_count} — initial reflex/escalation did not resolve."
-            f"{local_only_note}"
-        )
-
-        action = {
-            "type": "long_unhealthy_re_escalation",
-            "component": component,
-            "pod_name": pod_name,
-            "stuck_for_hours": stuck_hours,
-            "consecutive_failures": consecutive_failures,
-            "phase": phase,
-            "waiting_reason": waiting_reason,
-            "restarts": restarts,
-            "fire_count": fire_count,
-            "alert_label": alert_label,
-            "healthy_in_hive": healthy_in_hive,
-            "timestamp": now,
-        }
-        _recent_actions.append(action)
-        if len(_recent_actions) > _recent_actions_max:
-            _recent_actions.pop(0)
-        _schedule_persist()
-        try:
-            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-        except Exception:
-            log.exception("Failed to publish long-unhealthy re-escalation action")
-
-        # Hand back to Claude for a fresh investigation on every re-escalation —
-        # the whole point of this path is that the previous escalation did not
-        # resolve the underlying problem, so spawning one Claude turn per
-        # ``realert_s`` window is the desired cadence (not just first-fire-only).
-        # ``_escalate_to_claude`` is fire-and-forget; if Claude is busy the
-        # semaphore upstream will serialise the turn.
-        if _escalate_to_claude is not None:
-            local_only_reason = (
-                f" Hive peers {healthy_in_hive} have this component healthy, so the "
-                f"normal hive-guard suppression has been holding back the alert; this "
-                f"escalation breaks through after {round(local_only_threshold_s / 3600, 1)}h "
-                f"because a local-only outage that nothing autonomous can fix is still an "
-                f"outage worth investigating."
-                if local_only_breakthrough
-                else ""
-            )
-            reason = (
-                f"{alert_label} re-escalation: {component} ({pod_name}) has been unhealthy "
-                f"for {stuck_hours}h (consecutive_failures={consecutive_failures}, "
-                f"phase={phase}, waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
-                f"This is re-escalation #{fire_count} — earlier reflex/escalation did not fix "
-                f"the root cause.{local_only_reason} Investigate logs/events/dependencies and "
-                f"remediate. If the underlying issue is structural, file or revisit the "
-                f"relevant bug issue."
-            )
-            spawn_background(
-                _escalate_to_claude(component, state, reason),
-                name="immune.long_unhealthy_reescalation",
-            )
-
-
-# --- Immune Self-Health Watchdog ---
-
-
-async def _check_immune_self_health(config: dict) -> None:
-    """Detect when the monitor's own view of a component has gone stale (#270).
-
-    All the other escalation paths in this file trust ``_component_health`` —
-    they decide what to do based on ``healthy``, ``consecutive_failures``,
-    ``last_state_change`` etc. If the loop that *writes* that state silently
-    stops for one component (an unhandled exception in a per-component
-    sub-task, an asyncio.gather swallowing an error, a task cancelled and not
-    restarted), every downstream check keeps reading stale data and the rest
-    of the immune surface can't tell the difference between "component is
-    really still in this state" and "we stopped looking days ago".
-
-    This watchdog catches that. If ``now - last_check`` exceeds
-    ``SELF_HEALTH_STALE_MULTIPLIER × _check_interval`` for any component, we
-    classify it as an immune-self-failure: the monitor itself is the broken
-    thing, the component's apparent state is untrustworthy. We alert (with a
-    cooldown so a wedged sub-task doesn't fire every tick) so Adi sees it
-    quickly, and we record an action so the divergence is visible in the
-    hive/recent-actions audit trail.
-
-    Deliberately *only* alerts. No reflex restart of immune itself — if the
-    process is half-wedged we don't want it making things worse by hitting
-    K8s with delete calls. Recovery of the monitor is left to the kubelet
-    liveness probe and to Adi (or a future Claude turn) acting on the alert.
-    """
-    if _nc is None:
-        return
-
-    multiplier = config.get("self_health_stale_multiplier", SELF_HEALTH_STALE_MULTIPLIER)
-    realert_s = config.get("self_health_realert_interval_s", SELF_HEALTH_REALERT_INTERVAL_S)
-    threshold_s = max(multiplier * _check_interval, 1.0)
-    now = time.time()
-
-    for component, state in list(_component_health.items()):
-        last_check = state.get("last_check") or 0.0
-        if last_check == 0.0:
-            # Never been checked yet (e.g., during init). Not stale, just
-            # uninitialised; the regular path will fill it in.
-            _self_health_alerted.pop(component, None)
-            continue
-
-        stale_for = now - last_check
-        if stale_for < threshold_s:
-            # Healthy: monitor is actively writing state for this component.
-            # Drop any tracker so the next wedge re-arms cleanly.
-            _self_health_alerted.pop(component, None)
-            continue
-
-        tracker = _self_health_alerted.get(component)
-        if tracker is None:
-            tracker = {
-                "first_seen_stale_at": now,
-                "last_check_when_stale": last_check,
-                "last_fired_at": 0.0,
-                "fire_count": 0,
+                "timestamp": now,
             }
-            _self_health_alerted[component] = tracker
+            self._recent_actions.append(action)
+            if len(self._recent_actions) > self._recent_actions_max:
+                self._recent_actions.pop(0)
+            self._schedule_persist()
+            try:
+                await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish long-unhealthy re-escalation action")
 
-        last_fired = tracker.get("last_fired_at") or 0.0
-        first_fire = last_fired == 0.0
-        if not first_fire and (now - last_fired) < realert_s:
-            continue
+            # Hand back to Claude for a fresh investigation on every re-escalation —
+            # the whole point of this path is that the previous escalation did not
+            # resolve the underlying problem, so spawning one Claude turn per
+            # ``realert_s`` window is the desired cadence (not just first-fire-only).
+            # ``_escalate_to_claude`` is fire-and-forget; if Claude is busy the
+            # semaphore upstream will serialise the turn.
+            if self._escalate_to_claude is not None:
+                local_only_reason = (
+                    f" Hive peers {healthy_in_hive} have this component healthy, so the "
+                    f"normal hive-guard suppression has been holding back the alert; this "
+                    f"escalation breaks through after {round(local_only_threshold_s / 3600, 1)}h "
+                    f"because a local-only outage that nothing autonomous can fix is still an "
+                    f"outage worth investigating."
+                    if local_only_breakthrough
+                    else ""
+                )
+                reason = (
+                    f"{alert_label} re-escalation: {component} ({pod_name}) has been unhealthy "
+                    f"for {stuck_hours}h (consecutive_failures={consecutive_failures}, "
+                    f"phase={phase}, waiting_reason={waiting_reason or 'none'}, restarts={restarts}). "
+                    f"This is re-escalation #{fire_count} — earlier reflex/escalation did not fix "
+                    f"the root cause.{local_only_reason} Investigate logs/events/dependencies and "
+                    f"remediate. If the underlying issue is structural, file or revisit the "
+                    f"relevant bug issue."
+                )
+                spawn_background(
+                    self._escalate_to_claude(component, state, reason),
+                    name="immune.long_unhealthy_reescalation",
+                )
 
-        fire_count = int(tracker.get("fire_count") or 0) + 1
-        tracker["last_fired_at"] = now
-        tracker["fire_count"] = fire_count
+    # --- Immune Self-Health Watchdog ---
 
-        stale_min = round(stale_for / 60, 1)
-        last_known_healthy = state.get("healthy")
-        consecutive_failures = state.get("consecutive_failures", 0)
+    async def _check_immune_self_health(self, config: dict) -> None:
+        """Detect when the monitor's own view of a component has gone stale (#270).
 
-        log.error(
-            "Immune self-health: component check is stale",
-            extra={
+        All the other escalation paths in this file trust ``_component_health`` —
+        they decide what to do based on ``healthy``, ``consecutive_failures``,
+        ``last_state_change`` etc. If the loop that *writes* that state silently
+        stops for one component (an unhandled exception in a per-component
+        sub-task, an asyncio.gather swallowing an error, a task cancelled and not
+        restarted), every downstream check keeps reading stale data and the rest
+        of the immune surface can't tell the difference between "component is
+        really still in this state" and "we stopped looking days ago".
+
+        This watchdog catches that. If ``now - last_check`` exceeds
+        ``SELF_HEALTH_STALE_MULTIPLIER × _check_interval`` for any component, we
+        classify it as an immune-self-failure: the monitor itself is the broken
+        thing, the component's apparent state is untrustworthy. We alert (with a
+        cooldown so a wedged sub-task doesn't fire every tick) so Adi sees it
+        quickly, and we record an action so the divergence is visible in the
+        hive/recent-actions audit trail.
+
+        Deliberately *only* alerts. No reflex restart of immune itself — if the
+        process is half-wedged we don't want it making things worse by hitting
+        K8s with delete calls. Recovery of the monitor is left to the kubelet
+        liveness probe and to Adi (or a future Claude turn) acting on the alert.
+        """
+        if self._nc is None:
+            return
+
+        multiplier = config.get("self_health_stale_multiplier", SELF_HEALTH_STALE_MULTIPLIER)
+        realert_s = config.get("self_health_realert_interval_s", SELF_HEALTH_REALERT_INTERVAL_S)
+        threshold_s = max(multiplier * self._check_interval, 1.0)
+        now = time.time()
+
+        for component, state in list(self._component_health.items()):
+            last_check = state.get("last_check") or 0.0
+            if last_check == 0.0:
+                # Never been checked yet (e.g., during init). Not stale, just
+                # uninitialised; the regular path will fill it in.
+                self._self_health_alerted.pop(component, None)
+                continue
+
+            stale_for = now - last_check
+            if stale_for < threshold_s:
+                # Healthy: monitor is actively writing state for this component.
+                # Drop any tracker so the next wedge re-arms cleanly.
+                self._self_health_alerted.pop(component, None)
+                continue
+
+            tracker = self._self_health_alerted.get(component)
+            if tracker is None:
+                tracker = {
+                    "first_seen_stale_at": now,
+                    "last_check_when_stale": last_check,
+                    "last_fired_at": 0.0,
+                    "fire_count": 0,
+                }
+                self._self_health_alerted[component] = tracker
+
+            last_fired = tracker.get("last_fired_at") or 0.0
+            first_fire = last_fired == 0.0
+            if not first_fire and (now - last_fired) < realert_s:
+                continue
+
+            fire_count = int(tracker.get("fire_count") or 0) + 1
+            tracker["last_fired_at"] = now
+            tracker["fire_count"] = fire_count
+
+            stale_min = round(stale_for / 60, 1)
+            last_known_healthy = state.get("healthy")
+            consecutive_failures = state.get("consecutive_failures", 0)
+
+            log.error(
+                "Immune self-health: component check is stale",
+                extra={
+                    "component": component,
+                    "stale_for_s": round(stale_for, 1),
+                    "threshold_s": round(threshold_s, 1),
+                    "last_check_age_s": round(stale_for, 1),
+                    "last_known_healthy": last_known_healthy,
+                    "consecutive_failures": consecutive_failures,
+                    "fire_count": fire_count,
+                    "instance_id": self._instance_id,
+                },
+            )
+
+            await self._publish_alert(
+                f"IMMUNE-SELF-FAILURE: monitor stopped updating {component} {stale_min}min ago "
+                f"(threshold {round(threshold_s / 60, 1)}min = {multiplier}× poll interval "
+                f"{self._check_interval}s). Last-known state: healthy={last_known_healthy}, "
+                f"consecutive_failures={consecutive_failures}. Treat that state as untrustworthy "
+                f"— a downstream task likely died silently. Alert #{fire_count} from "
+                f"instance {self._instance_id}."
+            )
+
+            action = {
+                "type": "immune_self_failure",
                 "component": component,
                 "stale_for_s": round(stale_for, 1),
                 "threshold_s": round(threshold_s, 1),
-                "last_check_age_s": round(stale_for, 1),
                 "last_known_healthy": last_known_healthy,
                 "consecutive_failures": consecutive_failures,
                 "fire_count": fire_count,
-                "instance_id": _instance_id,
-            },
-        )
+                "instance_id": self._instance_id,
+                "timestamp": now,
+            }
+            self._recent_actions.append(action)
+            if len(self._recent_actions) > self._recent_actions_max:
+                self._recent_actions.pop(0)
+            self._schedule_persist()
+            try:
+                await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish immune self-failure action")
 
-        await _publish_alert(
-            f"IMMUNE-SELF-FAILURE: monitor stopped updating {component} {stale_min}min ago "
-            f"(threshold {round(threshold_s / 60, 1)}min = {multiplier}× poll interval "
-            f"{_check_interval}s). Last-known state: healthy={last_known_healthy}, "
-            f"consecutive_failures={consecutive_failures}. Treat that state as untrustworthy "
-            f"— a downstream task likely died silently. Alert #{fire_count} from "
-            f"instance {_instance_id}."
-        )
+    # --- Stuck-Component Auto-Recovery (Tier 3) ---
 
-        action = {
-            "type": "immune_self_failure",
-            "component": component,
-            "stale_for_s": round(stale_for, 1),
-            "threshold_s": round(threshold_s, 1),
-            "last_known_healthy": last_known_healthy,
-            "consecutive_failures": consecutive_failures,
-            "fire_count": fire_count,
-            "instance_id": _instance_id,
-            "timestamp": now,
-        }
-        _recent_actions.append(action)
-        if len(_recent_actions) > _recent_actions_max:
-            _recent_actions.pop(0)
-        _schedule_persist()
-        try:
-            await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
-        except Exception:
-            log.exception("Failed to publish immune self-failure action")
+    async def _check_stuck_recovery(self, config: dict) -> None:
+        """Automated ``delete pod`` for components stuck initializing past the recovery threshold.
 
+        Plugs the autonomy gap exposed by #264: maki-vault sat PodInitializing for
+        8+ days while the hive guard correctly suppressed pages (other sites had
+        healthy vault, so "local-only issue"), but "local-only" is not the same as
+        "ignore forever" — the broken local instance still needs to recover. The
+        restart reflex churns the pod every hour but cannot fix deeper issues
+        (stuck PVC binding, image pull failures, init container hangs); after a
+        full day of fruitless reflex churn, a fresh ``delete pod`` is usually the
+        only safe autonomous move. Kubelet recreates the pod from spec, the PVC
+        survives, and the new pod typically re-binds cleanly.
 
-# --- Stuck-Component Auto-Recovery (Tier 3) ---
+        Distinct from ``_trigger_reflex`` (which fires every few minutes once a
+        pod is unhealthy) and ``_check_stuck_components`` (which only escalates
+        via alert/Claude). This is the heavier, slower-fire safety net for the
+        case both of those have already failed to recover the pod.
 
+        Safety gates (the "more deliberate gate than reflex restart" the issue
+        asks for):
 
-async def _check_stuck_recovery(config: dict) -> None:
-    """Automated ``delete pod`` for components stuck initializing past the recovery threshold.
+        - **Opt-in allowlist** — only components in the allowlist participate.
+          Default is ``maki-vault``; other single-replica stateful components
+          can be added once we've confirmed ``delete pod`` is safe for them.
+        - **Long threshold** — default 24h, far beyond any normal recovery
+          window. By this point reflex has tried ~72 times and gotten nowhere.
+        - **Hive sanity check** — only act when at least one peer site has the
+          component healthy. That proves the recipe (image, config, manifest)
+          works, so this really is a local-only issue worth fixing autonomously.
+          A system-wide outage (no healthy peers) is left to human judgment.
+        - **Cooldown** — once we delete, we don't try again for
+          ``stuck_recovery_cooldown_s`` (default 6h), giving the rescheduled
+          pod a full window to either recover or re-wedge before another attempt.
+        - **Per-incident tracker** — re-arms cleanly when ``last_state_change``
+          advances, so a recover-and-fail-again cycle gets a fresh budget.
+        """
+        if self._nc is None or self._k8s_v1 is None:
+            return
 
-    Plugs the autonomy gap exposed by #264: maki-vault sat PodInitializing for
-    8+ days while the hive guard correctly suppressed pages (other sites had
-    healthy vault, so "local-only issue"), but "local-only" is not the same as
-    "ignore forever" — the broken local instance still needs to recover. The
-    restart reflex churns the pod every hour but cannot fix deeper issues
-    (stuck PVC binding, image pull failures, init container hangs); after a
-    full day of fruitless reflex churn, a fresh ``delete pod`` is usually the
-    only safe autonomous move. Kubelet recreates the pod from spec, the PVC
-    survives, and the new pod typically re-binds cleanly.
+        threshold = config.get("stuck_recovery_threshold_s", STUCK_RECOVERY_THRESHOLD_S)
+        cooldown = config.get("stuck_recovery_cooldown_s", STUCK_RECOVERY_COOLDOWN_S)
+        allowlist_raw = config.get("stuck_recovery_allowlist", STUCK_RECOVERY_ALLOWLIST_DEFAULT)
+        allowlist = {c.strip() for c in (allowlist_raw or "").split(",") if c.strip()}
 
-    Distinct from ``_trigger_reflex`` (which fires every few minutes once a
-    pod is unhealthy) and ``_check_stuck_components`` (which only escalates
-    via alert/Claude). This is the heavier, slower-fire safety net for the
-    case both of those have already failed to recover the pod.
+        if not allowlist:
+            return
 
-    Safety gates (the "more deliberate gate than reflex restart" the issue
-    asks for):
+        now = time.time()
 
-    - **Opt-in allowlist** — only components in the allowlist participate.
-      Default is ``maki-vault``; other single-replica stateful components
-      can be added once we've confirmed ``delete pod`` is safe for them.
-    - **Long threshold** — default 24h, far beyond any normal recovery
-      window. By this point reflex has tried ~72 times and gotten nowhere.
-    - **Hive sanity check** — only act when at least one peer site has the
-      component healthy. That proves the recipe (image, config, manifest)
-      works, so this really is a local-only issue worth fixing autonomously.
-      A system-wide outage (no healthy peers) is left to human judgment.
-    - **Cooldown** — once we delete, we don't try again for
-      ``stuck_recovery_cooldown_s`` (default 6h), giving the rescheduled
-      pod a full window to either recover or re-wedge before another attempt.
-    - **Per-incident tracker** — re-arms cleanly when ``last_state_change``
-      advances, so a recover-and-fail-again cycle gets a fresh budget.
-    """
-    if _nc is None or _k8s_v1 is None:
-        return
+        for component, state in list(self._component_health.items()):
+            if component not in allowlist:
+                continue
 
-    threshold = config.get("stuck_recovery_threshold_s", STUCK_RECOVERY_THRESHOLD_S)
-    cooldown = config.get("stuck_recovery_cooldown_s", STUCK_RECOVERY_COOLDOWN_S)
-    allowlist_raw = config.get("stuck_recovery_allowlist", STUCK_RECOVERY_ALLOWLIST_DEFAULT)
-    allowlist = {c.strip() for c in (allowlist_raw or "").split(",") if c.strip()}
+            if state["healthy"]:
+                self._stuck_recovery_attempts.pop(component, None)
+                continue
 
-    if not allowlist:
-        return
+            details = state.get("details", {})
+            phase = details.get("phase")
+            waiting_reason = details.get("waiting_reason")
 
-    now = time.time()
+            # Same shape-check as ``_check_stuck_components``: only the never-
+            # finishes-initializing / non-Running pod case. A Running+ready=False
+            # pod is a different failure mode that should be handled by HTTP-level
+            # remediation, not a blind delete (the pod is at least up enough to
+            # answer probes — deleting it might destroy in-flight state).
+            is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
+            if not is_pod_stuck:
+                self._stuck_recovery_attempts.pop(component, None)
+                continue
 
-    for component, state in list(_component_health.items()):
-        if component not in allowlist:
-            continue
+            stuck_for = now - state["last_state_change"]
+            if stuck_for < threshold:
+                continue
 
-        if state["healthy"]:
-            _stuck_recovery_attempts.pop(component, None)
-            continue
+            # Hive sanity check: only act when at least one peer reports healthy.
+            # If no peer has this component working, this is either a system-wide
+            # outage or a brand-new component nobody's running yet — either way,
+            # blindly deleting our local pod is not the right autonomous move.
+            # Note the polarity flip vs ``_check_stuck_components``: that path
+            # *suppresses* on healthy peers (don't page about local-only issues);
+            # this path *requires* healthy peers (only act when we're confident
+            # the recipe works elsewhere).
+            healthy_peers = self.component_healthy_in_hive(component)
+            if not healthy_peers:
+                log.warning(
+                    "Stuck recovery threshold crossed but no healthy peers — skipping (system-wide issue)",
+                    extra={"component": component, "stuck_for_hours": round(stuck_for / 3600, 1)},
+                )
+                continue
 
-        details = state.get("details", {})
-        phase = details.get("phase")
-        waiting_reason = details.get("waiting_reason")
+            incident = state["last_state_change"]
+            tracker = self._stuck_recovery_attempts.get(component)
+            if tracker is None or tracker.get("incident") != incident:
+                tracker = {"incident": incident, "last_attempted_at": 0.0, "count": 0}
+                self._stuck_recovery_attempts[component] = tracker
 
-        # Same shape-check as ``_check_stuck_components``: only the never-
-        # finishes-initializing / non-Running pod case. A Running+ready=False
-        # pod is a different failure mode that should be handled by HTTP-level
-        # remediation, not a blind delete (the pod is at least up enough to
-        # answer probes — deleting it might destroy in-flight state).
-        is_pod_stuck = (phase is not None and phase != "Running") or waiting_reason is not None
-        if not is_pod_stuck:
-            _stuck_recovery_attempts.pop(component, None)
-            continue
+            last_attempted = tracker.get("last_attempted_at") or 0.0
+            if last_attempted and (now - last_attempted) < cooldown:
+                continue
 
-        stuck_for = now - state["last_state_change"]
-        if stuck_for < threshold:
-            continue
+            pod_name = details.get("pod_name")
+            if not pod_name:
+                continue
 
-        # Hive sanity check: only act when at least one peer reports healthy.
-        # If no peer has this component working, this is either a system-wide
-        # outage or a brand-new component nobody's running yet — either way,
-        # blindly deleting our local pod is not the right autonomous move.
-        # Note the polarity flip vs ``_check_stuck_components``: that path
-        # *suppresses* on healthy peers (don't page about local-only issues);
-        # this path *requires* healthy peers (only act when we're confident
-        # the recipe works elsewhere).
-        healthy_peers = component_healthy_in_hive(component)
-        if not healthy_peers:
-            log.warning(
-                "Stuck recovery threshold crossed but no healthy peers — skipping (system-wide issue)",
-                extra={"component": component, "stuck_for_hours": round(stuck_for / 3600, 1)},
-            )
-            continue
+            stuck_hours = round(stuck_for / 3600, 1)
+            try:
+                async with self._infra_lock("immune-stuck-recovery", ttl=60):
+                    try:
+                        await asyncio.to_thread(
+                            self._k8s_v1.delete_namespaced_pod,
+                            name=pod_name,
+                            namespace=self._namespace,
+                            grace_period_seconds=30,
+                        )
 
-        incident = state["last_state_change"]
-        tracker = _stuck_recovery_attempts.get(component)
-        if tracker is None or tracker.get("incident") != incident:
-            tracker = {"incident": incident, "last_attempted_at": 0.0, "count": 0}
-            _stuck_recovery_attempts[component] = tracker
+                        count = int(tracker.get("count") or 0) + 1
+                        tracker["last_attempted_at"] = now
+                        tracker["count"] = count
 
-        last_attempted = tracker.get("last_attempted_at") or 0.0
-        if last_attempted and (now - last_attempted) < cooldown:
-            continue
+                        log.error(
+                            "Stuck-recovery pod delete fired",
+                            extra={
+                                "component": component,
+                                "pod_name": pod_name,
+                                "stuck_for_hours": stuck_hours,
+                                "attempt_count": count,
+                                "healthy_peers": healthy_peers,
+                                "phase": phase,
+                                "waiting_reason": waiting_reason,
+                            },
+                        )
 
-        pod_name = details.get("pod_name")
-        if not pod_name:
-            continue
+                        await self._publish_alert(
+                            f"AUTO-RECOVERY: deleted {pod_name} after {stuck_hours}h stuck in "
+                            f"phase={phase}/{waiting_reason or 'unhealthy'}. Hive shows healthy "
+                            f"peers on {healthy_peers} so this is a local-only wedge safe to act on. "
+                            f"Attempt #{count}; kubelet will recreate from spec."
+                        )
 
-        stuck_hours = round(stuck_for / 3600, 1)
-        try:
-            async with _infra_lock("immune-stuck-recovery", ttl=60):
-                try:
-                    await asyncio.to_thread(
-                        _k8s_v1.delete_namespaced_pod,
-                        name=pod_name,
-                        namespace=_namespace,
-                        grace_period_seconds=30,
-                    )
-
-                    count = int(tracker.get("count") or 0) + 1
-                    tracker["last_attempted_at"] = now
-                    tracker["count"] = count
-
-                    log.error(
-                        "Stuck-recovery pod delete fired",
-                        extra={
+                        action = {
+                            "type": "stuck_recovery_delete",
                             "component": component,
                             "pod_name": pod_name,
                             "stuck_for_hours": stuck_hours,
@@ -1510,148 +1513,126 @@ async def _check_stuck_recovery(config: dict) -> None:
                             "healthy_peers": healthy_peers,
                             "phase": phase,
                             "waiting_reason": waiting_reason,
-                        },
-                    )
-
-                    await _publish_alert(
-                        f"AUTO-RECOVERY: deleted {pod_name} after {stuck_hours}h stuck in "
-                        f"phase={phase}/{waiting_reason or 'unhealthy'}. Hive shows healthy "
-                        f"peers on {healthy_peers} so this is a local-only wedge safe to act on. "
-                        f"Attempt #{count}; kubelet will recreate from spec."
-                    )
-
-                    action = {
-                        "type": "stuck_recovery_delete",
-                        "component": component,
-                        "pod_name": pod_name,
-                        "stuck_for_hours": stuck_hours,
-                        "attempt_count": count,
-                        "healthy_peers": healthy_peers,
-                        "phase": phase,
-                        "waiting_reason": waiting_reason,
-                        "timestamp": now,
-                    }
-                    _recent_actions.append(action)
-                    if len(_recent_actions) > _recent_actions_max:
-                        _recent_actions.pop(0)
-                    _schedule_persist()
-                    try:
-                        await _nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+                            "timestamp": now,
+                        }
+                        self._recent_actions.append(action)
+                        if len(self._recent_actions) > self._recent_actions_max:
+                            self._recent_actions.pop(0)
+                        self._schedule_persist()
+                        try:
+                            await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+                        except Exception:
+                            log.exception("Failed to publish stuck-recovery action")
                     except Exception:
-                        log.exception("Failed to publish stuck-recovery action")
-                except Exception:
-                    log.exception("Failed to delete stuck pod", extra={"pod_name": pod_name})
-        except LockNotAcquired:
-            log.warning("Cannot acquire lock for stuck recovery", extra={"component": component})
-            continue
-
-
-# --- Gossip Ring ---
-
-
-async def _refresh_running_images():
-    """Query K8s for current image tags on all maki deployments/statefulsets."""
-    if not _k8s_apps_v1:
-        return
-    images: dict[str, str] = {}
-    try:
-        deps = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_deployment, namespace=_namespace)
-        for dep in deps.items:
-            name = dep.metadata.name
-            if not name.startswith("maki-") or name == "maki-nerve-nats-box":
+                        log.exception("Failed to delete stuck pod", extra={"pod_name": pod_name})
+            except LockNotAcquired:
+                log.warning("Cannot acquire lock for stuck recovery", extra={"component": component})
                 continue
-            img = dep.spec.template.spec.containers[0].image
-            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
-    except Exception:
-        log.exception("Failed to refresh deployment images")
 
-    try:
-        sts_list = await asyncio.to_thread(_k8s_apps_v1.list_namespaced_stateful_set, namespace=_namespace)
-        for sts in sts_list.items:
-            name = sts.metadata.name
-            if not name.startswith("maki-"):
-                continue
-            img = sts.spec.template.spec.containers[0].image
-            if "ghcr.io" not in img:
-                continue
-            images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
-    except Exception:
-        log.exception("Failed to refresh statefulset images")
+    # --- Gossip Ring ---
 
-    if images:
-        _running_images.clear()
-        _running_images.update(images)
-
-
-async def gossip_publisher():
-    """Broadcast local state to all immune instances via NATS gossip."""
-    log.info("Gossip publisher started", extra={"site": _site_name, "interval": _check_interval})
-    while True:
+    async def _refresh_running_images(self) -> None:
+        """Query K8s for current image tags on all maki deployments/statefulsets."""
+        if not self._k8s_apps_v1:
+            return
+        images: dict[str, str] = {}
         try:
-            await _refresh_running_images()
-            # Load cortex config (chat_model etc.) for gossip
-            try:
-                cortex_config = await load_kv_config(_cortex_config_kv, {})
-            except Exception:
-                cortex_config = {}
-
-            payload = {
-                "site": _site_name,
-                "instance_id": _instance_id,
-                "timestamp": time.time(),
-                "component_health": {
-                    k: {"healthy": v["healthy"], "consecutive_failures": v["consecutive_failures"]}
-                    for k, v in _component_health.items()
-                },
-                "recent_actions": _recent_actions[-10:],
-                "cortex": {
-                    "last_heartbeat_age_s": round(time.time() - _cortex_state["last_heartbeat"], 1)
-                    if _cortex_state["last_heartbeat"]
-                    else None,
-                    "active_turn": _cortex_state["active_turn"],
-                    "turn_mode": _cortex_state["turn_mode"],
-                },
-                "cortex_config": cortex_config,
-                "token_usage_today": {
-                    "date": _token_stats["date"],
-                    "total_tokens": _token_stats["total_tokens"],
-                    "total_cost_usd": round(_token_stats["total_cost_usd"], 4),
-                    "turns": _token_stats["turns"],
-                    "by_model": _token_stats["by_model"],
-                },
-                "blacklist": list(_failed_image_blacklist),
-                "images": dict(_running_images),
-            }
-            await _nc.publish(IMMUNE_HEALTH, json.dumps(payload).encode())
+            deps = await asyncio.to_thread(self._k8s_apps_v1.list_namespaced_deployment, namespace=self._namespace)
+            for dep in deps.items:
+                name = dep.metadata.name
+                if not name.startswith("maki-") or name == "maki-nerve-nats-box":
+                    continue
+                img = dep.spec.template.spec.containers[0].image
+                images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
         except Exception:
-            log.exception("Gossip publish failed")
-        await asyncio.sleep(_check_interval)
+            log.exception("Failed to refresh deployment images")
 
+        try:
+            sts_list = await asyncio.to_thread(
+                self._k8s_apps_v1.list_namespaced_stateful_set, namespace=self._namespace
+            )
+            for sts in sts_list.items:
+                name = sts.metadata.name
+                if not name.startswith("maki-"):
+                    continue
+                img = sts.spec.template.spec.containers[0].image
+                if "ghcr.io" not in img:
+                    continue
+                images[name] = img.rsplit(":", 1)[-1] if ":" in img else "latest"
+        except Exception:
+            log.exception("Failed to refresh statefulset images")
 
-async def _handle_gossip(msg) -> None:
-    payload = json.loads(msg.data.decode())
-    site = payload.get("site", "unknown")
-    if site == _site_name:
-        return
+        if images:
+            self._running_images.clear()
+            self._running_images.update(images)
 
-    was_new = site not in _hive_state
-    _hive_state[site] = {**payload, "received_at": time.time()}
+    async def gossip_publisher(self) -> None:
+        """Broadcast local state to all immune instances via NATS gossip."""
+        log.info("Gossip publisher started", extra={"site": self._site_name, "interval": self._check_interval})
+        while True:
+            try:
+                await self._refresh_running_images()
+                # Load cortex config (chat_model etc.) for gossip
+                try:
+                    cortex_config = await load_kv_config(self._cortex_config_kv, {})
+                except Exception:
+                    cortex_config = {}
 
-    if was_new:
-        log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
+                payload = {
+                    "site": self._site_name,
+                    "instance_id": self._instance_id,
+                    "timestamp": time.time(),
+                    "component_health": {
+                        k: {"healthy": v["healthy"], "consecutive_failures": v["consecutive_failures"]}
+                        for k, v in self._component_health.items()
+                    },
+                    "recent_actions": self._recent_actions[-10:],
+                    "cortex": {
+                        "last_heartbeat_age_s": round(time.time() - self._cortex_state["last_heartbeat"], 1)
+                        if self._cortex_state["last_heartbeat"]
+                        else None,
+                        "active_turn": self._cortex_state["active_turn"],
+                        "turn_mode": self._cortex_state["turn_mode"],
+                    },
+                    "cortex_config": cortex_config,
+                    "token_usage_today": {
+                        "date": self._token_stats["date"],
+                        "total_tokens": self._token_stats["total_tokens"],
+                        "total_cost_usd": round(self._token_stats["total_cost_usd"], 4),
+                        "turns": self._token_stats["turns"],
+                        "by_model": self._token_stats["by_model"],
+                    },
+                    "blacklist": list(self._failed_image_blacklist),
+                    "images": dict(self._running_images),
+                }
+                await self._nc.publish(IMMUNE_HEALTH, json.dumps(payload).encode())
+            except Exception:
+                log.exception("Gossip publish failed")
+            await asyncio.sleep(self._check_interval)
 
-    now = time.time()
-    stale = [s for s, v in _hive_state.items() if now - v["received_at"] > _gossip_stale_threshold]
-    for s in stale:
-        log.warning("Peer went silent, pruning", extra={"site": s})
-        del _hive_state[s]
+    async def _handle_gossip(self, msg) -> None:
+        payload = json.loads(msg.data.decode())
+        site = payload.get("site", "unknown")
+        if site == self._site_name:
+            return
 
+        was_new = site not in self._hive_state
+        self._hive_state[site] = {**payload, "received_at": time.time()}
 
-async def gossip_listener():
-    """Subscribe to gossip from all immune instances, build hive-wide state."""
-    await subscribe_supervised(
-        _nc,
-        IMMUNE_HEALTH,
-        _handle_gossip,
-        name="gossip",
-    )
+        if was_new:
+            log.info("Peer joined hive", extra={"site": site, "instance_id": payload.get("instance_id")})
+
+        now = time.time()
+        stale = [s for s, v in self._hive_state.items() if now - v["received_at"] > self._gossip_stale_threshold]
+        for s in stale:
+            log.warning("Peer went silent, pruning", extra={"site": s})
+            del self._hive_state[s]
+
+    async def gossip_listener(self) -> None:
+        """Subscribe to gossip from all immune instances, build hive-wide state."""
+        await subscribe_supervised(
+            self._nc,
+            IMMUNE_HEALTH,
+            self._handle_gossip,
+            name="gossip",
+        )

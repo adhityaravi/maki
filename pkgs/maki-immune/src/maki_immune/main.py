@@ -47,9 +47,9 @@ from maki_common.subjects import (
     RESTART_REQUEST,
 )
 
-from maki_immune import claude as claude_mod
-from maki_immune import deploy as deploy_mod
-from maki_immune import health as health_mod
+from maki_immune.claude import ImmuneClaudeReasoner
+from maki_immune.deploy import ImmuneDeployCoordinator
+from maki_immune.health import ImmuneHealthMonitor
 from maki_immune.lock import infra_lock as _infra_lock_impl
 
 configure_logging()
@@ -299,6 +299,13 @@ _health_monitor_task: asyncio.Task | None = None
 # the readiness probe must flip red so kubelet restarts the pod (issue #175).
 _critical_listener_tasks: dict[str, asyncio.Task] = {}
 
+# The three subsystem instances (#102/#167). Constructed in :func:`main` after
+# NATS + KV + K8s handles are ready. Kept as module-level so the state-request
+# handlers and readiness probe can reach the monitor's ``get_last_incident_time``.
+_deploy_coordinator: ImmuneDeployCoordinator | None = None
+_claude_reasoner: ImmuneClaudeReasoner | None = None
+_health_monitor: ImmuneHealthMonitor | None = None
+
 
 def _liveness_check() -> tuple[bool, str | None]:
     """Return (ok, reason) for the ``/live`` liveness probe.
@@ -479,7 +486,7 @@ async def _state_request_handler(msg):
             "cortex_active_turn": _cortex_state["active_turn"],
             "cortex_turn_mode": _cortex_state["turn_mode"],
             "cortex_turn_started": _cortex_state["turn_started"],
-            "last_incident_time": health_mod.get_last_incident_time(),
+            "last_incident_time": _health_monitor.get_last_incident_time() if _health_monitor else 0,
             "site_name": SITE_NAME,
             "hive_state": _hive_state,
             "images": dict(_running_images),
@@ -785,8 +792,13 @@ async def main():
     )
     log.info("Immune MCP tools registered")
 
-    # Initialize modules
-    deploy_mod.init(
+    # Construct the three subsystem instances (#102/#167). The reasoner is
+    # built before the health monitor so we can hand its bound
+    # ``escalate_to_claude`` method in as the monitor's escalation callback —
+    # explicit dependency injection instead of the old
+    # ``escalate_to_claude=claude_mod.escalate_to_claude`` global-lookup trick.
+    global _deploy_coordinator, _claude_reasoner, _health_monitor
+    _deploy_coordinator = ImmuneDeployCoordinator(
         nc=_nc,
         js=_js,
         k8s_v1=_k8s_v1,
@@ -804,9 +816,9 @@ async def main():
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
     )
-    await deploy_mod.load_deploy_history()
+    await _deploy_coordinator.load_deploy_history()
 
-    claude_mod.init(
+    _claude_reasoner = ImmuneClaudeReasoner(
         nc=_nc,
         namespace=NAMESPACE,
         instance_id=INSTANCE_ID,
@@ -834,7 +846,7 @@ async def main():
         lock_kv=_lock_kv,
     )
 
-    health_mod.init(
+    _health_monitor = ImmuneHealthMonitor(
         nc=_nc,
         k8s_v1=_k8s_v1,
         k8s_apps_v1=_k8s_apps_v1,
@@ -860,7 +872,7 @@ async def main():
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
-        escalate_to_claude=claude_mod.escalate_to_claude,
+        escalate_to_claude=_claude_reasoner.escalate_to_claude,
     )
 
     # Subscriptions
@@ -877,19 +889,19 @@ async def main():
     await _nc.subscribe(IMMUNE_LOGS_REQUEST, queue="maki-immune", cb=_logs_request_handler)
     log.info("Subscribed", extra={"subject": IMMUNE_LOGS_REQUEST})
 
-    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_request_handler)
+    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=_deploy_coordinator.deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
 
-    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_status_handler)
+    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=_deploy_coordinator.deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
 
-    await _nc.subscribe(RESTART_REQUEST, queue="maki-immune", cb=deploy_mod.restart_request_handler)
+    await _nc.subscribe(RESTART_REQUEST, queue="maki-immune", cb=_deploy_coordinator.restart_request_handler)
     log.info("Subscribed", extra={"subject": RESTART_REQUEST})
 
-    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=claude_mod.cortex_stuck_handler)
+    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=_claude_reasoner.cortex_stuck_handler)
     log.info("Subscribed", extra={"subject": CORTEX_STUCK})
 
-    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=claude_mod.handle_immune_command)
+    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=_claude_reasoner.handle_immune_command)
     log.info("Subscribed", extra={"subject": IMMUNE_COMMAND})
 
     # Background tasks (tracked in ``_critical_listener_tasks`` so the
@@ -897,29 +909,29 @@ async def main():
     # ``spawn_background`` also anchors each task against GC and logs any
     # uncaught exception (issue #123).
     _critical_listener_tasks["deploy_propagate"] = spawn_background(
-        deploy_mod.deploy_propagate_listener(), name="deploy_propagate_listener"
+        _deploy_coordinator.deploy_propagate_listener(), name="deploy_propagate_listener"
     )
     log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
 
     _critical_listener_tasks["restart_propagate"] = spawn_background(
-        deploy_mod.restart_propagate_listener(), name="restart_propagate_listener"
+        _deploy_coordinator.restart_propagate_listener(), name="restart_propagate_listener"
     )
     log.info("Started JetStream restart propagation listener", extra={"subject": RESTART_PROPAGATE})
 
-    _health_monitor_task = spawn_background(health_mod.health_monitor_loop(), name="immune.health_monitor_loop")
-    spawn_background(claude_mod.immune_heartbeat_loop(), name="immune.heartbeat_loop")
-    spawn_background(claude_mod.passive_log_monitor_loop(), name="immune.passive_log_monitor_loop")
-    spawn_background(claude_mod.loop_heartbeat_watcher(), name="immune.loop_heartbeat_watcher")
+    _health_monitor_task = spawn_background(_health_monitor.health_monitor_loop(), name="immune.health_monitor_loop")
+    spawn_background(_claude_reasoner.immune_heartbeat_loop(), name="immune.heartbeat_loop")
+    spawn_background(_claude_reasoner.passive_log_monitor_loop(), name="immune.passive_log_monitor_loop")
+    spawn_background(_claude_reasoner.loop_heartbeat_watcher(), name="immune.loop_heartbeat_watcher")
     # Track these supervised listeners so the readiness probe can fail if any
     # of them dies — see ``_critical_listener_tasks`` and #175.
     _critical_listener_tasks["cortex_heartbeat"] = spawn_background(
-        health_mod.cortex_heartbeat_listener(), name="cortex_heartbeat_listener"
+        _health_monitor.cortex_heartbeat_listener(), name="cortex_heartbeat_listener"
     )
     _critical_listener_tasks["token_usage"] = spawn_background(
-        health_mod.token_usage_listener(), name="token_usage_listener"
+        _health_monitor.token_usage_listener(), name="token_usage_listener"
     )
-    _critical_listener_tasks["gossip"] = spawn_background(health_mod.gossip_listener(), name="gossip_listener")
-    spawn_background(health_mod.gossip_publisher(), name="immune.gossip_publisher")
+    _critical_listener_tasks["gossip"] = spawn_background(_health_monitor.gossip_listener(), name="gossip_listener")
+    spawn_background(_health_monitor.gossip_publisher(), name="immune.gossip_publisher")
 
     server = await tcp_health_server(
         port=HEALTH_PORT,
