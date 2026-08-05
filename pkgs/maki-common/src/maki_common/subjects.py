@@ -41,8 +41,12 @@ MEMORY_STORE = "maki.memory.store"
 CONVERSATION_STREAM = "maki.conversation"
 
 # Trading
+# TRADING_SIGNAL (maki.trading.signal) was removed in #168 — the automated
+# trading loop that used to publish it lived in the deleted maki_loops repo,
+# so the subject had zero publishers left. The manual-trade path
+# (TRADING_MANUAL_TRADE) and cortex tool-request path (TRADING_TOOL_REQUEST)
+# are both still live; the broader excise-vs-revive question is #242.
 TRADING_MANUAL_TRADE = "maki.trading.manual_trade"
-TRADING_SIGNAL = "maki.trading.signal"
 TRADING_TOOL_REQUEST = "maki.trading.tool"
 
 # Generic DB query

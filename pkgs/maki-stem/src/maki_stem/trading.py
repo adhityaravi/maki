@@ -1,9 +1,17 @@
 """Trading-specific NATS listeners for maki-stem.
 
-Keeps trade signal persistence, ``!trade`` command handling, and cortex
-tool dispatch out of ``main.py``. Dependencies (NATS connection, DB pool,
-KV handles, tool registries) are passed in by the caller rather than
-pulled from module globals, mirroring ``maki_ears.trading``.
+Keeps ``!trade`` command handling and cortex tool dispatch out of
+``main.py``. Dependencies (NATS connection, KV handles, tool
+registries) are passed in by the caller rather than pulled from module
+globals, mirroring ``maki_ears.trading``.
+
+Historical note: this module used to also host ``trading_signal_listener``,
+which persisted accepted trade signals from the automated trading loop into
+the ``trade_signals`` PostgreSQL table. That loop lived in the now-deleted
+``maki_loops`` repo, leaving the listener with zero publishers of
+``TRADING_SIGNAL`` — it was removed in #168. The ``trade_signals`` table
+is kept for historical rows; the broader excise-vs-revive question for
+the remainder of the trading subsystem is tracked in #242.
 """
 
 from __future__ import annotations
@@ -15,7 +23,6 @@ from maki_common import subscribe_supervised
 from maki_common.subjects import (
     EARS_OUT,
     TRADING_MANUAL_TRADE,
-    TRADING_SIGNAL,
     TRADING_TOOL_REQUEST,
 )
 
@@ -28,65 +35,6 @@ log = logging.getLogger(__name__)
 # request. Broadcast/fan-out listeners intentionally omit it — see the
 # comment at each subscribe site.
 STEM_QUEUE = "maki-stem"
-
-
-# ── Trade signal persistence ─────────────────────────────────────────────────
-
-
-async def trading_signal_listener(nc, db_pool) -> None:
-    """Persist accepted trade signals to maki-vault (PostgreSQL).
-
-    Subscribes to TRADING_SIGNAL, published by the trading loop after a
-    proposal is accepted. Inserts into the ``trade_signals`` table.
-
-    Wrapped in ``subscribe_supervised`` so a NATS reconnect / stream drain
-    re-subscribes instead of silently dropping every subsequent accepted
-    trade (issue #175).
-    """
-
-    async def _handle(msg) -> None:
-        try:
-            data = json.loads(msg.data.decode())
-
-            # Map direction: buy→long, sell→short
-            direction = data.get("direction", "")
-            db_direction = "long" if direction == "buy" else "short"
-
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO trade_signals (
-                        trade_id, asset, asset_type, direction, entry_price,
-                        position_size_pct, composite_score,
-                        sentiment_score, indicator_snapshot,
-                        paper, status, accepted_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'accepted', now())
-                    """,
-                    data.get("trade_id"),
-                    data.get("asset"),
-                    data.get("asset_type", "crypto"),
-                    db_direction,
-                    float(data.get("entry_price", 0)),
-                    float(data.get("position_size_eur", 0) or data.get("position_size_pct", 0)),
-                    float(data.get("composite_score", 0)),
-                    float(data.get("sentiment_score", 0)) if data.get("sentiment_score") is not None else None,
-                    json.dumps(data.get("indicator_snapshot")) if data.get("indicator_snapshot") else None,
-                    data.get("paper", True),
-                )
-            log.info(
-                "Trade signal persisted",
-                extra={"trade_id": data.get("trade_id"), "asset": data.get("asset")},
-            )
-        except Exception:
-            log.exception("Failed to persist trade signal")
-
-    await subscribe_supervised(
-        nc,
-        TRADING_SIGNAL,
-        _handle,
-        queue=STEM_QUEUE,
-        name="stem.trading_signal",
-    )
 
 
 # ── !trade command dispatch ──────────────────────────────────────────────────

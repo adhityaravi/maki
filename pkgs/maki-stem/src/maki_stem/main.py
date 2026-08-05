@@ -65,7 +65,6 @@ from maki_stem.system_state import format_system_state, gather_system_state
 from maki_stem.time_windows import in_quiet_hours, in_work_hours
 from maki_stem.trading import (
     trading_manual_listener,
-    trading_signal_listener,
     trading_tool_listener,
 )
 
@@ -237,9 +236,6 @@ async def lifespan(app: FastAPI):
     )
     _critical_listener_tasks["pattern_write"] = asyncio.create_task(
         pattern_write_listener(_nc, _db_pool, queue=STEM_QUEUE), name="stem.pattern_write_listener"
-    )
-    _critical_listener_tasks["trading_signal"] = asyncio.create_task(
-        trading_signal_listener(_nc, _db_pool), name="stem.trading_signal_listener"
     )
     _critical_listener_tasks["trading_manual"] = asyncio.create_task(
         trading_manual_listener(_nc, _lock_kv), name="stem.trading_manual_listener"
