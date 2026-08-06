@@ -306,6 +306,39 @@ async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
         log.exception("Failed to publish token usage", extra={"turn_id": turn_id})
 
 
+async def _publish_response(
+    nc,
+    turn_id: str,
+    response: str,
+    *,
+    done: bool,
+    cancelled: bool = False,
+    reason: str | None = None,
+    log_fail_msg: str = "Failed to publish turn response",
+) -> None:
+    """Publish a CORTEX_TURN_RESPONSE envelope with uniform error handling.
+
+    One source of truth for the response envelope shape and failure behaviour.
+    Every path (success, stream chunk, stream end, timeout, preemption, silent
+    error, user-visible error) funnels through here so a publish failure inside
+    an outer error handler can no longer re-raise and take down the handler.
+    See issue #171.
+
+    ``_turn_response`` still handles stamping ``instance_id`` on every payload
+    (issue #394) — this helper builds the base envelope and delegates encoding
+    to it so per-instance cancellation keeps working from every publish site.
+    """
+    payload = {"turn_id": turn_id, "response": response, "done": done}
+    if cancelled:
+        payload["cancelled"] = True
+    if reason:
+        payload["reason"] = reason
+    try:
+        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(payload))
+    except Exception:
+        log.exception(log_fail_msg, extra={"turn_id": turn_id})
+
+
 def build_system_prompt(turn: dict) -> str:
     """Assemble system prompt from turn payload.
 
@@ -516,8 +549,7 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 "response_len": len(response_text or ""),
             },
         )
-        response = {"turn_id": turn_id, "response": response_text, "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(response))
+        await _publish_response(nc, turn_id, response_text, done=True)
         log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
         await _publish_token_usage(nc, turn_id, usage)
     else:
@@ -544,13 +576,11 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 usage_out=usage_out,
                 system_prompt=static_context or None,
             ):
-                response = {"turn_id": turn_id, "response": chunk, "done": False}
-                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(response))
+                await _publish_response(nc, turn_id, chunk, done=False)
                 log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
 
         # Signal done
-        done_msg = {"turn_id": turn_id, "response": "", "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
+        await _publish_response(nc, turn_id, "", done=True)
         log.info(
             "Turn stream complete",
             extra={
@@ -644,25 +674,26 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "timeout_s": CORTEX_MAX_TURN_SECONDS,
                 },
             )
-            try:
-                done_msg = {
-                    "turn_id": turn_id,
-                    "response": "",
-                    "done": True,
-                    "cancelled": True,
-                    "reason": "cortex_turn_timeout",
-                }
-                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
-            except Exception:
-                log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
+            await _publish_response(
+                nc,
+                turn_id,
+                "",
+                done=True,
+                cancelled=True,
+                reason="cortex_turn_timeout",
+                log_fail_msg="Failed to publish timeout done signal",
+            )
 
         except asyncio.CancelledError:
             log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
-            done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
-            try:
-                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
-            except Exception:
-                log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
+            await _publish_response(
+                nc,
+                turn_id,
+                "",
+                done=True,
+                cancelled=True,
+                log_fail_msg="Failed to publish preemption done signal",
+            )
             # Re-raise so the cancelling caller sees the cancellation propagate.
             raise
 
@@ -676,16 +707,15 @@ async def handle_turn_request(msg, nc, mcp_server):
                     extra={"turn_id": turn_id, "error": str(exc)[:200]},
                 )
                 # Still send done signal so ears cleans up, but with empty response
-                done_msg = {"turn_id": turn_id, "response": "", "done": True}
-                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
+                await _publish_response(nc, turn_id, "", done=True)
             else:
                 # Genuine unexpected error — send a brief message
-                error_response = {
-                    "turn_id": turn_id,
-                    "response": "Something went wrong on my end. I'll try again next turn.",
-                    "done": True,
-                }
-                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(error_response))
+                await _publish_response(
+                    nc,
+                    turn_id,
+                    "Something went wrong on my end. I'll try again next turn.",
+                    done=True,
+                )
         finally:
             _turn_state.clear()
 
