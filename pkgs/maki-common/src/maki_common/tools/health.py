@@ -64,7 +64,7 @@ def make_health_tools(
         1. **Immune's view** (always queried) — covers every component
            ``component_health`` knows about, which is the k8s pod scan plus the
            HTTP endpoints immune itself probes. That's how ``maki-vault``,
-           ``maki-ears``, ``maki-embed``, ``maki-finbert``, ``maki-immune`` and
+           ``maki-ears``, ``maki-embed``, ``maki-immune`` and
            anything else with an ``app=maki-*`` label become visible to this
            tool — the local ``health_endpoints`` registry only has four names
            and was a self-diagnosis blind spot (#265).
@@ -202,7 +202,7 @@ def make_health_tools(
             "check_component",
             "Check a specific component's health. Always queries immune for its "
             "current view (covers every component immune sees via k8s pod scan "
-            "plus HTTP probes — vault, ears, embed, finbert, immune itself, etc.) "
+            "plus HTTP probes — vault, ears, embed, immune itself, etc.) "
             "and additionally hits /health directly if this process has a local "
             "URL for the component. Accepts both bare ('vault', 'recall') and "
             "prefixed ('maki-vault', 'maki-recall') names.",

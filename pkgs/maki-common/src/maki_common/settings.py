@@ -36,7 +36,6 @@ RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 SYNAPSE_URL = os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080")
 STEM_URL = os.environ.get("STEM_URL", "http://maki-stem:8000")
 CORTEX_URL = os.environ.get("CORTEX_URL", "http://maki-cortex:8080")
-FINBERT_URL = os.environ.get("FINBERT_URL", "http://maki-finbert:8080")
 
 # --- Repo identity ---------------------------------------------------------
 
@@ -46,7 +45,6 @@ REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
 __all__ = [
     "CORTEX_URL",
-    "FINBERT_URL",
     "NATS_TOKEN",
     "NATS_URL",
     "RECALL_URL",

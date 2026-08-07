@@ -24,7 +24,6 @@ DEFAULT_PORTS: dict[str, int] = {
     "cortex": 8080,
     "recall": 8000,
     "synapse": 8080,
-    "finbert": 8080,
 }
 
 
@@ -37,7 +36,7 @@ def default_health_endpoints(
 
     Each URL falls back to ``http://maki-<name>:<port>`` and is overridable
     via the ``<NAME>_URL`` environment variable (e.g. ``STEM_URL``,
-    ``FINBERT_URL``) — matching the convention the three drifting copies
+    ``CORTEX_URL``) — matching the convention the three drifting copies
     used before this consolidation.
 
     Args:

@@ -25,7 +25,6 @@ root = [
     "pkgs/maki-ears/src",
     "pkgs/maki-recall/src",
     "pkgs/maki-synapse/src",
-    "pkgs/maki-finbert/src",
 ]
 python-version = "3.12"
 
