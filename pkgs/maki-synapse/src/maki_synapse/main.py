@@ -11,11 +11,22 @@ Honored:
   - tool_choice: "auto" | "none" | "required"  (anything else → HTTP 400)
   - response_format={"type":"json_object"}
 
+Rejected (HTTP 400) — wire format incompatible with the current handler:
+  - stream=true  — synapse serves a single ``chat.completion`` body, not SSE
+    ``chat.completion.chunk`` frames. Silently downgrading would leave
+    default-streaming OpenAI clients (``AsyncOpenAI(...).chat.completions
+    .create(stream=True, ...)``, most LangChain/LlamaIndex paths) hanging on
+    ``data:`` frames that never arrive, or crashing while parsing a single
+    JSON body as SSE. See #179.
+
 Accepted-but-ignored (claude_agent_sdk.invoke_claude does not expose them):
   - temperature
   - max_tokens
-  When a caller sets these explicitly, synapse logs a warning so the
-  mismatch is visible rather than silent.
+  - n, stop, presence_penalty, frequency_penalty, seed, top_p, logprobs
+  When a caller sets any of these explicitly, synapse logs a warning so the
+  mismatch is visible rather than silent (see #179). These are declared on
+  the request model — not merely dropped by Pydantic's default extra=allow —
+  so ``_log_ignored_fields`` actually sees them.
 
 Response echoes the actual Claude model that served the request, not the
 `model` field from the request — `invoke_claude` always uses the `MODEL`
@@ -118,6 +129,23 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = 0
     max_tokens: int | None = 2000
     response_format: dict | None = None
+    # Declared so the very common ``{"stream": true, ...}`` body doesn't get
+    # silently dropped by Pydantic and served as a non-streaming
+    # ``chat.completion`` — which leaves SSE-parsing clients hanging or
+    # crashing (see #179). Rejected with HTTP 400 in ``_build_system_and_user``
+    # until real SSE is wired.
+    stream: bool | None = None
+    # Accepted-but-ignored OpenAI fields — declared (rather than dropped by
+    # Pydantic's default extra="allow") so ``_log_ignored_fields`` can warn
+    # when a caller sets them, instead of silently degrading behavior.
+    # invoke_claude does not expose any of these to the Claude SDK.
+    n: int | None = None
+    stop: str | list[str] | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    seed: int | None = None
+    top_p: float | None = None
+    logprobs: bool | None = None
 
 
 class ResponseMessage(BaseModel):
@@ -297,14 +325,32 @@ def _add_token_usages(a: TokenUsage, b: TokenUsage) -> TokenUsage:
     )
 
 
+# Fields declared on ChatCompletionRequest that invoke_claude does not
+# forward to the Claude SDK. Kept as a module-level tuple so adding a new
+# accepted-but-ignored field is a one-line change and the module docstring's
+# support matrix can be diff-audited against it.
+_ACCEPTED_BUT_IGNORED_FIELDS: tuple[str, ...] = (
+    "temperature",
+    "max_tokens",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "top_p",
+    "logprobs",
+)
+
+
 def _log_ignored_fields(req: ChatCompletionRequest) -> None:
-    """Warn when callers set fields that invoke_claude cannot honor."""
-    ignored: dict[str, Any] = {}
+    """Warn when callers set fields that invoke_claude cannot honor.
+
+    Only fires for fields the caller *explicitly set* (via
+    ``model_fields_set``) — the model's own defaults for ``temperature`` /
+    ``max_tokens`` would otherwise trip a warning on every request.
+    """
     fields_set = req.model_fields_set
-    if "temperature" in fields_set:
-        ignored["temperature"] = req.temperature
-    if "max_tokens" in fields_set:
-        ignored["max_tokens"] = req.max_tokens
+    ignored: dict[str, Any] = {name: getattr(req, name) for name in _ACCEPTED_BUT_IGNORED_FIELDS if name in fields_set}
     if ignored:
         log.warning(
             "synapse does not forward these OpenAI fields to the Claude SDK; they are ignored",
@@ -338,6 +384,17 @@ def _build_system_and_user(req: ChatCompletionRequest) -> PromptBundle:
     tool-prompt injection, JSON-mode instruction. Returns a frozen bundle so
     the orchestrator can pass strings + flags around without re-deriving them.
     """
+    # Reject stream=true up front — silently dropping it (Pydantic's old
+    # behavior, before we declared the field) served a single non-streaming
+    # ``chat.completion`` body to callers expecting SSE ``chat.completion
+    # .chunk`` frames, which either hangs the client or crashes the parser.
+    # Better to fail loud with a clear 400 until real SSE lands. See #179.
+    if req.stream:
+        raise HTTPException(
+            status_code=400,
+            detail="synapse does not yet support stream=true; pass stream=false",
+        )
+
     tool_choice = req.tool_choice or "auto"
     if tool_choice not in SUPPORTED_TOOL_CHOICE:
         raise HTTPException(

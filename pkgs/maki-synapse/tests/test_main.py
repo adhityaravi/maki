@@ -189,3 +189,48 @@ def test_build_system_and_user_rejects_unsupported_tool_choice() -> None:
         assert "garbage" in e.detail
     else:
         raise AssertionError("expected HTTPException")
+
+
+def test_build_system_and_user_rejects_stream_true() -> None:
+    """stream=true → HTTP 400 (see #179).
+
+    Silently dropping ``stream`` served a single JSON body to callers
+    expecting SSE ``chat.completion.chunk`` frames — the client hangs waiting
+    for ``data:`` lines that never arrive, or crashes parsing one JSON blob
+    as SSE. Fail loud until real SSE lands.
+    """
+    from fastapi import HTTPException
+
+    try:
+        _build_system_and_user(_req(stream=True))
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "stream" in e.detail
+    else:
+        raise AssertionError("expected HTTPException")
+
+
+def test_build_system_and_user_accepts_stream_false() -> None:
+    """stream=false is the normal path — must not 400."""
+    bundle = _build_system_and_user(_req(stream=False))
+    assert bundle.user == "hi"
+
+
+def test_build_system_and_user_accepts_stream_unset() -> None:
+    """Omitting stream (the common case) must not 400."""
+    bundle = _build_system_and_user(_req())
+    assert bundle.user == "hi"
+
+
+def test_chat_completion_request_declares_common_openai_fields() -> None:
+    """Regression guard for #179: fields must be declared, not silently dropped.
+
+    Prior to the fix, ChatCompletionRequest was a vanilla Pydantic model
+    without ``extra="forbid"`` and without these fields declared, so
+    Pydantic silently discarded them before ``_log_ignored_fields`` ran.
+    Declaring them is what makes the ignored-field warning fire — this
+    test pins the declaration so a future refactor can't quietly regress it.
+    """
+    declared = ChatCompletionRequest.model_fields
+    for name in ("stream", "n", "stop", "presence_penalty", "frequency_penalty", "seed", "top_p", "logprobs"):
+        assert name in declared, f"{name!r} must be declared on ChatCompletionRequest (see #179)"
