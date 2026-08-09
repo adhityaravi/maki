@@ -19,14 +19,22 @@ Rejected (HTTP 400) — wire format incompatible with the current handler:
     ``data:`` frames that never arrive, or crashing while parsing a single
     JSON body as SSE. See #179.
 
+Rejected (HTTP 422) — undeclared OpenAI fields:
+  ``ChatCompletionRequest`` uses ``extra="forbid"``, so any Chat Completions
+  field we haven't explicitly declared (``logit_bias``, ``top_logprobs``,
+  ``user``, ``parallel_tool_calls``, and anything OpenAI adds later) 422s
+  with ``"Extra inputs are not permitted"`` instead of being silently
+  dropped by Pydantic. Advertising OpenAI-compat while discarding half the
+  schema is a footgun for future callers and hides bugs like #179. See #180.
+
 Accepted-but-ignored (claude_agent_sdk.invoke_claude does not expose them):
   - temperature
   - max_tokens
   - n, stop, presence_penalty, frequency_penalty, seed, top_p, logprobs
   When a caller sets any of these explicitly, synapse logs a warning so the
   mismatch is visible rather than silent (see #179). These are declared on
-  the request model — not merely dropped by Pydantic's default extra=allow —
-  so ``_log_ignored_fields`` actually sees them.
+  the request model — with ``extra="forbid"`` in place they'd otherwise
+  422 — so ``_log_ignored_fields`` sees them and warns instead.
 
 Response echoes the actual Claude model that served the request, not the
 `model` field from the request — `invoke_claude` always uses the `MODEL`
@@ -58,7 +66,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from maki_common import DEFAULT_CLAUDE_MODEL, configure_logging
 from maki_common.claude import TokenUsage, invoke_claude
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -121,7 +129,17 @@ class ToolDefinition(BaseModel):
     function: ToolFunction
 
 
+# ``extra="forbid"`` makes any OpenAI Chat Completions field we haven't
+# explicitly declared 422 with ``"Extra inputs are not permitted"`` instead
+# of being silently dropped by Pydantic's default ``extra="ignore"``. Synapse
+# advertises itself as OpenAI-compatible; silently discarding half the schema
+# (``logit_bias``, ``top_logprobs``, ``user``, ``parallel_tool_calls``, …)
+# turns any future caller's bug into a mystery instead of a clean error.
+# See #180. Fields we *do* accept-but-ignore stay declared below so callers
+# get a warning via ``_log_ignored_fields`` rather than a 422.
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: str = MODEL
     messages: list[ChatMessage]
     tools: list[ToolDefinition] | None = None
@@ -129,16 +147,17 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = 0
     max_tokens: int | None = 2000
     response_format: dict | None = None
-    # Declared so the very common ``{"stream": true, ...}`` body doesn't get
-    # silently dropped by Pydantic and served as a non-streaming
-    # ``chat.completion`` — which leaves SSE-parsing clients hanging or
-    # crashing (see #179). Rejected with HTTP 400 in ``_build_system_and_user``
-    # until real SSE is wired.
+    # Declared so the very common ``{"stream": true, ...}`` body gets a clear
+    # 400 explaining SSE isn't wired yet, instead of the generic 422 that
+    # ``extra="forbid"`` would produce for an undeclared field. Prior to
+    # declaring it, Pydantic silently dropped ``stream`` and served a single
+    # non-streaming ``chat.completion`` body, leaving SSE-parsing clients
+    # hanging on ``data:`` frames that never arrive (see #179).
     stream: bool | None = None
-    # Accepted-but-ignored OpenAI fields — declared (rather than dropped by
-    # Pydantic's default extra="allow") so ``_log_ignored_fields`` can warn
-    # when a caller sets them, instead of silently degrading behavior.
-    # invoke_claude does not expose any of these to the Claude SDK.
+    # Accepted-but-ignored OpenAI fields — declared so ``_log_ignored_fields``
+    # can warn when a caller sets them, instead of the 422 that
+    # ``extra="forbid"`` would otherwise produce. invoke_claude does not
+    # expose any of these to the Claude SDK.
     n: int | None = None
     stop: str | list[str] | None = None
     presence_penalty: float | None = None

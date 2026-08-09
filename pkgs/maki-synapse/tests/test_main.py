@@ -234,3 +234,51 @@ def test_chat_completion_request_declares_common_openai_fields() -> None:
     declared = ChatCompletionRequest.model_fields
     for name in ("stream", "n", "stop", "presence_penalty", "frequency_penalty", "seed", "top_p", "logprobs"):
         assert name in declared, f"{name!r} must be declared on ChatCompletionRequest (see #179)"
+
+
+def test_chat_completion_request_forbids_unknown_openai_fields() -> None:
+    """Regression guard for #180: undeclared OpenAI fields must 422, not silently drop.
+
+    Before ``extra="forbid"``, any Chat Completions field synapse hadn't
+    explicitly declared (``logit_bias``, ``top_logprobs``, ``user``,
+    ``parallel_tool_calls``, …) was silently discarded by Pydantic's
+    default ``extra="ignore"``. That turned any future caller's bug into
+    a mystery — the handler never saw the field, so no warning ever fired.
+    FastAPI maps the resulting ``ValidationError`` to HTTP 422.
+    """
+    from pydantic import ValidationError
+
+    for name in ("logit_bias", "top_logprobs", "user", "parallel_tool_calls", "made_up_field"):
+        try:
+            ChatCompletionRequest(messages=[ChatMessage(role="user", content="hi")], **{name: "x"})
+        except ValidationError as e:
+            # Pydantic's error message for extra="forbid" is
+            # "Extra inputs are not permitted"; guard on the field name and
+            # the extra_forbidden error type so a wording change won't flap.
+            assert any(err["type"] == "extra_forbidden" and err["loc"] == (name,) for err in e.errors()), (
+                f"{name!r}: expected extra_forbidden error, got {e.errors()!r}"
+            )
+        else:
+            raise AssertionError(f"{name!r} should have been rejected by extra='forbid'")
+
+
+def test_chat_completion_request_accepts_declared_ignored_fields() -> None:
+    """Declared-but-ignored fields must NOT 422 — they warn via _log_ignored_fields.
+
+    ``extra="forbid"`` would otherwise reject these; the point of declaring
+    them is that ``_log_ignored_fields`` gets a chance to warn instead.
+    """
+    # Should not raise — all these fields are declared.
+    req = ChatCompletionRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        temperature=0.5,
+        max_tokens=100,
+        n=1,
+        stop=["\n"],
+        presence_penalty=0.1,
+        frequency_penalty=0.1,
+        seed=42,
+        top_p=0.9,
+        logprobs=False,
+    )
+    assert req.temperature == 0.5
