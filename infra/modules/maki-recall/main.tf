@@ -131,8 +131,11 @@ resource "kubernetes_deployment" "recall" {
             value = var.llm_model
           }
           env {
+            # Sourced from var.embed_model (default nomic-embed-text) so
+            # this stays in lockstep with maki-embed's preloaded model —
+            # see #383.
             name  = "EMBEDDER_MODEL"
-            value = "nomic-embed-text"
+            value = var.embed_model
           }
           env {
             name  = "EMBEDDING_DIMS"
