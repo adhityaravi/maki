@@ -128,9 +128,6 @@ class GitHubIssueClient:
                 # Filter out pull requests (GitHub API returns PRs as issues too)
                 batch = [i for i in raw if "pull_request" not in i]
 
-                if not batch:
-                    break
-
                 issues.extend(batch)
 
                 # If we got fewer than a full page, we've exhausted the results

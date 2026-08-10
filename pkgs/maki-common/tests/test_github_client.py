@@ -273,6 +273,23 @@ def test_list_issues_paginates_and_sorts_by_priority():
     assert priorities == sorted(priorities, key=lambda p: {"P1": 1, "P3": 3, "P5": 5}[p])
 
 
+def test_list_issues_continues_after_full_pull_request_page():
+    page1 = [{"number": i, "pull_request": {}, "labels": []} for i in range(100)]
+    page2 = [{"number": 1000, "labels": [{"name": "P2"}]}]
+    requested_pages: list[str] = []
+    pages = iter([page1, page2])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_pages.append(request.url.params["page"])
+        return httpx.Response(200, json=next(pages))
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues())
+
+    assert [i["number"] for i in issues] == [1000]
+    assert requested_pages == ["1", "2"]
+
+
 def test_list_issues_empty_on_http_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
