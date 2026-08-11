@@ -324,7 +324,10 @@ async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
 
 async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one night work cycle: pick an issue and hand it to cortex."""
-    issues = await ctx.github.list_issues(state="open")
+    # max_results=None → no cap. With 250+ open issues, the default 200 cap
+    # silently starves this loop of newly-filed P1/P2s (they land at the tail
+    # of the asc-by-created fetch). See issue #404.
+    issues = await ctx.github.list_issues(state="open", max_results=None)
     if not issues:
         return
 

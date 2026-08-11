@@ -90,19 +90,29 @@ class GitHubIssueClient:
         self,
         state: str = "open",
         labels: str = "",
-        max_results: int = 200,
+        max_results: int | None = 200,
     ) -> list[dict[str, Any]]:
         """List issues from the repo, optionally filtered by state and labels.
 
-        Paginates through all results (up to max_results) so issues beyond
-        the first 30 are not silently dropped. Returns issues sorted by
-        priority label (P1 first). Issues without a priority label are sorted last.
+        Paginates through all results so issues beyond the first 30 are not
+        silently dropped. Returns issues sorted by priority label (P1 first).
+        Issues without a priority label are sorted last.
+
+        ``max_results`` behavior:
+        - ``None`` — no cap; page until GitHub returns the last page. This is
+          the canonical "all open" view stem's loops need — with 250+ open
+          issues, a cap silently starves the work loop of newly-filed P1/P2s.
+        - ``int`` (default 200) — priority sort is applied to the *full*
+          fetched set *before* the cap, so the tail dropped is always the
+          lowest-priority issues, never the newest ones. Note the cap only
+          bounds the returned slice; pagination still fetches every issue up
+          to the last page hit.
         """
         try:
             issues: list[dict[str, Any]] = []
             page = 1
 
-            while len(issues) < max_results:
+            while max_results is None or len(issues) < max_results:
                 params: dict[str, Any] = {
                     "state": state,
                     "per_page": 100,
@@ -128,20 +138,22 @@ class GitHubIssueClient:
                 # Filter out pull requests (GitHub API returns PRs as issues too)
                 batch = [i for i in raw if "pull_request" not in i]
 
-                if not batch:
-                    break
-
                 issues.extend(batch)
 
-                # If we got fewer than a full page, we've exhausted the results
+                # If we got fewer than a full page, we've exhausted the results.
+                # (Check raw_count, not len(batch): a page that's all PRs still
+                # means there may be more pages behind it — see issue #248.)
                 if raw_count < 100:
                     break
 
                 page += 1
 
-            issues = issues[:max_results]
-
-            # Sort by priority label across the full result set
+            # Sort by priority label across the full result set BEFORE truncating.
+            # Sorting-then-truncating protects newly-filed P1/P2 issues when the
+            # open-issue count exceeds max_results: they land at the tail of the
+            # asc-by-created fetch, but their priority pulls them to the head of
+            # the returned list. Truncate-then-sort would silently drop them —
+            # exactly the bug this method used to have.
             def _priority_key(issue: dict[str, Any]) -> int:
                 for label in issue.get("labels", []):
                     name = label.get("name", "") if isinstance(label, dict) else str(label)
@@ -150,6 +162,9 @@ class GitHubIssueClient:
                 return 99  # No priority label → lowest
 
             issues.sort(key=_priority_key)
+
+            if max_results is not None:
+                issues = issues[:max_results]
 
             log.info(
                 "Listed GitHub issues",

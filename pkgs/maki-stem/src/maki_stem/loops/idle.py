@@ -225,7 +225,10 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     open_issues: list[dict] = []
     if ctx.github:
         try:
-            issues = await ctx.github.list_issues(state="open")
+            # max_results=None → no cap; idle needs the full open set for
+            # dedup so newly-filed issues are still detected as duplicates
+            # even when the open count exceeds the default cap. See #404.
+            issues = await ctx.github.list_issues(state="open", max_results=None)
             verified = await tag_unverified_issues(issues or [], ctx)
             open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in verified]
         except Exception:

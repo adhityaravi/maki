@@ -281,6 +281,62 @@ def test_list_issues_empty_on_http_error():
     assert _run(client.list_issues()) == []
 
 
+def test_list_issues_sorts_by_priority_before_truncating():
+    """Regression for #404: newest P1/P2 issues must survive the cap.
+
+    The API returns issues sorted asc-by-created, so newly-filed issues land
+    on the last page. If the cap is applied *before* the priority sort, those
+    fresh issues get silently dropped even when they carry P1/P2 labels — the
+    work loop then never sees them. Sort-then-truncate must land priority
+    issues at the head of the returned list regardless of file order.
+    """
+    # Page 1: 100 low-priority issues (P4) filed first.
+    page1 = [{"number": i, "labels": [{"name": "P4"}]} for i in range(100)]
+    # Page 2: 100 low-priority (P4) filed next.
+    page2 = [{"number": 100 + i, "labels": [{"name": "P4"}]} for i in range(100)]
+    # Page 3: the tail — a fresh P1 and P2 that must not be lost.
+    page3 = [
+        {"number": 200, "labels": [{"name": "P1"}]},
+        {"number": 201, "labels": [{"name": "P2"}]},
+    ]
+    pages = iter([page1, page2, page3])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(pages))
+
+    client = _make_client(handler)
+    # Cap of 50 — the returned list must still surface the P1 and P2 at the
+    # head, not silently drop them along with the rest of the asc tail.
+    issues = _run(client.list_issues(max_results=50))
+    assert len(issues) == 50
+    numbers = [i["number"] for i in issues]
+    assert 200 in numbers, "newest P1 dropped by pre-sort truncation"
+    assert 201 in numbers, "newest P2 dropped by pre-sort truncation"
+    # Priority ordering must hold: P1 before P2 before the P4 filler.
+    priorities = [i["labels"][0]["name"] for i in issues]
+    assert priorities[0] == "P1"
+    assert priorities[1] == "P2"
+    assert all(p == "P4" for p in priorities[2:])
+
+
+def test_list_issues_no_cap_when_max_results_none():
+    """max_results=None pages until GitHub returns a short page (last page)."""
+    page1 = [{"number": i, "labels": []} for i in range(100)]
+    page2 = [{"number": 100 + i, "labels": []} for i in range(100)]
+    page3 = [{"number": 200 + i, "labels": []} for i in range(50)]  # short → last
+    pages = iter([page1, page2, page3])
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(int(request.url.params.get("page", "1")))
+        return httpx.Response(200, json=next(pages))
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues(max_results=None))
+    assert len(issues) == 250
+    assert calls == [1, 2, 3]  # stopped on short page, no over-fetch
+
+
 def test_find_open_issue_matches_title():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/search/issues"
