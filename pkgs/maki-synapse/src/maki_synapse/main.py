@@ -222,6 +222,17 @@ def build_tool_prompt(tools: list[ToolDefinition], *, required: bool = False) ->
 def _serialize_messages(messages: list[ChatMessage]) -> tuple[list[str], list[str]]:
     """Flatten OpenAI-style messages into (system_parts, user_parts).
 
+    Each non-system message is wrapped in ``<turn role="...">...</turn>`` so
+    role boundaries survive the collapse into a single Claude user prompt.
+    Before this encoding, user turns were emitted as bare content and only
+    ``assistant`` / ``tool`` got a role marker; a multi-turn
+    ``user → assistant → user`` sequence lost the second user boundary and
+    Claude conflated the turns (see #184). Wrapping every turn keeps the
+    encoding symmetric and harder to confuse with prose that happens to
+    contain the substring ``User:`` or ``Assistant:``. The tag shape matches
+    the ``<turn role="…">…</turn>`` convention already used by
+    ``maki_cortex.main._format_conversation_history``.
+
     The Claude Agent SDK has no notion of multi-turn tool results coming back
     from the caller, so we inline prior assistant tool_calls and tool results
     into the prompt stream as tagged text. This is best-effort: Mem0 (our
@@ -234,7 +245,7 @@ def _serialize_messages(messages: list[ChatMessage]) -> tuple[list[str], list[st
         if msg.role == "system":
             system_parts.append(msg.content or "")
         elif msg.role == "user":
-            user_parts.append(msg.content or "")
+            user_parts.append(f'<turn role="user">{msg.content or ""}</turn>')
         elif msg.role == "assistant":
             parts: list[str] = []
             if msg.content:
@@ -242,10 +253,10 @@ def _serialize_messages(messages: list[ChatMessage]) -> tuple[list[str], list[st
             if msg.tool_calls:
                 call_descs = [f"{tc.function.name}({tc.function.arguments})" for tc in msg.tool_calls]
                 parts.append("[Tool calls: " + "; ".join(call_descs) + "]")
-            user_parts.append(f"Assistant: {' '.join(parts).strip()}")
+            user_parts.append(f'<turn role="assistant">{" ".join(parts).strip()}</turn>')
         elif msg.role in ("tool", "function"):
             ident = msg.name or msg.tool_call_id or "tool"
-            user_parts.append(f"[Tool result from {ident}]: {msg.content or ''}")
+            user_parts.append(f'<turn role="tool" name="{ident}">{msg.content or ""}</turn>')
         else:
             raise HTTPException(
                 status_code=400,

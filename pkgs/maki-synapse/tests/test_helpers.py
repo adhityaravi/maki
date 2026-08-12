@@ -86,7 +86,7 @@ def test_serialize_messages_system_and_user_split() -> None:
     ]
     system, user = _serialize_messages(msgs)
     assert system == ["be terse"]
-    assert user == ["hello"]
+    assert user == ['<turn role="user">hello</turn>']
 
 
 def test_serialize_messages_empty_content_uses_empty_string() -> None:
@@ -97,13 +97,13 @@ def test_serialize_messages_empty_content_uses_empty_string() -> None:
     ]
     system, user = _serialize_messages(msgs)
     assert system == [""]
-    assert user == [""]
+    assert user == ['<turn role="user"></turn>']
 
 
 def test_serialize_messages_assistant_content_only() -> None:
     msgs = [ChatMessage(role="assistant", content="prior reply")]
     _, user = _serialize_messages(msgs)
-    assert user == ["Assistant: prior reply"]
+    assert user == ['<turn role="assistant">prior reply</turn>']
 
 
 def test_serialize_messages_assistant_tool_calls_only() -> None:
@@ -118,9 +118,7 @@ def test_serialize_messages_assistant_tool_calls_only() -> None:
         ),
     ]
     _, user = _serialize_messages(msgs)
-    assert len(user) == 1
-    assert user[0].startswith("Assistant: ")
-    assert '[Tool calls: search({"q":"cats"})]' in user[0]
+    assert user == ['<turn role="assistant">[Tool calls: search({"q":"cats"})]</turn>']
 
 
 def test_serialize_messages_assistant_content_and_tool_calls_combined() -> None:
@@ -135,8 +133,7 @@ def test_serialize_messages_assistant_content_and_tool_calls_combined() -> None:
         ),
     ]
     _, user = _serialize_messages(msgs)
-    assert "Let me search." in user[0]
-    assert "[Tool calls: search({})]" in user[0]
+    assert user == ['<turn role="assistant">Let me search. [Tool calls: search({})]</turn>']
 
 
 def test_serialize_messages_tool_result_prefers_name_over_id() -> None:
@@ -144,28 +141,28 @@ def test_serialize_messages_tool_result_prefers_name_over_id() -> None:
         ChatMessage(role="tool", name="search", tool_call_id="call_1", content="42 results"),
     ]
     _, user = _serialize_messages(msgs)
-    assert user == ["[Tool result from search]: 42 results"]
+    assert user == ['<turn role="tool" name="search">42 results</turn>']
 
 
 def test_serialize_messages_tool_result_falls_back_to_tool_call_id() -> None:
     """No name → use tool_call_id as identifier."""
     msgs = [ChatMessage(role="tool", tool_call_id="call_abc", content="ok")]
     _, user = _serialize_messages(msgs)
-    assert user == ["[Tool result from call_abc]: ok"]
+    assert user == ['<turn role="tool" name="call_abc">ok</turn>']
 
 
 def test_serialize_messages_tool_result_final_fallback() -> None:
     """Neither name nor tool_call_id → literal 'tool'."""
     msgs = [ChatMessage(role="tool", content="ok")]
     _, user = _serialize_messages(msgs)
-    assert user == ["[Tool result from tool]: ok"]
+    assert user == ['<turn role="tool" name="tool">ok</turn>']
 
 
 def test_serialize_messages_legacy_function_role_matches_tool() -> None:
     """role='function' (legacy OpenAI) must be treated like role='tool'."""
     msgs = [ChatMessage(role="function", name="lookup", content="x")]
     _, user = _serialize_messages(msgs)
-    assert user == ["[Tool result from lookup]: x"]
+    assert user == ['<turn role="tool" name="lookup">x</turn>']
 
 
 def test_serialize_messages_unknown_role_raises_400() -> None:
@@ -187,7 +184,39 @@ def test_serialize_messages_preserves_order_across_roles() -> None:
         ChatMessage(role="user", content="again"),
     ]
     _, user = _serialize_messages(msgs)
-    assert user == ["hi", "Assistant: hello", "again"]
+    assert user == [
+        '<turn role="user">hi</turn>',
+        '<turn role="assistant">hello</turn>',
+        '<turn role="user">again</turn>',
+    ]
+
+
+def test_serialize_messages_multi_turn_user_boundaries_preserved() -> None:
+    """Regression for #184.
+
+    A ``user → assistant → user`` sequence must keep BOTH user turns
+    distinguishable. Prior to #184, user turns had no role marker (only
+    assistant/tool did), so joining ``["what's the weather?", "Assistant:
+    sunny", "tomorrow?"]`` with newlines gave Claude no way to see the
+    second user boundary — it read "sunny\\ntomorrow?" as one continued
+    assistant/user blur.
+    """
+    msgs = [
+        ChatMessage(role="user", content="what's the weather?"),
+        ChatMessage(role="assistant", content="sunny"),
+        ChatMessage(role="user", content="tomorrow?"),
+    ]
+    _, user = _serialize_messages(msgs)
+    # Every turn is tagged — the second user turn is NOT bare content.
+    assert user == [
+        '<turn role="user">what\'s the weather?</turn>',
+        '<turn role="assistant">sunny</turn>',
+        '<turn role="user">tomorrow?</turn>',
+    ]
+    # Joined form: role boundaries are unambiguous end-tags, not implicit.
+    joined = "\n".join(user)
+    assert joined.count('<turn role="user">') == 2
+    assert joined.count("</turn>") == 3
 
 
 # --- extract_json_str -------------------------------------------------------
