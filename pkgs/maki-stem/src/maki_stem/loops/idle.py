@@ -153,10 +153,14 @@ def _build_idle_system_prompt(
     config_str = "\n".join(f"- {k}: {v}" for k, v in config.items())
 
     raw_issues = idle_context.get("open_issues", [])
+
+    def _fmt_issue(i: dict) -> str:
+        labels = i.get("labels") or []
+        suffix = f" [{', '.join(labels)}]" if labels else ""
+        return f"- #{i['number']}: {i['title']}{suffix}"
+
     issues_str = (
-        "\n".join(f"- #{i['number']}: {i['title']}" for i in raw_issues)
-        if raw_issues
-        else "None (GitHub unavailable or no open issues)"
+        "\n".join(_fmt_issue(i) for i in raw_issues) if raw_issues else "None (GitHub unavailable or no open issues)"
     )
 
     dynamic = _IDLE_CONTEXT_TEMPLATE.format(
@@ -230,7 +234,20 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             # even when the open count exceeds the default cap. See #404.
             issues = await ctx.github.list_issues(state="open", max_results=None)
             verified = await tag_unverified_issues(issues or [], ctx)
-            open_issues = [{"number": i.get("number"), "title": i.get("title", "")} for i in verified]
+            # Preserve labels so the reflection prompt can show `human`/`draft`
+            # hygiene markers inline and dedup against P1/P2/bug/refactor/etc.
+            # signal. Without this, the hygiene rule is structurally
+            # unenforceable from the prompt (see #406).
+            open_issues = [
+                {
+                    "number": i.get("number"),
+                    "title": i.get("title", ""),
+                    "labels": [
+                        lbl.get("name", "") if isinstance(lbl, dict) else str(lbl) for lbl in (i.get("labels") or [])
+                    ],
+                }
+                for i in verified
+            ]
         except Exception:
             log.warning("Failed to fetch open issues for idle dedup")
 
