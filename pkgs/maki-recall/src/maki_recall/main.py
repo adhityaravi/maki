@@ -670,6 +670,69 @@ async def _retry_graph_init() -> None:
             backoff = min(backoff * 2, GRAPH_RETRY_MAX_SECONDS)
 
 
+# Every mem0-touching endpoint must either enforce an identifier scope
+# (user_id/agent_id/run_id) or be explicitly listed here as operating on
+# a known-safe unscoped resource. Only paths under ``/memories`` and
+# ``/search`` are audited — FastAPI's default plumbing (``/docs``,
+# ``/openapi.json``, ``/redoc``) and the probe endpoints (``/health``,
+# ``/live``) don't touch Mem0 and are excluded by prefix rather than
+# enumerated so a FastAPI upgrade that adds a new default route doesn't
+# spuriously crashloop us. See #190 — the whole point is to catch a new
+# ``/memories/foo`` shipping without ``_require_identifier``, not to
+# police the framework's own routes.
+_SCOPED_MEM0_ROUTES: frozenset[str] = frozenset(
+    {
+        # Each of these calls _require_identifier (or verifies ownership
+        # per-id, as delete_memory does) before touching mem0.
+        "POST /memories",
+        "GET /memories",
+        "DELETE /memories",
+        "DELETE /memories/{memory_id}",
+        "POST /search",
+    }
+)
+
+
+def _assert_routes_scoped(app: FastAPI) -> list[str]:
+    """Drift catcher (#190) — bail if a mem0 route isn't in the whitelist.
+
+    Adding an endpoint under /memories or /search without either an
+    identifier check or an explicit entry in ``_SCOPED_MEM0_ROUTES``
+    means we've silently opened a cross-tenant path. Fail startup loud
+    so the diff review that added the endpoint has to consciously
+    extend the whitelist.
+
+    Returns the sorted route strings (all routes, not just mem0 ones)
+    so the caller can log them for #263's probe/image mismatch check.
+    """
+    # A single FastAPI route may advertise multiple methods; expand to
+    # a stable "METHOD path" form before comparing to the whitelist.
+    seen: set[str] = set()
+    for r in app.routes:
+        methods = getattr(r, "methods", None) or ()
+        path = getattr(r, "path", None)
+        if not path or not methods:
+            continue
+        for method in methods:
+            seen.add(f"{method} {path}")
+    routes = sorted(seen)
+    mem0_paths = ("/memories", "/search")
+
+    def _is_mem0_route(route: str) -> bool:
+        path = route.split(" ", 1)[1]
+        return any(path.startswith(p) for p in mem0_paths)
+
+    unknown = [r for r in routes if _is_mem0_route(r) and r not in _SCOPED_MEM0_ROUTES]
+    if unknown:
+        raise RuntimeError(
+            "maki-recall mem0 route(s) missing from identifier-scope whitelist "
+            f"(see _SCOPED_MEM0_ROUTES in main.py): {unknown}. "
+            "Every mem0 endpoint must either call _require_identifier or "
+            "verify ownership before delegating to mem0. See #190."
+        )
+    return routes
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Spin up Mem0 initialization as a background task on startup.
@@ -681,16 +744,10 @@ async def lifespan(app: FastAPI):
     Neo4j was briefly unreachable at boot.
     """
     global _init_task, _neo4j_probe_driver, _nc
-    # Log the actual HTTP endpoint inventory so a probe/image mismatch is
-    # diagnosable from `kubectl logs` alone. #263's root-cause hypothesis
-    # was specifically a manifest-pointed-at-missing-endpoint scenario;
-    # surfacing the live route table catches that class of bug instantly
-    # ("manifest says livenessProbe=/livez but image only exposes /live").
-    routes = sorted(
-        f"{','.join(sorted(r.methods))} {r.path}"
-        for r in app.routes
-        if hasattr(r, "methods") and hasattr(r, "path") and r.methods
-    )
+    # #190: fail loud at startup if a new endpoint bypasses the identifier
+    # check. Runs before init scheduling so a misconfigured route table
+    # never reaches the point of serving traffic.
+    routes = _assert_routes_scoped(app)
     log.info(
         "maki-recall starting; scheduling Mem0 init",
         extra={"http_routes": routes, "route_count": len(routes)},
@@ -1119,20 +1176,47 @@ def get_memories(user_id: str | None = None, agent_id: str | None = None, run_id
 @app.post("/search")
 def search_memories(req: SearchRequest):
     mem = _require_memory()
+    # #190: /search used to skip the identifier check that add/get/delete-all
+    # enforce, so a bare {"query": "..."} would return matches across every
+    # user/agent/run in the collection. Reject early with the same 400 the
+    # other endpoints use — mem0's storage model is per-identifier and a
+    # scope-less search is always a cross-tenant footgun waiting to happen.
+    _require_identifier(req.user_id, req.agent_id, req.run_id)
     # mem0 requires entity identifiers (user_id, agent_id, run_id) inside filters={},
     # not as top-level kwargs — only limit stays top-level.
     filters = _identifier_params(req.user_id, req.agent_id, req.run_id)
-    kwargs: dict[str, Any] = {}
-    if filters:
-        kwargs["filters"] = filters
+    kwargs: dict[str, Any] = {"filters": filters}
     if req.limit is not None:
         kwargs["limit"] = req.limit
     return mem.search(query=req.query, **kwargs)
 
 
 @app.delete("/memories/{memory_id}")
-def delete_memory(memory_id: str):
+def delete_memory(
+    memory_id: str,
+    user_id: str | None = None,
+    agent_id: str | None = None,
+    run_id: str | None = None,
+):
+    # #190: the per-id delete used to accept any memory_id from any caller
+    # with no ownership check — a leaked ID was enough to nuke someone else's
+    # memory. Require an identifier query param (same shape as bulk delete)
+    # and verify it matches whatever the stored memory is scoped to before
+    # calling through to mem0. Keeps the surface symmetric with add/get/
+    # delete-all, all of which already validate.
     mem = _require_memory()
+    _require_identifier(user_id, agent_id, run_id)
+    stored = mem.get(memory_id=memory_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="Memory not found.")
+    requested = _identifier_params(user_id, agent_id, run_id)
+    # Every identifier the caller supplied must match the stored value.
+    # A missing field on the stored memory (mem0 leaves unset identifiers
+    # off the dict entirely) counts as a mismatch — we never want a caller
+    # scoped to user_id="a" to delete a memory that has no user_id at all.
+    for key, value in requested.items():
+        if stored.get(key) != value:
+            raise HTTPException(status_code=403, detail="Identifier does not match memory owner.")
     mem.delete(memory_id=memory_id)
     return {"message": "Memory deleted"}
 
