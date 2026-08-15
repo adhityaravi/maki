@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from maki_common.github_client import API, GitHubIssueClient
+from maki_common.tools.github import GitHubAuth
 
 
 def _run(coro):
@@ -33,7 +34,7 @@ def _make_client(handler) -> GitHubIssueClient:
         async def headers(self) -> dict[str, str]:
             return {"Authorization": "Bearer test-token"}
 
-    client._auth = _StubAuth()
+    client._auth = cast(GitHubAuth, _StubAuth())
     return client
 
 
