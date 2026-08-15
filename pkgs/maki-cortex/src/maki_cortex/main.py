@@ -809,7 +809,7 @@ async def main():
     )
     log.info("MCP tools registered")
 
-    spawn_background(heartbeat_loop(nc), name="cortex.heartbeat_loop")
+    _heartbeat_task = spawn_background(heartbeat_loop(nc), name="cortex.heartbeat_loop")
     log.info("Heartbeat loop started")
 
     async def _handle_turn_message(msg) -> None:
