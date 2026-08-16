@@ -7,6 +7,7 @@ from maki_common.futures import PendingFutures, PendingQueues
 from maki_common.logging import configure_logging, get_logger
 from maki_common.models import DEFAULT_CLAUDE_MODEL
 from maki_common.nats import (
+    NatsTerminalError,
     connect_nats,
     init_kv,
     kv_acquire_lease,
@@ -44,6 +45,7 @@ __all__ = [
     "kv_get_float",
     "kv_put_float",
     "load_kv_config",
+    "NatsTerminalError",
     "try_claim_loop",
     "parse_config_tags",
     "parse_tagged",

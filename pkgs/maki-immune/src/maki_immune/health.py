@@ -146,6 +146,45 @@ SELF_HEALTH_STALE_MULTIPLIER = float(os.environ.get("SELF_HEALTH_STALE_MULTIPLIE
 # stuck/long-unhealthy realert intervals.
 SELF_HEALTH_REALERT_INTERVAL_S = int(os.environ.get("SELF_HEALTH_REALERT_INTERVAL_S", "1800"))
 
+# Terminal-zombie escalation tunables (#470). A "terminal zombie" is a pod that
+# stays ``phase=Running, ready=False`` while its /health body advertises a
+# permanent error the retry loop cannot fix (bad NATS token, missing TLS cert,
+# invalid credentials file). The other autonomy tiers all skip this shape:
+# ``_check_stuck_components`` only matches non-Running pods, ``_trigger_reflex``
+# would just delete-and-recreate the pod against the same broken Secret, and
+# ``_check_stuck_recovery`` bails on the same non-Running predicate. Left to
+# rot, ``consecutive_failures`` ticks up forever and nothing acts (motivating
+# incident: recall wedged 34+ min with 63 failures and zero restarts). The
+# fix is a distinct check that spots the terminal marker in the /health body
+# excerpt and escalates directly to Claude with a "config mismatch" hint —
+# not a reflex restart, not a pod delete.
+TERMINAL_ZOMBIE_MIN_FAILURES = int(os.environ.get("TERMINAL_ZOMBIE_MIN_FAILURES", "10"))
+
+# Cooldown between re-fires for the same incident. First escalation is
+# immediate once the failure threshold is crossed; after that we re-alert
+# every ``TERMINAL_ZOMBIE_REALERT_INTERVAL_S`` so an ignored escalation
+# doesn't go silent, without spamming every 30s health tick.
+TERMINAL_ZOMBIE_REALERT_INTERVAL_S = int(os.environ.get("TERMINAL_ZOMBIE_REALERT_INTERVAL_S", "3600"))
+
+# Substrings we consider "terminal error" markers in a component's /health
+# body excerpt. Match is case-sensitive and substring-based so a component
+# can advertise any of these shapes:
+#   - ``"nats_terminal": true`` — recall's structured surface (see #470)
+#   - ``"terminal": true``       — generic
+#   - ``Authorization Violation`` / ``Authorization Timeout`` — raw NATS -ERR text
+#   - ``TLS Required``            — server refused non-TLS handshake
+# New shapes should be added here and to
+# ``maki_common.nats._TERMINAL_NATS_MESSAGES`` together.
+TERMINAL_ERROR_PATTERNS: tuple[str, ...] = (
+    '"nats_terminal": true',
+    '"terminal": true',
+    "Authorization Violation",
+    "Authorization Timeout",
+    "TLS Required",
+    "InvalidUserCredentialsError",
+    "NatsTerminalError",
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -278,6 +317,12 @@ class ImmuneHealthMonitor:
         # restarts during a wedge we'll re-fire one alert per stuck component, which
         # is fine — that's the whole point.
         self._self_health_alerted: dict[str, dict[str, Any]] = {}
+
+        # Track terminal-zombie escalations (#470). Same shape as
+        # ``_stuck_alerted``: keyed by component -> {incident, last_fired_at,
+        # fire_count}. Cleared when the component recovers so a subsequent
+        # failure re-arms cleanly. In-memory only.
+        self._terminal_zombie_alerted: dict[str, dict[str, Any]] = {}
 
     # --- Health State Tracking ---
 
@@ -787,6 +832,7 @@ class ImmuneHealthMonitor:
                         await self._trigger_reflex(component, state, config)
 
                 await self._check_stuck_components(config)
+                await self._check_terminal_zombies(config)
                 await self._check_long_unhealthy_components(config)
                 await self._check_immune_self_health(config)
                 await self._check_stuck_recovery(config)
@@ -802,6 +848,28 @@ class ImmuneHealthMonitor:
         """Autonomous pod restart reflex (Tier 1)."""
         if component.endswith("-heartbeat"):
             return
+
+        # #470: don't reflex-restart a terminal-zombie. If /health already
+        # tells us the failure is a permanent config mismatch (bad NATS
+        # token, missing TLS cert), delete-and-recreate just schedules a
+        # fresh pod against the same broken Secret and hits the same
+        # -ERR — pointless thrash that also masks the incident with a
+        # stream of restarts and rotating pod names. The
+        # ``_check_terminal_zombies`` path owns escalation for this
+        # shape; log at DEBUG here so the skip is greppable but doesn't
+        # add tick-rate noise.
+        details = state.get("details", {})
+        if details.get("phase") == "Running" and details.get("ready") is False:
+            terminal_pattern = self._detect_terminal_pattern(details)
+            if terminal_pattern is not None:
+                log.debug(
+                    "Skipping reflex restart — terminal error in /health body",
+                    extra={
+                        "component": component,
+                        "terminal_pattern": terminal_pattern,
+                    },
+                )
+                return
 
         pod_name = state.get("details", {}).get("pod_name")
         if not pod_name:
@@ -1052,6 +1120,181 @@ class ImmuneHealthMonitor:
                 spawn_background(
                     self._escalate_to_claude(component, state, reason),
                     name="immune.stuck_escalation",
+                )
+
+    @staticmethod
+    def _detect_terminal_pattern(details: dict) -> str | None:
+        """Return the first terminal-error pattern found in ``details['body_excerpt']``.
+
+        The body excerpt is captured by :meth:`_check_http_health` on any
+        non-200 response and truncated to 200 chars. Terminal markers
+        (recall's ``"nats_terminal": true`` field, raw NATS -ERR text like
+        ``Authorization Violation``, or a bare ``NatsTerminalError``
+        surfaced in a traceback) live inside that window, so a substring
+        match is enough. Returns ``None`` when no marker is present or when
+        the component has no body excerpt (e.g. a transport-level error
+        that never reached a response body).
+        """
+        body = details.get("body_excerpt")
+        if not body:
+            return None
+        for pattern in TERMINAL_ERROR_PATTERNS:
+            if pattern in body:
+                return pattern
+        return None
+
+    async def _check_terminal_zombies(self, config: dict) -> None:
+        """Escalate ``Running+ready=False+terminal=true`` components (#470).
+
+        The other autonomy tiers all skip a Running-but-not-ready pod that's
+        advertising a permanent error:
+
+        - ``_trigger_reflex`` restarts it — but a fresh pod hits the same
+          broken NATS token / TLS cert / credentials file and wedges the
+          same way. #470 gates the reflex on the terminal marker so we
+          don't churn.
+        - ``_check_stuck_components`` requires ``phase != Running`` or a
+          ``waiting_reason``. A Running+ready=False pod matches neither.
+        - ``_check_stuck_recovery`` uses the same ``is_pod_stuck``
+          predicate and skips for the same reason (motivating incident:
+          recall 34+ min unhealthy, ``consecutive_failures=63``,
+          ``restarts=0`` — nothing acted).
+
+        The remediation for a config-level failure is *not* kubectl —
+        it's a Secret/ConfigMap change. So this path escalates directly
+        to Claude with a config-mismatch hint and publishes the same
+        alert shape ears already renders, without ever asking the
+        kubelet to recreate the pod. First-fire spawns the Claude turn;
+        subsequent fires (past ``TERMINAL_ZOMBIE_REALERT_INTERVAL_S``)
+        only re-alert so a single stalled Claude turn doesn't leave the
+        incident silent for hours.
+        """
+        if self._nc is None:
+            return
+
+        threshold = config.get("terminal_zombie_min_failures", TERMINAL_ZOMBIE_MIN_FAILURES)
+        realert = config.get("terminal_zombie_realert_interval_s", TERMINAL_ZOMBIE_REALERT_INTERVAL_S)
+        now = time.time()
+
+        for component, state in list(self._component_health.items()):
+            if component.endswith("-heartbeat"):
+                continue
+
+            if state["healthy"]:
+                self._terminal_zombie_alerted.pop(component, None)
+                continue
+
+            details = state.get("details", {})
+            phase = details.get("phase")
+            ready = details.get("ready")
+
+            # Only the Running+ready=False shape — the very gap the other
+            # tiers miss. Anything with a non-Running phase or a
+            # waiting_reason is already covered by
+            # ``_check_stuck_components`` / ``_check_stuck_recovery``.
+            if phase != "Running" or ready is not False:
+                self._terminal_zombie_alerted.pop(component, None)
+                continue
+
+            pattern = self._detect_terminal_pattern(details)
+            if pattern is None:
+                self._terminal_zombie_alerted.pop(component, None)
+                continue
+
+            consecutive_failures = state.get("consecutive_failures", 0)
+            if consecutive_failures < threshold:
+                # Wait until we're past the fluke threshold — a single
+                # tick with a suspicious body could still be a rollout
+                # racing with a stale probe. ``threshold`` (default 10)
+                # ≈ 5 minutes of continuous failures at the 30s tick.
+                continue
+
+            incident = state["last_state_change"]
+            tracker = self._terminal_zombie_alerted.get(component)
+            if tracker is None or tracker.get("incident") != incident:
+                tracker = {"incident": incident, "last_fired_at": 0.0, "fire_count": 0}
+                self._terminal_zombie_alerted[component] = tracker
+
+            last_fired = tracker.get("last_fired_at") or 0.0
+            first_fire = last_fired == 0.0
+            if not first_fire and (now - last_fired) < realert:
+                continue
+
+            fire_count = int(tracker.get("fire_count") or 0) + 1
+            tracker["last_fired_at"] = now
+            tracker["fire_count"] = fire_count
+
+            stuck_for = now - state["last_state_change"]
+            stuck_min = round(stuck_for / 60, 1)
+            pod_name = details.get("pod_name", "?")
+            body_excerpt = (details.get("body_excerpt") or "")[:200]
+
+            log.error(
+                "Terminal-zombie detected — escalating (config mismatch, not restartable)",
+                extra={
+                    "component": component,
+                    "pod_name": pod_name,
+                    "phase": phase,
+                    "ready": ready,
+                    "consecutive_failures": consecutive_failures,
+                    "stuck_for_min": stuck_min,
+                    "terminal_pattern": pattern,
+                    "fire_count": fire_count,
+                    "body_excerpt": body_excerpt,
+                },
+            )
+
+            await self._publish_alert(
+                f"TERMINAL-ZOMBIE: {component} ({pod_name}) has been Running+ready=False for "
+                f"{stuck_min}min with a terminal error in its /health body "
+                f"(pattern={pattern!r}, consecutive_failures={consecutive_failures}). "
+                f"Restarting the pod won't help — remediation is a config/secret change "
+                f"(likely NATS token, TLS cert, or credentials file). "
+                f"Escalation #{fire_count}. /health excerpt: {body_excerpt}"
+            )
+
+            action = {
+                "type": "terminal_zombie_escalation",
+                "component": component,
+                "pod_name": pod_name,
+                "stuck_for_min": stuck_min,
+                "phase": phase,
+                "ready": ready,
+                "consecutive_failures": consecutive_failures,
+                "terminal_pattern": pattern,
+                "fire_count": fire_count,
+                "timestamp": now,
+            }
+            self._recent_actions.append(action)
+            if len(self._recent_actions) > self._recent_actions_max:
+                self._recent_actions.pop(0)
+            self._schedule_persist()
+            try:
+                await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish terminal-zombie action")
+
+            # Only spawn the Claude turn on the first fire per incident.
+            # Re-alerts still keep the audit trail loud, but a busy Claude
+            # semaphore doesn't need one extra queued turn every realert
+            # window for the same underlying config problem.
+            if first_fire and self._escalate_to_claude is not None:
+                reason = (
+                    f"Terminal-zombie classification: {component} ({pod_name}) is stuck "
+                    f"Running+ready=False with a terminal error surfaced in /health "
+                    f"(pattern={pattern!r}). Recent /health body excerpt: {body_excerpt}. "
+                    f"consecutive_failures={consecutive_failures}, stuck_for_min={stuck_min}. "
+                    f"This is a CONFIG-LEVEL failure, not a transient outage: `kubectl "
+                    f"delete pod` will re-schedule against the same broken "
+                    f"Secret/ConfigMap and hit the same error immediately. "
+                    f"Do NOT reflex-restart or delete the pod — investigate the "
+                    f"pod's environment (Secret contents, ConfigMap, NATS token, "
+                    f"TLS/creds file mounts) and remediate the config before rolling. "
+                    f"If the fix requires a human action, publish an ALERT and stop."
+                )
+                spawn_background(
+                    self._escalate_to_claude(component, state, reason),
+                    name="immune.terminal_zombie_escalation",
                 )
 
     async def _check_long_unhealthy_components(self, config: dict) -> None:

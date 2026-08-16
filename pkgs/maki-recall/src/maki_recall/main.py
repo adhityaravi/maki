@@ -16,7 +16,13 @@ import neo4j
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from maki_common import DEFAULT_CLAUDE_MODEL, build_pg_dsn, configure_logging, connect_nats
+from maki_common import (
+    DEFAULT_CLAUDE_MODEL,
+    NatsTerminalError,
+    build_pg_dsn,
+    configure_logging,
+    connect_nats,
+)
 from maki_common.settings import NATS_TOKEN, NATS_URL
 from maki_common.subjects import IMMUNE_ALERT
 from mem0 import Memory
@@ -214,6 +220,12 @@ _init_state: dict[str, Any] = {
     "ready_at": 0.0,  # wall-clock when init completed; 0 until ready
     "last_alert_at": 0.0,  # wall-clock of last NATS alert published; 0 until first alert (#258)
     "alert_count": 0,  # cumulative number of "stuck" alerts published this lifetime (#258)
+    # Terminal NATS auth/TLS failure captured at lifespan startup (#470). When
+    # set, /health surfaces it as ``nats_terminal=True`` + ``nats_terminal_error``
+    # so immune's HTTP probe body-excerpt reads a config-mismatch signal and
+    # routes remediation to Claude/human instead of a pointless pod delete.
+    "nats_terminal_error": None,
+    "nats_terminal_reason": None,
 }
 
 
@@ -759,6 +771,28 @@ async def lifespan(app: FastAPI):
     # tolerates ``_nc is None`` and skips publishing in that case.
     try:
         _nc = await connect_nats(NATS_URL, token=NATS_TOKEN, max_retries=3, base_delay=1.0, max_delay=5.0)
+    except NatsTerminalError as e:
+        # Permanent auth/TLS mismatch — no retry loop is going to fix a
+        # bad token, so this is a config-level failure (#470). We still
+        # don't crash the lifespan (the Mem0 init loop must run so /health
+        # can serve 503 with real diagnostics), but we record the terminal
+        # state on _init_state so /health exposes it verbatim to immune's
+        # probe body-excerpt. That excerpt is what feeds the terminal-
+        # zombie escalation path — the whole point is to distinguish this
+        # "config broken, needs human" case from "warming up, keep waiting".
+        err_text = _format_exception(e)
+        log.error(
+            "NATS connection failed with terminal error at startup — init-stuck alerts disabled",
+            extra={
+                "nats_url": NATS_URL,
+                "error": err_text,
+                "reason": e.reason,
+                "terminal": True,
+            },
+        )
+        _init_state["nats_terminal_error"] = err_text
+        _init_state["nats_terminal_reason"] = e.reason
+        _nc = None
     except Exception as e:
         # Don't crash the lifespan — the init loop must still run.
         log.warning(
@@ -1045,6 +1079,16 @@ def _init_snapshot() -> dict[str, Any]:
         # "looks like X is down" hint the NATS alert carries.
         if _init_state["last_error"]:
             snap["likely_dependency"] = _likely_dependency(_init_state["last_error"], _init_state["last_attempt_phase"])
+    # #470: terminal NATS auth/TLS failure captured at startup. Publish it
+    # unconditionally (both in initializing-503 and ready-200 bodies) so
+    # immune's HTTP probe body-excerpt matches the terminal-zombie pattern
+    # and escalates to Claude with a config-mismatch hint instead of
+    # reflex-restarting into the same broken Secret.
+    if _init_state["nats_terminal_error"]:
+        snap["nats_terminal"] = True
+        snap["terminal"] = True
+        snap["nats_terminal_error"] = _init_state["nats_terminal_error"]
+        snap["nats_terminal_reason"] = _init_state["nats_terminal_reason"]
     return snap
 
 

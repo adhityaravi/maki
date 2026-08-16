@@ -10,11 +10,83 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats
+import nats.errors
 import nats.js.errors
 from nats.aio.client import Client
 from nats.js.kv import KeyValue
 
 log = logging.getLogger(__name__)
+
+
+# Server-sent -ERR strings that indicate a permanent, retry-immune failure.
+# NATS surfaces these as ``nats.errors.Error("nats: '<message>'")`` from the
+# protocol handler — a bare ``Error`` with the message baked into ``str(exc)``
+# rather than a distinct subclass — so message matching is unavoidable. See
+# nats-py's ``client.py`` ``_process_err`` and issue #470: a broken NATS
+# token had ``connect_nats`` retrying an ``Authorization Violation`` in a
+# tight backoff loop forever, treating a config mismatch the same as a
+# cold-start race with maki-nerve-nats.
+_TERMINAL_NATS_MESSAGES: tuple[str, ...] = (
+    "Authorization Violation",
+    "Authorization Timeout",
+    "TLS Required",
+    "TLS Handshake",
+    "Authentication Expired",
+    "User Authentication Expired",
+    "Invalid Client Protocol",
+    "Invalid Connect Config",
+    "Invalid Signature",
+    "No Credentials",
+    "Authentication Timeout",
+)
+
+# Client-side exception classes that indicate a permanent failure. A retry
+# loop cannot fix a rejected token, a missing TLS cert, or an unparseable
+# credentials file — the config is wrong, not the network.
+_TERMINAL_NATS_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    nats.errors.AuthorizationError,
+    nats.errors.InvalidUserCredentialsError,
+    nats.errors.SecureConnRequiredError,
+    nats.errors.SecureConnWantedError,
+    nats.errors.SecureConnFailedError,
+)
+
+
+class NatsTerminalError(nats.errors.Error):
+    """Raised by :func:`connect_nats` on a permanent, retry-immune failure.
+
+    Distinguishes "the config is wrong, human/config change required" from
+    "the server is briefly down, keep waiting". Callers (recall's lifespan,
+    immune's Claude escalation, etc.) can catch this to surface the terminal
+    state on ``/health`` and skip the retry backoff. See issue #470.
+
+    Attributes:
+        reason: Short slug (e.g. ``"authorization_violation"``,
+            ``"AuthorizationError"``) that observers can key off without
+            parsing the message string.
+        original: The underlying exception raised by ``nats.connect``.
+    """
+
+    def __init__(self, message: str, *, reason: str, original: BaseException) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.original = original
+
+
+def _classify_terminal_nats_error(exc: BaseException) -> str | None:
+    """Return a short reason slug if ``exc`` is a terminal NATS error, else None.
+
+    Checks exception type first (cheapest, unambiguous) then falls back to
+    message matching for the ``nats.errors.Error("nats: '<server-msg>'")``
+    shape the protocol handler emits on server -ERR frames.
+    """
+    if isinstance(exc, _TERMINAL_NATS_EXCEPTION_TYPES):
+        return type(exc).__name__
+    msg = str(exc).lower()
+    for pattern in _TERMINAL_NATS_MESSAGES:
+        if pattern.lower() in msg:
+            return pattern.lower().replace(" ", "_")
+    return None
 
 
 async def connect_nats(
@@ -30,6 +102,15 @@ async def connect_nats(
     attempt (capped at max_delay), giving roughly 2 minutes of patience for
     NATS to become available — enough to survive cold-start races where the
     pod comes up before maki-nerve-nats is ready.
+
+    Terminal failures (bad auth token, TLS required, invalid credentials
+    file) skip the backoff entirely and raise :class:`NatsTerminalError`
+    immediately — no amount of retry fixes a config mismatch, and burning
+    ``max_retries`` seconds of backoff before surfacing the same permanent
+    failure was hiding the real problem behind what looked like a slow
+    init (see #470). Callers should catch ``NatsTerminalError`` distinctly
+    from other exceptions so ``/health`` can surface the terminal reason
+    and immune can escalate to Claude instead of reflex-restarting.
 
     Args:
         url: NATS server URL.
@@ -49,6 +130,28 @@ async def connect_nats(
             log.info("Connected to NATS", extra={"nats_url": url, "auth": bool(token), "attempt": attempt})
             return nc
         except Exception as exc:
+            reason = _classify_terminal_nats_error(exc)
+            if reason is not None:
+                # Permanent failure — a broken token / missing TLS cert /
+                # unparseable creds is not going to fix itself in 2 minutes
+                # of backoff. Bail immediately so the caller can decide
+                # what to expose on /health. See #470.
+                log.error(
+                    "NATS connection failed with terminal error — not retrying",
+                    extra={
+                        "nats_url": url,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "terminal": True,
+                        "reason": reason,
+                    },
+                )
+                raise NatsTerminalError(
+                    f"terminal NATS error ({reason}): {exc}",
+                    reason=reason,
+                    original=exc,
+                ) from exc
             if attempt >= max_retries:
                 log.error(
                     "Failed to connect to NATS after all retries",

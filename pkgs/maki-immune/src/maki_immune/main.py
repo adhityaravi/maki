@@ -123,6 +123,16 @@ DEFAULT_CONFIG = {
     "stuck_recovery_threshold_s": 86400,
     "stuck_recovery_cooldown_s": 21600,
     "stuck_recovery_allowlist": "maki-vault,maki-recall,maki-cortex,maki-stem,maki-ears,maki-synapse",
+    # Terminal-zombie escalation (#470): a pod stuck Running+ready=False
+    # whose /health body advertises a permanent error (bad NATS token, TLS
+    # required, etc.) gets escalated to Claude with a config-mismatch hint
+    # instead of a pointless pod delete. ``min_failures`` gates on
+    # consecutive tick-failures (≈5 min at 30s cadence) so a single
+    # rollout-race body-read doesn't fire; ``realert_interval_s`` keeps
+    # the alert stream loud enough to survive an ignored escalation
+    # without spamming every 30s tick.
+    "terminal_zombie_min_failures": 10,
+    "terminal_zombie_realert_interval_s": 3600,
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
