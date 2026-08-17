@@ -107,18 +107,35 @@ class GitHubIssueClient:
           lowest-priority issues, never the newest ones. Note the cap only
           bounds the returned slice; pagination still fetches every issue up
           to the last page hit.
+
+        Fetch direction is ``desc`` (newest first) so that within each
+        priority tier — and especially the untriaged (99) tier that holds
+        most issues — the head of the returned list is the *newest*
+        content. This matters because the priority sort is stable: within
+        a tier, items keep their fetch order. If a caller hits ``max_results``
+        and truncation drops the tail, dropping the *oldest* untriaged is
+        vastly safer than dropping the *newest* — the reflection dedup
+        pass only works if it can see what was recently filed. See #552.
         """
         try:
             issues: list[dict[str, Any]] = []
             page = 1
 
-            while max_results is None or len(issues) < max_results:
+            # Always page until GitHub returns a short page — the cap only
+            # bounds the returned slice, not the fetch. Breaking early on
+            # ``len(issues) >= max_results`` would defeat priority-sort-
+            # before-truncate: a P1 living on the next page would never be
+            # fetched and would never land at the head of the returned list
+            # (see #404 for the original sort-then-truncate fix). With 250+
+            # open issues this means ~3 API calls per invocation, which is
+            # cheap relative to the correctness win.
+            while True:
                 params: dict[str, Any] = {
                     "state": state,
                     "per_page": 100,
                     "page": page,
                     "sort": "created",
-                    "direction": "asc",
+                    "direction": "desc",
                 }
                 if labels:
                     params["labels"] = labels

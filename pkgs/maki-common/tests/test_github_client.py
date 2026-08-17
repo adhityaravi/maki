@@ -285,17 +285,18 @@ def test_list_issues_empty_on_http_error():
 def test_list_issues_sorts_by_priority_before_truncating():
     """Regression for #404: newest P1/P2 issues must survive the cap.
 
-    The API returns issues sorted asc-by-created, so newly-filed issues land
-    on the last page. If the cap is applied *before* the priority sort, those
-    fresh issues get silently dropped even when they carry P1/P2 labels — the
-    work loop then never sees them. Sort-then-truncate must land priority
-    issues at the head of the returned list regardless of file order.
+    Regardless of fetch direction, the priority sort must lift P1/P2 issues
+    to the head of the returned list *before* any cap-driven truncation, so
+    they always survive. The pages here are yielded in fixed order (P4s
+    first, P1/P2 last) to simulate a fetch where high-priority items live
+    on the trailing page — the head of the returned slice must still be
+    the P1/P2, not P4 filler.
     """
-    # Page 1: 100 low-priority issues (P4) filed first.
+    # Page 1: 100 low-priority issues (P4).
     page1 = [{"number": i, "labels": [{"name": "P4"}]} for i in range(100)]
-    # Page 2: 100 low-priority (P4) filed next.
+    # Page 2: 100 more low-priority (P4).
     page2 = [{"number": 100 + i, "labels": [{"name": "P4"}]} for i in range(100)]
-    # Page 3: the tail — a fresh P1 and P2 that must not be lost.
+    # Page 3: the tail — a P1 and P2 that must not be lost.
     page3 = [
         {"number": 200, "labels": [{"name": "P1"}]},
         {"number": 201, "labels": [{"name": "P2"}]},
@@ -307,7 +308,7 @@ def test_list_issues_sorts_by_priority_before_truncating():
 
     client = _make_client(handler)
     # Cap of 50 — the returned list must still surface the P1 and P2 at the
-    # head, not silently drop them along with the rest of the asc tail.
+    # head, not silently drop them along with the rest of the trailing tail.
     issues = _run(client.list_issues(max_results=50))
     assert len(issues) == 50
     numbers = [i["number"] for i in issues]
@@ -318,6 +319,56 @@ def test_list_issues_sorts_by_priority_before_truncating():
     assert priorities[0] == "P1"
     assert priorities[1] == "P2"
     assert all(p == "P4" for p in priorities[2:])
+
+
+def test_list_issues_fetches_newest_first_so_truncation_drops_oldest():
+    """Regression for #552: cap-hit truncation must drop OLDEST, not newest.
+
+    Silent oldest-first truncation caused reflection dedup blindness — every
+    cycle re-filed the same bug because it could not see the previous cycle's
+    output past the cap. Fetch must request ``direction=desc`` so that within
+    the untriaged tier (which is stable-sorted) the newest survive the cap.
+    """
+    seen_directions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_directions.append(request.url.params.get("direction", ""))
+        # Short page so pagination stops after one call.
+        return httpx.Response(200, json=[{"number": 1, "labels": []}])
+
+    client = _make_client(handler)
+    _run(client.list_issues())
+    assert seen_directions and all(d == "desc" for d in seen_directions), (
+        f"list_issues must fetch newest-first; got directions={seen_directions}"
+    )
+
+
+def test_list_issues_truncation_keeps_newest_untriaged():
+    """Regression for #552: after truncation, newest untriaged must survive.
+
+    The API is asked in ``direction=desc`` order, so with the priority sort
+    being stable within a tier, capping the returned slice should drop the
+    oldest untriaged issues rather than the newest — the reverse of the
+    pre-#552 default behavior.
+    """
+    # GitHub API returns issues in the direction we ask for; the handler
+    # honors that so this test exercises the true end-to-end ordering.
+    all_issues = [{"number": i, "labels": []} for i in range(150)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        direction = request.url.params.get("direction", "asc")
+        page = int(request.url.params.get("page", "1"))
+        ordered = list(reversed(all_issues)) if direction == "desc" else all_issues
+        start = (page - 1) * 100
+        return httpx.Response(200, json=ordered[start : start + 100])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues(max_results=50))
+    numbers = [i["number"] for i in issues]
+    assert len(numbers) == 50
+    # Newest (#149) must be present; oldest (#0) must be dropped.
+    assert 149 in numbers, "newest untriaged dropped — direction=asc regression"
+    assert 0 not in numbers, "oldest untriaged surfaced — cap ordering wrong"
 
 
 def test_list_issues_no_cap_when_max_results_none():

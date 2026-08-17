@@ -229,9 +229,13 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     open_issues: list[dict] = []
     if ctx.github:
         try:
-            # max_results=None → no cap; idle needs the full open set for
+            # max_results=None → no cap; idle needs the FULL open set for
             # dedup so newly-filed issues are still detected as duplicates
-            # even when the open count exceeds the default cap. See #404.
+            # even when the open count exceeds the default cap. If this ever
+            # falls back to the default 200 cap, the reflection dedup pass
+            # goes blind past the tail — see #552 (triplicate filings of
+            # #541/#548/#551 because each reflection cycle could not see
+            # what the previous had already filed). See also #404.
             issues = await ctx.github.list_issues(state="open", max_results=None)
             verified = await tag_unverified_issues(issues or [], ctx)
             # Preserve labels so the reflection prompt can show `human`/`draft`
