@@ -389,6 +389,96 @@ def test_list_issues_no_cap_when_max_results_none():
     assert calls == [1, 2, 3]  # stopped on short page, no over-fetch
 
 
+def test_search_issues_by_symbols_scores_and_sorts():
+    """≥min_matches enforced; scoring is by matched-symbol count desc."""
+    items = [
+        # Two symbols matched — should pass threshold.
+        {"number": 1, "title": "get_issue_comments truncates", "body": "affects github_client.py"},
+        # One symbol matched — below default threshold, must be dropped.
+        {"number": 2, "title": "Rework retries", "body": "touches github_client.py only"},
+        # Three symbols matched — should sort to the head.
+        {"number": 3, "title": "get_issue_comments per_page cap", "body": "in github_client.py"},
+        # A PR — must be filtered even if it matches.
+        {"number": 4, "title": "get_issue_comments PR", "body": "github_client.py per_page", "pull_request": {}},
+        # Zero symbols matched — dropped.
+        {"number": 5, "title": "Unrelated", "body": "nothing here"},
+    ]
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/search/issues"
+        captured.append(request.url.params.get("q", ""))
+        return httpx.Response(200, json={"items": items})
+
+    client = _make_client(handler)
+    results = _run(
+        client.search_issues_by_symbols(
+            ["get_issue_comments", "github_client.py", "per_page"],
+        )
+    )
+    # Quoted OR clause, correct repo scope.
+    assert captured and "repo:acme/widgets" in captured[0]
+    assert '"get_issue_comments"' in captured[0]
+    assert " OR " in captured[0]
+    # #3 (3 hits) beats #1 (2 hits); #2/#4/#5 dropped.
+    assert [r["number"] for r in results] == [3, 1]
+    assert results[0]["score"] == 3
+    assert set(results[0]["matched"]) == {"get_issue_comments", "github_client.py", "per_page"}
+    assert results[1]["score"] == 2
+
+
+def test_search_issues_by_symbols_empty_input_returns_empty():
+    """Whitespace-only or empty symbol list short-circuits — no request fired."""
+    fired: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fired.append(request)
+        return httpx.Response(200, json={"items": []})
+
+    client = _make_client(handler)
+    assert _run(client.search_issues_by_symbols([])) == []
+    assert _run(client.search_issues_by_symbols(["", "  "])) == []
+    assert fired == []
+
+
+def test_search_issues_by_symbols_caps_or_clause_at_five():
+    """GitHub rejects boolean queries with too many terms — cap at 5."""
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.url.params.get("q", ""))
+        return httpx.Response(200, json={"items": []})
+
+    client = _make_client(handler)
+    _run(client.search_issues_by_symbols(["a", "b", "c", "d", "e", "f", "g"]))
+    # 5 quoted terms → 4 " OR " joins in the OR clause.
+    assert captured and captured[0].count(" OR ") == 4
+
+
+def test_search_issues_by_symbols_returns_empty_on_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _make_client(handler)
+    assert _run(client.search_issues_by_symbols(["x", "y"])) == []
+
+
+def test_search_issues_by_symbols_min_matches_override():
+    """min_matches=1 lets single-symbol hits through."""
+    items = [
+        {"number": 10, "title": "single hit", "body": "just alpha here"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": items})
+
+    client = _make_client(handler)
+    default_result = _run(client.search_issues_by_symbols(["alpha", "beta"]))
+    assert default_result == []  # default min_matches=2 drops single-hit
+    loose_result = _run(client.search_issues_by_symbols(["alpha", "beta"], min_matches=1))
+    assert [r["number"] for r in loose_result] == [10]
+
+
 def test_find_open_issue_matches_title():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/search/issues"

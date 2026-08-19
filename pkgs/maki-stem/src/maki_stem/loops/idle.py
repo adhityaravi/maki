@@ -109,9 +109,18 @@ Use "automated" label too. Example: `labels="P3,automated"`.
 - **Always share something.** Every cycle, tell Adi what you found. One to three sentences. \
 What did you read? What bugged you? What did you file? This is your voice — use it.
 - Store learnings with add_memory.
-- **Dedup rule**: Before calling create_issue, check whether the thought is already \
-covered by an open issue in the list below (same topic, same intent). If it is → do NOT \
-create a duplicate. Still share what you found in your response — just don't double-file.
+- **Dedup rule (two-step, mandatory)**: The list below shows titles only, and titles vary too \
+much across cycles to catch semantic duplicates (see #682: 85 issues → 13 real bugs). Before \
+calling create_issue:
+  1. **Skim the titles below** for an obvious same-topic match. If one exists → comment on it \
+instead of filing.
+  2. **Always** call `search_issues_by_symbol` with 3–5 identifiers extracted from your draft \
+body — the specific function names, filenames, class names your finding touches (e.g. \
+`get_issue_comments,github_client.py,per_page`). If any open issue matches on ≥2 of those \
+symbols → comment on the highest-scoring match instead of filing new. Titles differ across \
+re-derivations of the same bug; symbols don't. Skipping this step is how the tracker \
+accumulated ~13 clusters of 5–12 duplicates each.
+Still share what you found in your response — just don't double-file.
 - **Hygiene rule**: For each issue in the list below, ask: is this already resolved? \
 Check the code if needed. If the fix is clearly in place → close_issue with a brief reason. \
 Don't close if uncertain. The work loop depends on this list being accurate."""

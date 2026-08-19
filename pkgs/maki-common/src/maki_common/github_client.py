@@ -222,6 +222,100 @@ class GitHubIssueClient:
             log.exception("Failed to search GitHub issues")
             return None
 
+    async def search_issues_by_symbols(
+        self,
+        symbols: list[str],
+        *,
+        state: str = "open",
+        min_matches: int = 2,
+        max_results: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Find issues whose title/body mentions ≥``min_matches`` of ``symbols``.
+
+        The idle-loop dedup rule (title-only substring match on a truncated
+        dashboard slice) misses semantic duplicates: the same underlying bug
+        gets re-derived from a different entry point, phrased around that
+        entry point, and filed as a new issue. See #682 for the systemic map.
+
+        This method is the structural fix. Callers extract 3–5 identifiers
+        (functions, filenames, class names) from a draft body and ask: "does
+        any open issue *already* discuss ≥2 of these symbols?" If yes, the
+        caller should comment on the existing issue instead of filing new.
+
+        Symbols are quoted in the GitHub search query so identifiers with
+        underscores/dots (``get_issue_comments``, ``github_client.py``) match
+        as whole tokens rather than word-broken fragments. Matches are then
+        re-counted locally against title+body because GitHub's ranking
+        doesn't tell us *which* symbols hit — we need the count to enforce
+        the ``min_matches`` threshold.
+
+        Args:
+            symbols: 1–5 identifiers (function/class/file names). Empty or
+                whitespace-only entries are dropped. GitHub caps a single
+                search at 256 chars, so callers should pass tight symbol
+                sets, not sprawling n-grams.
+            state: ``"open"`` (default) or ``"closed"``.
+            min_matches: Return only issues where this many symbols hit.
+                Default 2 — one shared identifier is too weak (many issues
+                mention ``request_restart`` incidentally), two is strong.
+            max_results: Cap the returned list. Default 20 keeps the dedup
+                pass cheap; raise only when scanning a wider net.
+
+        Returns:
+            List of ``{"number", "title", "matched": [symbols], "score": int}``,
+            sorted by score desc. Empty on error, empty input, or no hits.
+        """
+        clean = [s.strip() for s in symbols if s and s.strip()]
+        if not clean:
+            return []
+        # Cap the OR clause at 5 terms — GitHub search rejects longer boolean
+        # queries with a 422, and the top-5 most-specific identifiers from a
+        # draft are more than enough signal for dedup.
+        clean = clean[:5]
+        or_clause = " OR ".join(f'"{s}"' for s in clean)
+        search_q = f"repo:{self._repo_path} is:issue is:{state} ({or_clause})"
+        resp = await self._request(
+            "GET",
+            f"{API}/search/issues",
+            err_log="Failed to search issues by symbols",
+            err_extra={"symbols": clean},
+            params={"q": search_q, "per_page": max_results * 2},
+        )
+        if resp is None:
+            return []
+        try:
+            items = resp.json().get("items", [])
+        except Exception:
+            log.exception("Failed to parse issue-search response")
+            return []
+
+        lowered = [s.lower() for s in clean]
+        scored: list[dict[str, Any]] = []
+        for item in items:
+            # PRs also come back from /search/issues; skip them so dedup
+            # doesn't accidentally comment on an in-flight PR thread.
+            if "pull_request" in item:
+                continue
+            haystack = f"{item.get('title', '')}\n{item.get('body') or ''}".lower()
+            matched = [orig for orig, low in zip(clean, lowered, strict=True) if low in haystack]
+            if len(matched) < min_matches:
+                continue
+            scored.append(
+                {
+                    "number": item.get("number"),
+                    "title": item.get("title", ""),
+                    "matched": matched,
+                    "score": len(matched),
+                }
+            )
+        scored.sort(key=lambda r: r["score"], reverse=True)
+        result = scored[:max_results]
+        log.info(
+            "Symbol issue search complete",
+            extra={"symbols": clean, "hits": len(result), "state": state},
+        )
+        return result
+
     async def create_issue(
         self,
         title: str,
