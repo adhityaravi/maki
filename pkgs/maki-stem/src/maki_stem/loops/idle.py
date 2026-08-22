@@ -311,10 +311,10 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             await apply_config_updates(ctx.config_kv, config_updates, allowed_keys=set(ctx.default_config.keys()))
 
         if clean_thought:
-            thought_payload = {"text": clean_thought, "turn_id": turn_id}
-            await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
-            log.info("Thought published", extra={"turn_id": turn_id})
-
+            # Memory feed FIRST — it's the primary output (long-term continuity).
+            # Discord publish is secondary; a NATS hiccup on EARS_OUT must not
+            # erase the reflection from memory. Mirrors work.py's ordering
+            # (feed_memories before close_issue/comment_issue). See #414.
             state_summary = ctx.format_system_state(system_state)
             spawn_background(
                 ctx.feed_memories(
@@ -323,6 +323,20 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
                 ),
                 name="idle.feed_memories",
             )
+
+            # EARS_OUT publish is a best-effort side output. Narrow try/except
+            # so a NATS failure here can't unwind the enclosing turn — memory
+            # is already fed above, and we don't want to bubble up as
+            # "Idle turn failed" for what is really just a delivery blip.
+            try:
+                thought_payload = {"text": clean_thought, "turn_id": turn_id}
+                await ctx.nc.publish(EARS_OUT, json.dumps(thought_payload).encode())
+                log.info("Thought published", extra={"turn_id": turn_id})
+            except Exception:
+                log.exception(
+                    "Failed to publish reflection to ears — memory still fed",
+                    extra={"turn_id": turn_id},
+                )
 
     except TimeoutError:
         log.error("Idle turn timed out", extra={"turn_id": turn_id})
