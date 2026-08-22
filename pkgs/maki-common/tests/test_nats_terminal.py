@@ -122,10 +122,12 @@ def test_connect_nats_raises_terminal_on_auth_violation() -> None:
 
     async def scenario() -> None:
         # Monkeypatch nats.connect to our fake for the duration of the call.
+        # setattr keeps this invisible to ty's strict signature check — the
+        # fake intentionally has a wider return type than nats.connect.
         import maki_common.nats as mod
 
         real = mod.nats.connect
-        mod.nats.connect = _fake_connect  # type: ignore[assignment]
+        setattr(mod.nats, "connect", _fake_connect)
         try:
             raised: NatsTerminalError | None = None
             try:
@@ -139,7 +141,7 @@ def test_connect_nats_raises_terminal_on_auth_violation() -> None:
             assert raised.reason == "authorization_violation"
             assert "Authorization Violation" in str(raised.original)
         finally:
-            mod.nats.connect = real  # type: ignore[assignment]
+            setattr(mod.nats, "connect", real)
 
     _run(scenario())
 
@@ -157,7 +159,7 @@ def test_connect_nats_retries_on_transient() -> None:
         import maki_common.nats as mod
 
         real = mod.nats.connect
-        mod.nats.connect = _fake_connect  # type: ignore[assignment]
+        setattr(mod.nats, "connect", _fake_connect)
         try:
             raised: ConnectionRefusedError | None = None
             try:
@@ -169,6 +171,6 @@ def test_connect_nats_retries_on_transient() -> None:
             # non-terminal.
             assert call_count == 3, f"expected 3 attempts (transient retry), got {call_count}"
         finally:
-            mod.nats.connect = real  # type: ignore[assignment]
+            setattr(mod.nats, "connect", real)
 
     _run(scenario())
