@@ -32,6 +32,7 @@ from maki_common.subjects import (
     IMMUNE_COMMAND,
 )
 
+from maki_ears.dedup import claim_or_skip
 from maki_ears.trading import (
     TradeProposalView,
     handle_trade_command,
@@ -260,13 +261,20 @@ class MakiDiscordClient(discord.Client):
             await _handle_loop_command(message, content)
             return
 
-        # Dedup: if another ears instance already published this message, skip
-        msg_key = f"msg.{message.id}"
+        # Dedup: if another ears instance already published this message, skip.
+        # On transient KV errors, fail-open (process anyway) rather than silently
+        # drop the user's message — see #416. Dedup is defence-in-depth for
+        # blue/green; with a single replica today, a false-negative dupe is far
+        # worse than a rare double-process.
         try:
-            await _dedup_kv.create(msg_key, b"1")
+            if not await claim_or_skip(_dedup_kv, str(message.id), "message"):
+                return
         except Exception:
-            log.info("Dedup: message already claimed by another instance", extra={"message_id": str(message.id)})
-            return
+            log.warning(
+                "Dedup KV failed — fail-open, processing message anyway",
+                extra={"message_id": str(message.id)},
+                exc_info=True,
+            )
 
         payload = {
             "message_id": str(message.id),
@@ -328,13 +336,19 @@ class MakiDiscordClient(discord.Client):
 
 async def _handle_immune_command(message: discord.Message, content: str):
     """Handle messages in #maki-immune — forward to immune as direct commands."""
-    # Dedup: if another ears instance already published this command, skip
-    msg_key = f"msg.{message.id}"
+    # Dedup: if another ears instance already published this command, skip.
+    # Fail-open on transient KV errors so a NATS blip doesn't silently swallow
+    # an immune command (which is precisely when Adi is most likely to be
+    # investigating something that just broke). See #416.
     try:
-        await _dedup_kv.create(msg_key, b"1")
+        if not await claim_or_skip(_dedup_kv, str(message.id), "immune command"):
+            return
     except Exception:
-        log.info("Dedup: immune command already claimed", extra={"message_id": str(message.id)})
-        return
+        log.warning(
+            "Dedup KV failed — fail-open, processing immune command anyway",
+            extra={"message_id": str(message.id)},
+            exc_info=True,
+        )
 
     payload = {
         "message_id": str(message.id),
@@ -376,12 +390,16 @@ async def _handle_immune_command(message: discord.Message, content: str):
 
 async def _handle_loop_command(message: discord.Message, content: str) -> None:
     """Handle ``!loop <name>`` — forward to stem via EARS_IN, immediate ack, no typing."""
-    msg_key = f"msg.{message.id}"
+    # Fail-open on transient KV errors — see #416.
     try:
-        await _dedup_kv.create(msg_key, b"1")
+        if not await claim_or_skip(_dedup_kv, str(message.id), "loop command"):
+            return
     except Exception:
-        log.info("Dedup: loop command already claimed", extra={"message_id": str(message.id)})
-        return
+        log.warning(
+            "Dedup KV failed — fail-open, processing loop command anyway",
+            extra={"message_id": str(message.id)},
+            exc_info=True,
+        )
 
     tokens = content.strip().split()
     if len(tokens) < 2:

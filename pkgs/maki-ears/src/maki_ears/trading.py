@@ -20,6 +20,8 @@ from maki_common.trading import (
     parse_manual_command,
 )
 
+from maki_ears.dedup import claim_or_skip
+
 log = logging.getLogger(__name__)
 
 
@@ -265,12 +267,17 @@ async def handle_trade_command(
     that keeps error wording and accepted syntax in lock-step across both
     services (see issue #116).
     """
-    msg_key = f"msg.{message.id}"
+    # Fail-open on transient KV errors — a NATS blip must not silently drop
+    # a manual !trade (the user just typed real money into a command). See #416.
     try:
-        await dedup_kv.create(msg_key, b"1")
+        if not await claim_or_skip(dedup_kv, str(message.id), "trade command"):
+            return
     except Exception:
-        log.info("Dedup: trade command already claimed", extra={"message_id": str(message.id)})
-        return
+        log.warning(
+            "Dedup KV failed — fail-open, processing trade command anyway",
+            extra={"message_id": str(message.id)},
+            exc_info=True,
+        )
 
     try:
         parsed = parse_manual_command(content)
