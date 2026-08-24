@@ -706,15 +706,34 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "Silent error — not forwarding to Discord",
                     extra={"turn_id": turn_id, "error": str(exc)[:200]},
                 )
-                # Still send done signal so ears cleans up, but with empty response
-                await _publish_response(nc, turn_id, "", done=True)
+                # Still send done signal so ears cleans up, but with empty response.
+                # Mark ``cancelled=True`` so loop submitters (work/idle/care) can
+                # distinguish "cortex actually completed the work" from "cortex
+                # bailed out due to rate limit / capacity / quota". Without this
+                # flag, the work loop would treat an empty response as success,
+                # auto-close the issue with a blank comment, and wipe the
+                # per-issue failure backoff. See issue #422.
+                await _publish_response(
+                    nc,
+                    turn_id,
+                    "",
+                    done=True,
+                    cancelled=True,
+                    reason="cortex_silent_error",
+                )
             else:
-                # Genuine unexpected error — send a brief message
+                # Genuine unexpected error — send a brief message. Mark
+                # ``cancelled=True`` so loop submitters don't mistake the
+                # user-facing status text for actual task output (see #422).
+                # Discord/ears still delivers the visible message; callers that
+                # care about task completion (loops) check ``cancelled``.
                 await _publish_response(
                     nc,
                     turn_id,
                     "Something went wrong on my end. I'll try again next turn.",
                     done=True,
+                    cancelled=True,
+                    reason="cortex_error",
                 )
         finally:
             _turn_state.clear()

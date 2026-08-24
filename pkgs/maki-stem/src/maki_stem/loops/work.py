@@ -488,8 +488,52 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         )
         return
 
+    # Defensive contract check (issue #422)
+    # -------------------------------------
+    # ``done=True`` alone is not a completion signal — cortex publishes it on
+    # every terminal path, including silent rate-limit / capacity bailouts and
+    # generic errors where zero real work happened. Treat any of the following
+    # as a failure and route to the same backoff path as an exception:
+    #
+    #   - ``cancelled=True`` (cortex explicitly bailed — timeout, preemption,
+    #     silent error, generic error, cortex restart).
+    #   - Empty response body (cortex published a done chunk with nothing in it
+    #     — historically the silent-error branch did this without a cancelled
+    #     flag; belt-and-suspenders in case any future path repeats that).
+    #
+    # Without this guard, a 529/overloaded burst against cortex's model would
+    # cause the work loop to auto-close the issue with a blank "Task
+    # completed." comment, pollute memories with a phantom completion, and
+    # wipe the per-issue failure backoff via ``_clear_attempts``.
     result_text = response_data.get("response", "")
-    clean_result = strip_tags(result_text or "")
+    cancelled = bool(response_data.get("cancelled"))
+    if cancelled or not result_text.strip():
+        reason = response_data.get("reason") or ("cancelled" if cancelled else "empty_response")
+        log.warning(
+            "Work turn returned no usable result — treating as failure",
+            extra={
+                "turn_id": turn_id,
+                "issue": issue_number,
+                "cancelled": cancelled,
+                "reason": reason,
+                "response_len": len(result_text),
+            },
+        )
+        new_count = await _record_work_failure(ctx, issue_number, reason)
+        spawn_background(
+            ctx.github.comment_issue(
+                issue_number,
+                (
+                    f"⚠️ **Work bailed out** ({reason}, failure {new_count}). "
+                    f"Backing off — next eligible retry in "
+                    f"~{_backoff_seconds(new_count) // 3600}h."
+                ),
+            ),
+            name="work.cancelled_comment",
+        )
+        return
+
+    clean_result = strip_tags(result_text)
     log.info(
         "Work turn complete",
         extra={"turn_id": turn_id, "issue": issue_number},
