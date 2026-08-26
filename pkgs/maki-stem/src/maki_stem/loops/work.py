@@ -47,24 +47,28 @@ WORK_CRON = "0 3 * * *"
 
 # Prompt caching note
 # -------------------
-# The Claude Code CLI (which the Agent SDK uses) wraps the system prompt with
-# Anthropic prompt-caching breakpoints. Caching is a *prefix* match, so every
-# byte before the first variable character must stay byte-identical across
-# turns for the cache to hit. We therefore split the work prompt into a static
-# header (mode description, instructions, rules — identical across every work
-# turn) and a dynamic task block (issue #, title, description, comments) that
-# changes per turn. The final system prompt is assembled by
-# :func:`assemble_loop_prompt` as:
+# The Claude Code CLI (which the Agent SDK uses) marks the tail of the system
+# prompt with an Anthropic prompt-cache breakpoint. Caching is a *prefix* match
+# keyed off that breakpoint, so every byte of ``system_prompt`` must be
+# byte-identical across turns for the cache to hit. We therefore split the
+# work prompt into a static header (mode description, instructions, rules —
+# identical across every work turn) that flows into ``system_prompt``, and a
+# dynamic task block (issue #, title, description, comments, memories, graph)
+# that flows into the *human* turn via :func:`assemble_loop_prompt`:
 #
-#     identity            (static, shared by every loop)
-#   + TOOLS_PROMPT        (static, shared by every loop)
-#   + _WORK_STATIC_PROMPT (static across all work turns)
-#   + _WORK_TASK_TEMPLATE (dynamic — filled from the issue)
-#   + memories / graph    (dynamic)
+#     system_prompt (cached):
+#         identity            (static, shared by every loop)
+#       + TOOLS_PROMPT        (static, shared by every loop)
+#       + _WORK_STATIC_PROMPT (static across all work turns)
 #
-# Everything up to and including _WORK_STATIC_PROMPT is a stable ~2 KTok
-# prefix that the API can serve from cache at 90% discount on subsequent
-# tool-use turns inside a single streaming conversation.
+#     human_prefix (per-turn):
+#         _WORK_TASK_TEMPLATE (dynamic — filled from the issue)
+#       + memories / graph    (dynamic — freshly retrieved per turn)
+#
+# Everything in ``system_prompt`` is a stable ~2 KTok prefix that the API can
+# serve from cache at 90% discount on subsequent work turns. Prior to #437
+# the memories/graph/task blocks were concatenated into ``system_prompt``,
+# which silently invalidated the cache on every turn.
 _WORK_STATIC_PROMPT = """## Work Mode
 
 You have a GitHub issue to execute. Complete it fully — code changes, commit, \
@@ -117,17 +121,20 @@ Priority: {issue_priority}
 Comments: {issue_comments}"""
 
 
-def _build_work_system_prompt(
+def _build_work_prompts(
     identity: str,
     memories: list,
     graph_context: list,
     work_context: dict,
-) -> str:
-    """Assemble the complete system prompt for a work turn.
+) -> tuple[str, str]:
+    """Assemble the (system_prompt, human_prefix) tuple for a work turn.
 
-    Delegates the shared layout (identity + tools + memories + graph) to
-    :func:`assemble_loop_prompt` and only formats the work-specific main
-    section here.
+    Delegates the shared layout (identity + tools static header vs.
+    dynamic-context/memories/graph tail) to :func:`assemble_loop_prompt` and
+    only formats the work-specific dynamic task block here. The caller
+    concatenates ``human_prefix`` onto the human-turn ``prompt`` — keeping
+    the system prompt byte-stable across work turns so Anthropic prompt
+    caching actually hits (see the "Prompt caching note" above and #437).
     """
     raw_comments = work_context.get("issue_comments", [])
     if raw_comments:
@@ -146,9 +153,7 @@ def _build_work_system_prompt(
         issue_priority=work_context.get("issue_priority", "?"),
         issue_comments=issue_comments_str,
     )
-    main_section = f"{_WORK_STATIC_PROMPT}\n\n{dynamic}"
-
-    return assemble_loop_prompt(identity, main_section, memories, graph_context)
+    return assemble_loop_prompt(identity, _WORK_STATIC_PROMPT, dynamic, memories, graph_context)
 
 
 def _issue_has_skip_label(issue: dict) -> bool:
@@ -394,6 +399,11 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "issue_priority": issue_priority,
         "issue_comments": issue_comments,
     }
+    system_prompt, human_prefix = _build_work_prompts(identity, memories, graph_context, work_context)
+    # Dynamic per-turn context (task block, memories, graph) rides on the
+    # human message so ``system_prompt`` stays byte-stable across work turns —
+    # required for Anthropic prompt-cache hits. See #437.
+    human_prompt = f"{human_prefix}\n\nExecute this task." if human_prefix else "Execute this task."
     work_payload = {
         "turn_id": turn_id,
         "mode": "work",
@@ -401,12 +411,12 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "conversation": [],
         "memories": memories,
         "graph_context": graph_context,
-        "prompt": "Execute this task.",
+        "prompt": human_prompt,
         "stream": False,
         "max_turns": int(os.environ.get("CORTEX_WORK_MAX_TURNS", "100")),
         "git_pull": True,
         "work_context": work_context,
-        "system_prompt": _build_work_system_prompt(identity, memories, graph_context, work_context),
+        "system_prompt": system_prompt,
         **({"model": spec.model} if spec.model else {}),
     }
 

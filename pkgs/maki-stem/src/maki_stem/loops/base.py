@@ -138,43 +138,62 @@ async def load_identity(kv: Any) -> str:
 
 def assemble_loop_prompt(
     identity: str,
-    main_section: str,
+    static_header: str,
+    dynamic_context: str,
     memories: list,
     graph_context: list,
-) -> str:
-    """Assemble the shared loop system prompt layout.
+) -> tuple[str, str]:
+    """Split the loop prompt into a byte-stable system prompt and a per-turn human prefix.
 
-    Ordering is tuned for Anthropic prompt-cache reuse — every static section
-    comes first, every dynamic section last:
+    Anthropic prompt caching is a *prefix* match keyed off the last
+    ``cache_control`` breakpoint. The Claude Agent SDK marks the end of
+    ``system_prompt`` as such a breakpoint, so anything byte-stable across
+    turns MUST live in the returned ``system_prompt`` and anything that
+    changes per turn MUST live in the returned ``human_prefix`` (which the
+    caller concatenates onto the human message). Concatenating dynamic
+    content into the system prompt — the previous shape of this helper —
+    silently killed cache reuse on every turn (issue #437).
 
-        identity        (static, shared by every loop)
-      + TOOLS_PROMPT    (static, shared by every loop)
-      + main_section    (loop-specific: static header + dynamic context)
-      + memories        (dynamic tail)
-      + graph_context   (dynamic tail)
+    Split:
 
-    Each loop supplies its own *main_section* (static prompt concatenated with
-    its formatted dynamic template) and lets this function handle the shared
-    identity prefix, tools block, and memory/graph tail.
+        system_prompt (stable → cached):
+            identity        (loaded once from KV per turn; changes only when Adi edits)
+          + TOOLS_PROMPT    (module constant, shared by every loop)
+          + static_header   (loop-specific mode/rules text)
+
+        human_prefix (rebuilt per turn):
+            dynamic_context (per-turn task/context: issue details, system state, etc.)
+          + memories_block  (freshly retrieved per turn)
+          + graph_block     (freshly retrieved per turn)
+
+    The caller merges ``human_prefix`` into its human-turn ``prompt`` (typically
+    ``f"{human_prefix}\\n\\n{prompt}"``). Returning both strings — rather than
+    burying the split in each loop — keeps every loop's cache story identical.
     """
-    parts: list[str] = []
-
     # --- Static prefix (cacheable) ---
+    system_parts: list[str] = []
     if identity:
-        parts.append(identity)
-    parts.append(TOOLS_PROMPT)
-    parts.append(main_section)
+        system_parts.append(identity)
+    system_parts.append(TOOLS_PROMPT)
+    if static_header:
+        system_parts.append(static_header)
+    system_prompt = "\n\n".join(system_parts)
 
-    # --- Dynamic tail (changes per turn) ---
+    # --- Dynamic tail (changes per turn) — goes into the human message ---
+    human_parts: list[str] = []
+    if dynamic_context:
+        human_parts.append(dynamic_context)
+
     memories_block = format_memories_block(memories)
     if memories_block:
-        parts.append(memories_block)
+        human_parts.append(memories_block)
 
     graph_block = format_graph_block(graph_context)
     if graph_block:
-        parts.append(graph_block)
+        human_parts.append(graph_block)
 
-    return "\n\n".join(parts)
+    human_prefix = "\n\n".join(human_parts)
+    return system_prompt, human_prefix
 
 
 @dataclass

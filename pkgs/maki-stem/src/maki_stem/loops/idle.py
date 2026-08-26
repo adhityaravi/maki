@@ -140,17 +140,20 @@ Last interaction with Adi: {hours_since}h ago
 Local time: {local_time}, {day_of_week}"""
 
 
-def _build_idle_system_prompt(
+def _build_idle_prompts(
     identity: str,
     memories: list,
     graph_context: list,
     idle_context: dict,
-) -> str:
-    """Assemble the complete system prompt for an idle reflection turn.
+) -> tuple[str, str]:
+    """Assemble the (system_prompt, human_prefix) tuple for an idle reflection turn.
 
-    Delegates the shared layout (identity + tools + memories + graph) to
-    :func:`assemble_loop_prompt` and only formats the idle-specific main
-    section here.
+    Delegates the shared layout (identity + tools + static header vs.
+    dynamic-context/memories/graph tail) to :func:`assemble_loop_prompt` and
+    only formats the idle-specific dynamic context block here. The caller
+    concatenates ``human_prefix`` onto the human-turn ``prompt`` — keeping
+    the system prompt byte-stable across idle turns so Anthropic prompt
+    caching actually hits (see #437).
     """
     time_ctx = idle_context.get("time_context", {})
     system_state = idle_context.get("system_state", {})
@@ -180,9 +183,7 @@ def _build_idle_system_prompt(
         local_time=time_ctx.get("local_time", "?"),
         day_of_week=datetime.now().strftime("%A"),
     )
-    main_section = f"{_IDLE_STATIC_PROMPT}\n\n{dynamic}"
-
-    return assemble_loop_prompt(identity, main_section, memories, graph_context)
+    return assemble_loop_prompt(identity, _IDLE_STATIC_PROMPT, dynamic, memories, graph_context)
 
 
 # Rotating memory search queries — varied by hour so each cycle surfaces different memories.
@@ -275,6 +276,11 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "system_state": system_state,
         "open_issues": open_issues,
     }
+    system_prompt, human_prefix = _build_idle_prompts(identity, memories, graph_context, idle_context)
+    # Dynamic per-turn context (issues list, system state, config, memories,
+    # graph) rides on the human message so ``system_prompt`` stays byte-stable
+    # across idle turns — required for Anthropic prompt-cache hits. See #437.
+    human_prompt = f"{human_prefix}\n\nReflect." if human_prefix else "Reflect."
     idle_payload = {
         "turn_id": turn_id,
         "mode": "idle_reflection",
@@ -282,10 +288,10 @@ async def _idle_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "conversation": [],
         "memories": memories,
         "graph_context": graph_context,
-        "prompt": "Reflect.",
+        "prompt": human_prompt,
         "stream": False,
         "idle_context": idle_context,
-        "system_prompt": _build_idle_system_prompt(identity, memories, graph_context, idle_context),
+        "system_prompt": system_prompt,
         **({"model": spec.model} if spec.model else {}),
     }
 
