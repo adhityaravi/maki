@@ -7,6 +7,7 @@ import base64
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -344,6 +345,14 @@ class RepoEntry:
     `path` is the local clone directory. `owner`/`name` identify the GitHub
     repo for push-URL construction. `auth` is the GitHubAuth used for clone
     and push; if None, operations run without injected credentials.
+
+    `last_synced_at` is a monotonic-clock timestamp (see ``time.monotonic``)
+    of the last successful ``hard_sync`` on this entry. ``RepoRegistry.resolve``
+    uses it to gate per-resolve auto-sync behind a TTL, so a burst of tool
+    calls hitting the same auxiliary repo folds down to one network fetch. The
+    initial ``0.0`` is intentional — it forces the first ``resolve`` after a
+    process restart (or after a clone that pre-dates the sync mechanism) to
+    fetch fresh, rather than trusting whatever snapshot happens to be on disk.
     """
 
     path: str
@@ -351,6 +360,7 @@ class RepoEntry:
     name: str
     auth: Any | None = None
     clone_url: str | None = None
+    last_synced_at: float = 0.0
 
     def resolved_clone_url(self) -> str:
         return self.clone_url or clean_remote_url(self.owner, self.name)
@@ -371,13 +381,39 @@ class RepoRegistry:
     Auto-clones inherit the default repo's auth — typically the makiself[bot]
     installation, which has access to every repo in adhityaravi/*. A repo the
     bot has no installation access to will fail at clone with a redacted error.
+
+    Freshness (issue #450). Every ``resolve`` also fast-forwards the workspace
+    to ``origin/main`` via ``hard_sync``, bounded by ``sync_ttl_seconds`` per
+    repo — so a burst of tool calls in the same turn folds down to one fetch,
+    and repos-that-haven't-been-touched-in-days still get fresh code on the
+    next resolve. Without this, the primary maki repo stayed fresh (cortex
+    calls ``hard_sync`` at the top of each turn) but auxiliary repos
+    auto-registered via ``owner/name`` were cloned once and never pulled again
+    — every subsequent read hit whatever snapshot happened to be on disk. Same
+    silent-stale-code failure mode ``hard_sync`` was invented to prevent
+    (#290), on a different code path. On sync failure the resolver returns
+    ``None`` rather than silently serving the stale on-disk snapshot,
+    mirroring the "loud failure over quiet staleness" contract cortex already
+    holds. Pass ``sync_ttl_seconds=float("inf")`` to disable auto-sync (used
+    by tests with fake ``.git`` fixtures that would trip the real fetch).
     """
 
-    def __init__(self, workspace_root: str = "/repo") -> None:
+    def __init__(
+        self,
+        workspace_root: str = "/repo",
+        *,
+        sync_ttl_seconds: float = 60.0,
+    ) -> None:
         self._repos: dict[str, RepoEntry] = {}
         self._default_key: str | None = None
         self._workspace_root = workspace_root
         self._clone_lock = asyncio.Lock()
+        # Per-repo sync lock so a burst of concurrent tool calls against the
+        # same repo collapses to one fetch (the losers see fresh state under
+        # the re-check inside the lock) — but concurrent resolves against
+        # *different* repos don't serialize on each other.
+        self._sync_locks: dict[str, asyncio.Lock] = {}
+        self._sync_ttl_seconds = sync_ttl_seconds
 
     def register(
         self,
@@ -404,16 +440,36 @@ class RepoRegistry:
         """Return the list of registered keys (for diagnostics/error messages)."""
         return sorted(set(self._repos.keys()))
 
+    def _sync_lock_for(self, entry: RepoEntry) -> asyncio.Lock:
+        """Return (creating if needed) the async lock for this repo's sync path."""
+        key = f"{entry.owner}/{entry.name}"
+        lock = self._sync_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sync_locks[key] = lock
+        return lock
+
     async def resolve(self, repo_key: str | None) -> RepoEntry | None:
         """Resolve a repo arg to an entry, cloning unknown `owner/name` on demand.
 
-        Returns None when the registry has no default and `repo_key` is empty,
-        or when an unknown key cannot be auto-registered (no `owner/name` form).
+        After ensuring the clone exists, fast-forward to ``origin/main`` via
+        ``hard_sync`` when the entry's last-synced timestamp is older than
+        ``sync_ttl_seconds``. See the class docstring for the rationale
+        (issue #450) — the short version: without this, auxiliary repos went
+        stale forever.
+
+        Returns None when:
+          - the registry has no default and ``repo_key`` is empty;
+          - an unknown key cannot be auto-registered (no ``owner/name`` form);
+          - the clone attempt failed;
+          - the sync attempt failed (we refuse to serve a known-possibly-stale
+            snapshot; loud failure over silent staleness — issue #290).
         """
         if not repo_key:
-            return self.default()
-
-        if repo_key in self._repos:
+            entry = self.default()
+            if entry is None:
+                return None
+        elif repo_key in self._repos:
             entry = self._repos[repo_key]
         elif "/" in repo_key:
             owner, name = repo_key.split("/", 1)
@@ -440,4 +496,46 @@ class RepoRegistry:
                     ok = await init_repo(entry.path, entry.resolved_clone_url(), github_auth=entry.auth)
                     if not ok:
                         return None
+                    # A fresh clone lands on origin/HEAD by definition — treat
+                    # it as just-synced so we don't immediately fetch again.
+                    entry.last_synced_at = time.monotonic()
+                    return entry
+
+        # Fast-forward to origin/main if the last sync is older than the TTL.
+        # The TTL bounds the network cost of a burst of tool calls against the
+        # same repo: only the first crosses the threshold; the rest see fresh
+        # state. `float("inf")` disables auto-sync entirely (used by tests
+        # that seed a fake `.git` dir which isn't a real git workspace).
+        if time.monotonic() - entry.last_synced_at < self._sync_ttl_seconds:
+            return entry
+
+        async with self._sync_lock_for(entry):
+            # Re-check under the lock — a concurrent resolve may have just
+            # completed a sync while we waited.
+            if time.monotonic() - entry.last_synced_at < self._sync_ttl_seconds:
+                return entry
+            try:
+                await hard_sync(
+                    entry.path,
+                    github_auth=entry.auth,
+                    clone_url=entry.resolved_clone_url(),
+                )
+            except SyncError as exc:
+                # Refuse to serve possibly-stale code. The alternative
+                # (log-and-return-entry) is exactly the silent-stale-code
+                # failure mode issue #290 was written to eliminate.
+                # `exc.stderr` is pre-redacted by `_run_git`.
+                log.warning(
+                    "Auto-sync failed for %s/%s — refusing to serve stale disk state",
+                    entry.owner,
+                    entry.name,
+                    extra={
+                        "step": exc.step,
+                        "returncode": exc.returncode,
+                        "stderr": exc.stderr,
+                    },
+                )
+                return None
+            entry.last_synced_at = time.monotonic()
+
         return entry

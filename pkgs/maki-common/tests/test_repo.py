@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -137,7 +138,10 @@ def _make_git_dir(tmp_path: Path, name: str) -> Path:
 
 def test_registry_resolves_default_when_repo_arg_missing(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    # `sync_ttl_seconds=inf` disables the sync-on-resolve path (issue #450) so
+    # this test — which is only exercising registration lookup, not freshness
+    # — doesn't try to `git fetch` against a fake `.git` dir.
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     entry = asyncio.run(reg.resolve(None))
@@ -152,7 +156,7 @@ def test_registry_resolves_default_when_repo_arg_missing(tmp_path: Path) -> None
 
 def test_registry_resolves_known_short_and_full_keys(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     by_name = asyncio.run(reg.resolve("maki"))
@@ -162,14 +166,14 @@ def test_registry_resolves_known_short_and_full_keys(tmp_path: Path) -> None:
 
 def test_registry_returns_none_for_unknown_short_name(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     assert asyncio.run(reg.resolve("charmarr")) is None
 
 
 def test_registry_returns_none_when_no_default_and_no_arg() -> None:
-    reg = RepoRegistry(workspace_root="/tmp")
+    reg = RepoRegistry(workspace_root="/tmp", sync_ttl_seconds=float("inf"))
     assert asyncio.run(reg.resolve(None)) is None
     assert reg.default() is None
 
@@ -177,7 +181,7 @@ def test_registry_returns_none_when_no_default_and_no_arg() -> None:
 def test_registry_auto_registers_owner_slash_name_for_existing_clone(tmp_path: Path) -> None:
     """If the workspace already has a `.git` dir, no clone is attempted."""
     repo = _make_git_dir(tmp_path, "charmarr")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     # No default, but owner/name still resolves because the path already exists.
     entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
     assert entry is not None
@@ -193,7 +197,7 @@ def test_registry_inherits_default_auth_for_auto_registered(tmp_path: Path) -> N
     _make_git_dir(tmp_path, "maki")
     _make_git_dir(tmp_path, "charmarr")
     sentinel_auth = object()
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(
         RepoEntry(
             path=str(tmp_path / "maki"),
@@ -210,10 +214,195 @@ def test_registry_inherits_default_auth_for_auto_registered(tmp_path: Path) -> N
 
 
 def test_registry_rejects_malformed_owner_slash_name() -> None:
-    reg = RepoRegistry(workspace_root="/tmp")
+    reg = RepoRegistry(workspace_root="/tmp", sync_ttl_seconds=float("inf"))
     assert asyncio.run(reg.resolve("/")) is None
     assert asyncio.run(reg.resolve("owner/")) is None
     assert asyncio.run(reg.resolve("/name")) is None
+
+
+# ---------------------------------------------------------------------------
+# Sync-on-resolve — issue #450. Before this change, `RepoRegistry.resolve`
+# only ever cloned an auxiliary `owner/name` repo once. Every subsequent
+# tool call saw the day-0 disk snapshot, however many days later. These
+# tests pin the new contract:
+#
+#   1. First resolve of an existing (already-cloned) auxiliary repo triggers
+#      `hard_sync` — the original bug's fix.
+#   2. A burst of tool calls within `sync_ttl_seconds` folds down to ONE
+#      fetch (TTL cache). Without this, chatty codegraph tool calls would
+#      hammer GitHub.
+#   3. Once TTL elapses, the next resolve fetches again.
+#   4. Fresh clones don't double-sync — they're already at HEAD.
+#   5. Sync failure returns None. We refuse to serve possibly-stale data;
+#      that's exactly the silent-stale failure mode issue #290 forbade.
+# ---------------------------------------------------------------------------
+
+
+def test_registry_syncs_existing_clone_on_first_resolve(tmp_path: Path) -> None:
+    """Issue #450: auxiliary repos with a `.git` dir must still get fetched.
+
+    Previously the guard `if not os.path.exists(.git)` short-circuited every
+    resolve after the initial clone. This test asserts `hard_sync` now runs
+    on the first resolve after (re)startup even when the clone is present.
+    """
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append((repo_path, kwargs))
+
+    with mock.patch("maki_common.repo.hard_sync", fake_hard_sync):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is not None
+    assert entry.name == "charmarr"
+    assert len(calls) == 1
+    assert calls[0][0] == str(tmp_path / "charmarr")
+    # The clone URL must be passed so hard_sync can rewrite `origin` to the
+    # token-free form (issue #347).
+    assert calls[0][1]["clone_url"] == "https://github.com/adhityaravi/charmarr.git"
+
+
+def test_registry_folds_burst_of_resolves_within_ttl_to_one_sync(tmp_path: Path) -> None:
+    """A chatty burst of tool calls must NOT trigger N network fetches."""
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append(repo_path)
+
+    fake_now = [1000.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.time.monotonic", fake_monotonic),
+    ):
+        # First resolve: last_synced_at=0.0, so 1000-0 >= 60 → sync.
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        # Advance 30s (still inside 60s TTL) — must NOT sync again.
+        fake_now[0] += 30.0
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert calls == [str(tmp_path / "charmarr")]
+
+
+def test_registry_re_syncs_after_ttl_expiry(tmp_path: Path) -> None:
+    """The TTL bounds burst cost, but the repo still eventually gets fresh."""
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append(repo_path)
+
+    fake_now = [1000.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.time.monotonic", fake_monotonic),
+    ):
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        assert len(calls) == 1
+        # Advance well past the TTL — next resolve must fetch again.
+        fake_now[0] += 120.0
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert len(calls) == 2
+
+
+def test_registry_sync_failure_returns_none_not_stale_entry(tmp_path: Path) -> None:
+    """Loud failure over silent staleness (issue #290 contract).
+
+    If `hard_sync` fails we cannot know whether the disk is fresh. Rather
+    than serve a possibly-week-old snapshot and let the caller reason about
+    stale code, `resolve` returns None. Same shape as clone-failure today.
+    """
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    async def failing_hard_sync(repo_path: str, **kwargs) -> None:
+        raise SyncError("fetch", 1, "fatal: could not resolve host github.com")
+
+    with mock.patch("maki_common.repo.hard_sync", failing_hard_sync):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is None
+
+
+def test_registry_fresh_clone_does_not_double_sync(tmp_path: Path) -> None:
+    """A brand-new clone is at origin/HEAD already — no fetch needed."""
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    hard_sync_calls: list[str] = []
+    init_repo_calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        hard_sync_calls.append(repo_path)
+
+    async def fake_init_repo(repo_path: str, *args, **kwargs) -> bool:
+        init_repo_calls.append(repo_path)
+        # Simulate the clone by creating the `.git` dir the guard checks for.
+        os.makedirs(os.path.join(repo_path, ".git"), exist_ok=True)
+        return True
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.init_repo", fake_init_repo),
+    ):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is not None
+    assert len(init_repo_calls) == 1
+    # Critical: hard_sync must NOT have run after the clone — the freshly
+    # cloned tree is already at origin/HEAD, and re-fetching would waste a
+    # network round-trip on every first-clone.
+    assert hard_sync_calls == []
+    # And the entry's timestamp is set so the next same-turn resolve
+    # (within the TTL) is a no-op.
+    assert entry.last_synced_at > 0.0
+
+
+def test_registry_sync_uses_entry_auth(tmp_path: Path) -> None:
+    """Auth from the registered entry must flow through to `hard_sync`."""
+    _make_git_dir(tmp_path, "charmarr")
+    sentinel_auth = object()
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+    reg.register(
+        RepoEntry(
+            path=str(tmp_path / "charmarr"),
+            owner="adhityaravi",
+            name="charmarr",
+            auth=sentinel_auth,
+        )
+    )
+
+    seen_auth: list[object] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        seen_auth.append(kwargs.get("github_auth"))
+
+    with mock.patch("maki_common.repo.hard_sync", fake_hard_sync):
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert seen_auth == [sentinel_auth]
+
+
+def test_registry_repo_entry_last_synced_at_defaults_to_zero() -> None:
+    """New entries default to `never synced` so the first resolve fetches."""
+    entry = RepoEntry(path="/repo/x", owner="o", name="x")
+    assert entry.last_synced_at == 0.0
 
 
 def test_repo_entry_default_clone_url_uses_owner_name() -> None:
