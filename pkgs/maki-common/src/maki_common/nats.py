@@ -193,9 +193,30 @@ async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> Ke
         for key, value in defaults.items():
             try:
                 await kv.get(key)
-            except Exception:
+            except nats.js.errors.KeyNotFoundError:
+                # Genuine unset key — seed the default. This is the only
+                # branch that should write to KV; any other exception is a
+                # transient blip (mid-init reconnect, TLS renegotiation,
+                # request timeout during consumer rebalance) and MUST NOT
+                # overwrite whatever live value is already persisted. See
+                # issue #456: a bare ``except:`` here silently clobbered
+                # runtime-tuned config (chat_model, retention knobs, …)
+                # back to the stale default any time init raced with a
+                # NATS blip — no ERROR log, just an INFO "Seeded KV
+                # default" that read as normal first-boot behaviour.
                 await kv.put(key, json.dumps(value).encode())
                 log.info("Seeded KV default", extra={"bucket": bucket, "key": key, "value": value})
+            except Exception:
+                # Transient / unexpected — leave the persisted value alone
+                # and log loudly so the blip is visible instead of masked
+                # as a normal seed. Losing tuned config to a silent
+                # default-overwrite is materially worse than skipping a
+                # seed attempt this boot; the read side will see the
+                # existing value on the next call.
+                log.exception(
+                    "init_kv: unexpected error reading key — leaving persisted value alone",
+                    extra={"bucket": bucket, "key": key},
+                )
 
     return kv
 
