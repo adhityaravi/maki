@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 
@@ -622,14 +623,37 @@ class ImmuneHealthMonitor:
 
     # --- Cortex Heartbeat ---
 
+    def _fresh_hive_peers(self) -> Iterator[tuple[str, dict]]:
+        """Yield (site, state) for peers whose gossip is within the stale threshold.
+
+        Read-time freshness filter — the invariant "only fresh peers count"
+        must hold everywhere ``_hive_state`` is consulted, because the only
+        pruner runs inside ``_handle_gossip`` and fires *on receipt*. If gossip
+        stops arriving (NATS partition, all peer immunes down, the
+        ``subscribe_supervised`` loop drops without re-subscribing, or
+        ``_handle_gossip`` raises before reaching the prune), entries retain
+        their old ``received_at`` forever. Downstream reads — most dangerously
+        the ``_check_stuck_recovery`` sanity gate that authorises an
+        autonomous ``delete pod`` — would then treat those stale entries as
+        live peers confirming the recipe works, when in reality nobody has
+        reported in for hours. Filtering at read time is O(peers), cheap, and
+        eliminates the "prune fires only on receipt" trap with no timing gap.
+        """
+        now = time.time()
+        for site, state in self._hive_state.items():
+            received_at = state.get("received_at", 0)
+            if now - received_at <= self._gossip_stale_threshold:
+                yield site, state
+
     def _hive_cortex_status(self) -> tuple[int, int]:
         """Count how many hive sites (local + remote peers) have healthy cortex."""
         # Include local site
         total = 1
         local_last = self._cortex_state["last_heartbeat"]
         healthy = 1 if local_last and (time.time() - local_last) < 60 else 0
-        # Include remote peers from hive gossip
-        for _site, state in self._hive_state.items():
+        # Include remote peers from hive gossip (freshness-filtered — stale
+        # entries would otherwise inflate the cortex heartbeat health signal).
+        for _site, state in self._fresh_hive_peers():
             total += 1
             cortex_info = state.get("cortex", {})
             age = cortex_info.get("last_heartbeat_age_s")
@@ -638,9 +662,14 @@ class ImmuneHealthMonitor:
         return total, healthy
 
     def component_healthy_in_hive(self, component: str) -> list[str]:
-        """Return list of hive site names where this component is healthy."""
+        """Return list of hive site names where this component is healthy.
+
+        Filtered to fresh peers only — a stale entry here would authorise the
+        stuck-recovery ``delete pod`` path (``_check_stuck_recovery``) on the
+        basis of a peer that hasn't gossiped in hours.
+        """
         healthy_sites = []
-        for site, state in self._hive_state.items():
+        for site, state in self._fresh_hive_peers():
             peer_health = state.get("component_health", {})
             comp_state = peer_health.get(component, {})
             if comp_state.get("healthy"):
