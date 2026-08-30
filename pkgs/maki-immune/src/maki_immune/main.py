@@ -455,24 +455,42 @@ def _schedule_persist_recent_actions():
 
 
 async def _publish_alert(alert_text: str):
-    """Publish urgent alert to JetStream."""
+    """Publish urgent alert to JetStream (fire-and-forget; swallows publish errors).
+
+    Callers invoke this mid-flow right after a critical side effect (pod deleted,
+    deploy rolled back, escalation classified). A JetStream hiccup here must not
+    propagate up and short-circuit the tail of the caller's block or cause its
+    ``except`` handler to mis-attribute the failure — see #472.
+    """
     payload = {"alert": alert_text, "timestamp": time.time()}
-    await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
-    log.info("Alert published", extra={"alert_preview": alert_text[:100]})
+    try:
+        await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
+        log.info("Alert published", extra={"alert_preview": alert_text[:100]})
+    except Exception:
+        log.exception("Failed to publish alert", extra={"alert_preview": alert_text[:100]})
 
 
 async def _publish_vitals(digest: str):
-    """Publish health digest to JetStream for #maki-vitals."""
+    """Publish health digest to JetStream for #maki-vitals (fire-and-forget; see #472)."""
     payload = {"digest": digest, "timestamp": time.time()}
-    await _js.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
-    log.info("Vitals digest published", extra={"digest_len": len(digest)})
+    try:
+        await _js.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
+        log.info("Vitals digest published", extra={"digest_len": len(digest)})
+    except Exception:
+        log.exception("Failed to publish vitals digest", extra={"digest_len": len(digest)})
 
 
 async def _publish_immune_response(message_id: str, response: str):
-    """Publish immune command response back to ears for #maki-immune."""
+    """Publish immune command response back to ears for #maki-immune (fire-and-forget; see #472)."""
     payload = {"message_id": message_id, "response": response}
-    await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
-    log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
+    try:
+        await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
+        log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
+    except Exception:
+        log.exception(
+            "Failed to publish immune response",
+            extra={"message_id": message_id, "response_len": len(response)},
+        )
 
 
 # --- State Request Handlers ---
