@@ -90,6 +90,15 @@ async def tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[di
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
 CRON_WINDOW_SECONDS = 1800  # 30 minutes
 
+# When a loop body raises, `_run_loop` releases the KV claim so another attempt
+# (this instance or another replica) can pick up inside the same cron window
+# rather than losing the whole window to a single crash (issue #474). To avoid
+# hammering the claim → delete → re-claim cycle when a body crashes
+# deterministically on every call, we stop releasing after this many consecutive
+# failures — the claim then rides out its full TTL and the loop backs off until
+# the next execution_interval boundary.
+LOOP_RELEASE_FAILURE_LIMIT = 3
+
 # Shared tools listing injected into every loop system prompt.
 # Lives here so all loops stay in sync — edit once, affects all.
 TOOLS_PROMPT = """## Tools
@@ -261,11 +270,33 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
     Handles: periodic sleep, config loading, optional pre-claim guard, distributed
     lock claiming, and top-level exception isolation. Per-loop variation lives
     entirely inside *spec.pre_claim_guard* and *spec.body*.
+
+    Body-failure handling (issue #474)
+    ----------------------------------
+    ``try_claim_loop`` writes a KV lease with TTL == ``execution_interval`` (up
+    to 24h for the work loop). If ``spec.body`` raises, the top-level
+    ``except Exception`` used to swallow the error and move on with the claim
+    still held for the full TTL — a single crash inside a 30-minute cron window
+    silently killed the whole window (and, for the work loop, the whole day).
+    We now:
+
+    * wrap ``spec.body`` in its own ``try`` so we can distinguish body failures
+      from pre-claim failures;
+    * on body failure, best-effort ``delete`` the claim key so another attempt
+      (this instance on the next ``check_interval`` tick, or a peer replica)
+      can pick up inside the same cron window;
+    * track consecutive failures per loop instance and stop releasing after
+      :data:`LOOP_RELEASE_FAILURE_LIMIT` — a deterministically-crashing body
+      would otherwise ping-pong claim/delete every ``check_interval`` seconds;
+    * write ``loop.last_failure.<name>`` so operators (and immune's health
+      checks) can see a "body failed" signal distinct from "body succeeded
+      and wrote a heartbeat" or "body never ran".
     """
     log.info(
         "Loop started",
         extra={"loop": spec.name, "check_interval": spec.check_interval_getter(), "instance_id": ctx.instance_id},
     )
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(spec.check_interval_getter())
         try:
@@ -277,7 +308,48 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
             lock_key = f"loop.stem.{spec.name}"
             if not await try_claim_loop(ctx.lock_kv, lock_key, execution_interval, ctx.instance_id):
                 continue
-            await spec.body(spec, config, ctx)
+            try:
+                await spec.body(spec, config, ctx)
+            except Exception:
+                consecutive_failures += 1
+                log.exception(
+                    "Error in loop body",
+                    extra={"loop": spec.name, "consecutive_failures": consecutive_failures},
+                )
+                # Best-effort: record a distinct failure signal so immune can
+                # tell "body failed" apart from "body never ran" (issue #238).
+                try:
+                    await kv_put_float(ctx.lock_kv, f"loop.last_failure.{spec.name}", time.time())
+                except Exception:
+                    log.warning("Failed to write loop last_failure", extra={"loop": spec.name})
+                # Release the claim so the next check_interval tick can retry
+                # inside the same cron window — but only up to
+                # LOOP_RELEASE_FAILURE_LIMIT to avoid a busy claim/delete loop
+                # against a deterministically-broken body.
+                if consecutive_failures < LOOP_RELEASE_FAILURE_LIMIT:
+                    try:
+                        await ctx.lock_kv.delete(lock_key)
+                        log.warning(
+                            "Released loop claim after body failure",
+                            extra={"loop": spec.name, "consecutive_failures": consecutive_failures},
+                        )
+                    except Exception:
+                        log.warning(
+                            "Failed to release loop claim after body failure",
+                            extra={"loop": spec.name},
+                        )
+                else:
+                    log.warning(
+                        "Holding loop claim after repeated body failures — backing off until TTL",
+                        extra={
+                            "loop": spec.name,
+                            "consecutive_failures": consecutive_failures,
+                            "ttl_seconds": execution_interval,
+                        },
+                    )
+                continue
+            # Body succeeded — reset the failure counter and stamp the heartbeat.
+            consecutive_failures = 0
             try:
                 await kv_put_float(ctx.lock_kv, f"loop.heartbeat.{spec.name}", time.time())
             except Exception:
