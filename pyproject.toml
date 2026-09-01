@@ -79,6 +79,10 @@ allowed-unresolved-imports = [
     "optimum.**",
     "transformers",
     "transformers.**",
+    # pytest is a test-only dep and not installed in the CI ``uvx ty check``
+    # environment; used by test files' ``importorskip`` guards.
+    "pytest",
+    "pytest.**",
 ]
 
 [tool.pytest.ini_options]
