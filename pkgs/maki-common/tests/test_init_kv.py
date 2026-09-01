@@ -1,19 +1,24 @@
 """Tests for ``init_kv`` default-seeding behaviour in ``maki_common.nats``.
 
-Guards issue #456: ``init_kv`` used to seed defaults on ANY exception from
-``kv.get``, which meant a transient blip during startup (mid-init NATS
-reconnect, TLS renegotiation, request timeout during consumer rebalance)
-would silently overwrite whatever live value was already persisted with
-the stale default — no ERROR log, just an INFO ``"Seeded KV default"``
-that read like normal first-boot behaviour.
+Guards issues #456 and #479: ``init_kv`` used to seed defaults on ANY
+exception from ``kv.get``, so a transient blip during startup (mid-init
+NATS reconnect, TLS renegotiation, request timeout during consumer
+rebalance) would silently overwrite whatever live value was already
+persisted with the stale default — no ERROR log, just an INFO
+``"Seeded KV default"`` that read like normal first-boot behaviour.
+#456's first pass narrowed the write to ``KeyNotFoundError`` but kept
+a log-and-continue swallow for other errors; #479 removed the swallow
+so init failures propagate to the caller (and ultimately k8s) instead
+of being hidden.
 
 Contract these tests lock in:
 
 * An unset key (``KeyNotFoundError``) IS seeded with the default.
 * An already-set key is left alone (no write).
-* A transient error (``TimeoutError``, ``ConnectionClosedError``,
-  ``NoServersError``, generic ``Exception``) does NOT trigger a write —
-  the persisted value must survive.
+* A transient error (``TimeoutError``, ``NoServersError``, generic
+  ``Exception``) propagates unchanged — the persisted value survives
+  AND the caller sees the failure, so startup can crash cleanly rather
+  than continuing with a half-initialised bucket.
 
 Uses plain ``asyncio.run`` + ``assert`` so the maki-common test suite
 stays pytest-asyncio-free (see ``test_futures.py``, ``test_nats_terminal.py``).
@@ -116,16 +121,27 @@ def test_init_kv_leaves_existing_value_alone() -> None:
     assert json.loads(kv.stored["chat_model"].decode()) == "claude-opus-4-7"
 
 
-# --- the #456 regression guards ----------------------------------------------
+# --- the #456 / #479 regression guards ---------------------------------------
 
 
-def test_init_kv_does_not_overwrite_on_timeout_error() -> None:
-    """A transient TimeoutError must NOT trigger a write.
+def _assert_raises(exc_type: type[BaseException], coro) -> BaseException:
+    """Run ``coro`` and assert it raises ``exc_type``. Return the exception."""
+    try:
+        _run(coro)
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"expected {exc_type.__name__}, got no exception")
 
-    This is the #456 scenario: NATS client mid-reconnect during
-    JetStream handshake, ``kv.get`` times out — the old bare-except
-    code would have written the stale default back on top of the
-    live tuned value.
+
+def test_init_kv_propagates_timeout_error() -> None:
+    """A transient TimeoutError propagates AND leaves the persisted value alone.
+
+    This is the #456 / #479 scenario: NATS client mid-reconnect during
+    JetStream handshake, ``kv.get`` times out. The old bare-except code
+    would have written the stale default back on top of the live tuned
+    value; the #456 log-and-continue variant would have booted with an
+    unread bucket; #479 makes the failure visible to the caller so k8s
+    can restart the pod and try again against a healthy NATS.
     """
     kv = _FakeKV(get_error=TimeoutError("kv.get timed out"))
     js = _FakeJS(kv)
@@ -133,33 +149,34 @@ def test_init_kv_does_not_overwrite_on_timeout_error() -> None:
     async def scenario() -> None:
         await init_kv(js, "cfg", defaults={"chat_model": "claude-sonnet-4-legacy"})
 
-    _run(scenario())
+    _assert_raises(TimeoutError, scenario())
 
     assert kv.puts == [], "transient TimeoutError must not clobber persisted value"
 
 
-def test_init_kv_does_not_overwrite_on_no_servers_error() -> None:
-    """``nats.errors.NoServersError`` on read is transient — leave KV alone."""
+def test_init_kv_propagates_no_servers_error() -> None:
+    """``nats.errors.NoServersError`` on read propagates unchanged."""
     kv = _FakeKV(get_error=nats.errors.NoServersError())
     js = _FakeJS(kv)
 
     async def scenario() -> None:
         await init_kv(js, "cfg", defaults={"chat_model": "claude-sonnet-4-legacy"})
 
-    _run(scenario())
+    _assert_raises(nats.errors.NoServersError, scenario())
 
     assert kv.puts == [], "NoServersError must not clobber persisted value"
 
 
-def test_init_kv_does_not_overwrite_on_generic_exception() -> None:
-    """Any unexpected exception is treated as transient — no seed."""
+def test_init_kv_propagates_generic_exception() -> None:
+    """Any unexpected exception propagates — no swallow, no seed."""
     kv = _FakeKV(get_error=RuntimeError("something unexpected"))
     js = _FakeJS(kv)
 
     async def scenario() -> None:
         await init_kv(js, "cfg", defaults={"chat_model": "claude-sonnet-4-legacy"})
 
-    _run(scenario())
+    exc = _assert_raises(RuntimeError, scenario())
+    assert str(exc) == "something unexpected"
 
     assert kv.puts == [], "unknown exception must not clobber persisted value"
 
