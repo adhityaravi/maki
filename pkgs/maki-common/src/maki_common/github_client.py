@@ -116,6 +116,12 @@ class GitHubIssueClient:
         and truncation drops the tail, dropping the *oldest* untriaged is
         vastly safer than dropping the *newest* — the reflection dedup
         pass only works if it can see what was recently filed. See #552.
+
+        Callers that only want the highest-priority tiers (e.g. the work loop's
+        next-task pick) should use :meth:`list_issues_by_priority` instead —
+        it queries GitHub one ``labels=<tier>`` filter at a time and skips
+        the untriaged tail entirely, which is dramatically cheaper as the
+        open-issue count grows. See #488.
         """
         try:
             issues: list[dict[str, Any]] = []
@@ -190,6 +196,91 @@ class GitHubIssueClient:
             return issues
         except Exception:
             log.exception("Failed to list GitHub issues")
+            return []
+
+    async def list_issues_by_priority(
+        self,
+        state: str = "open",
+        priorities: tuple[str, ...] = ("P1", "P2", "P3", "P4", "P5"),
+    ) -> list[dict[str, Any]]:
+        """Fetch open issues one priority tier at a time, in priority order.
+
+        The efficient alternative to :meth:`list_issues` for callers that only
+        care about the highest-priority items — most notably the work loop's
+        next-task pick. ``list_issues`` has to page every open issue (400+ and
+        growing) to guarantee no P1 is missed by the priority sort; this
+        method issues one ``labels=<tier>`` request per tier in ``priorities``
+        order, so the untriaged tail (which historically dominates the open
+        set) is never fetched at all. See issue #488.
+
+        Semantics vs :meth:`list_issues`:
+        - Only issues with one of the labels in ``priorities`` are returned.
+          Untriaged issues (no priority label) are omitted — use
+          :meth:`list_issues` if you need them for a global scan such as
+          the reflection dedup pass.
+        - Results are in priority order: all P1s (in ``desc``-by-created
+          order) first, then all P2s, etc. Within a tier, ordering is
+          newest-first for the same reason ``list_issues`` fetches ``desc``
+          (see #552).
+        - If an issue is mis-tagged with multiple priority labels, the first
+          tier it appears in wins; it will not be duplicated in the result.
+
+        Args:
+            state: ``"open"`` (default) or ``"closed"``.
+            priorities: Tuple of priority labels to fetch, in the order they
+                should appear in the returned list. Default: P1 through P5.
+
+        Returns:
+            Issues in priority order. Pull requests are filtered out. Returns
+            an empty list on any error mid-fetch, matching
+            :meth:`list_issues`'s failure mode so callers can uniformly treat
+            an empty return as "nothing to do this cycle".
+        """
+        try:
+            seen: set[int] = set()
+            result: list[dict[str, Any]] = []
+            for tier in priorities:
+                page = 1
+                while True:
+                    resp = await self._request(
+                        "GET",
+                        f"{API}/repos/{self._repo_path}/issues",
+                        err_log="Failed to list GitHub issues by priority",
+                        err_extra={"tier": tier, "page": page, "state": state},
+                        params={
+                            "state": state,
+                            "labels": tier,
+                            "per_page": 100,
+                            "page": page,
+                            "sort": "created",
+                            "direction": "desc",
+                        },
+                    )
+                    if resp is None:
+                        return []
+                    raw = resp.json()
+                    raw_count = len(raw)
+                    for issue in raw:
+                        if "pull_request" in issue:
+                            continue
+                        number = issue.get("number")
+                        if number is None or number in seen:
+                            continue
+                        seen.add(number)
+                        result.append(issue)
+                    # Same page-exhaustion rule as list_issues — check raw_count,
+                    # not the filtered length, so an all-PR page still advances.
+                    # See issue #248.
+                    if raw_count < 100:
+                        break
+                    page += 1
+            log.info(
+                "Listed GitHub issues by priority",
+                extra={"count": len(result), "state": state, "tiers": list(priorities)},
+            )
+            return result
+        except Exception:
+            log.exception("Failed to list GitHub issues by priority")
             return []
 
     async def find_open_issue(self, title_query: str) -> int | None:

@@ -389,6 +389,139 @@ def test_list_issues_no_cap_when_max_results_none():
     assert calls == [1, 2, 3]  # stopped on short page, no over-fetch
 
 
+def test_list_issues_by_priority_queries_each_tier_and_orders_results():
+    """Issue #488: fetch per priority tier, results ordered P1 → P2 → ... → P5."""
+    tier_pages: dict[str, list[list[dict[str, Any]]]] = {
+        "P1": [[{"number": 10, "labels": [{"name": "P1"}]}]],
+        "P2": [
+            [
+                {"number": 20, "labels": [{"name": "P2"}]},
+                {"number": 21, "labels": [{"name": "P2"}]},
+            ]
+        ],
+        "P3": [[]],
+        "P4": [[{"number": 40, "labels": [{"name": "P4"}]}]],
+        "P5": [[]],
+    }
+    seen_labels: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/acme/widgets/issues"
+        label = request.url.params.get("labels", "")
+        seen_labels.append(label)
+        page = int(request.url.params.get("page", "1"))
+        pages = tier_pages.get(label, [[]])
+        idx = page - 1
+        body = pages[idx] if idx < len(pages) else []
+        return httpx.Response(200, json=body)
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    # P1 first, then both P2s (in fetch order), then P4. No P3/P5 issues exist.
+    assert numbers == [10, 20, 21, 40]
+    # All five tiers were queried, in the documented order.
+    assert seen_labels == ["P1", "P2", "P3", "P4", "P5"]
+
+
+def test_list_issues_by_priority_paginates_within_tier():
+    """A tier with >100 open issues must page through until short-page."""
+    p1_page1 = [{"number": i, "labels": [{"name": "P1"}]} for i in range(100)]
+    p1_page2 = [{"number": 100 + i, "labels": [{"name": "P1"}]} for i in range(30)]  # short → last
+    p1_pages = iter([p1_page1, p1_page2])
+    p1_page_counts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        label = request.url.params.get("labels", "")
+        if label == "P1":
+            p1_page_counts.append(int(request.url.params.get("page", "1")))
+            return httpx.Response(200, json=next(p1_pages))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    assert len(issues) == 130
+    assert p1_page_counts == [1, 2]  # stopped on short page
+
+
+def test_list_issues_by_priority_filters_pull_requests():
+    """PRs come back from the issues endpoint too — must be filtered."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("labels") == "P1":
+            return httpx.Response(
+                200,
+                json=[
+                    {"number": 1, "labels": [{"name": "P1"}]},
+                    {"number": 2, "labels": [{"name": "P1"}], "pull_request": {}},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    assert numbers == [1]  # PR (#2) dropped
+
+
+def test_list_issues_by_priority_dedupes_across_tiers():
+    """An issue tagged with two priority labels must appear only once — under
+    the first tier it was seen in (higher priority wins)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        label = request.url.params.get("labels", "")
+        if label == "P1":
+            # Issue #7 tagged with BOTH P1 and P2 (mis-tag).
+            return httpx.Response(200, json=[{"number": 7, "labels": [{"name": "P1"}, {"name": "P2"}]}])
+        if label == "P2":
+            # Same issue returned again under the P2 filter.
+            return httpx.Response(200, json=[{"number": 7, "labels": [{"name": "P1"}, {"name": "P2"}]}])
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    assert numbers == [7]  # deduped; P1 tier wins
+
+
+def test_list_issues_by_priority_respects_custom_priorities_arg():
+    """Callers can restrict which tiers to query (e.g. ('P1', 'P2') only)."""
+    seen_labels: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_labels.append(request.url.params.get("labels", ""))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    _run(client.list_issues_by_priority(priorities=("P1", "P2")))
+    assert seen_labels == ["P1", "P2"]
+
+
+def test_list_issues_by_priority_empty_on_http_error():
+    """Any tier failing mid-fetch returns [] — same failure mode as list_issues."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _make_client(handler)
+    assert _run(client.list_issues_by_priority()) == []
+
+
+def test_list_issues_by_priority_fetches_desc_within_tier():
+    """Within a tier, order must be newest-first (matches list_issues, #552)."""
+    seen_directions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_directions.append(request.url.params.get("direction", ""))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    _run(client.list_issues_by_priority())
+    assert seen_directions and all(d == "desc" for d in seen_directions), (
+        f"list_issues_by_priority must fetch newest-first; got {seen_directions}"
+    )
+
+
 def test_search_issues_by_symbols_scores_and_sorts():
     """≥min_matches enforced; scoring is by matched-symbol count desc."""
     items = [

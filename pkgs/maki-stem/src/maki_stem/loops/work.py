@@ -329,10 +329,12 @@ async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
 
 async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one night work cycle: pick an issue and hand it to cortex."""
-    # max_results=None → no cap. With 250+ open issues, the default 200 cap
-    # silently starves this loop of newly-filed P1/P2s (they land at the tail
-    # of the asc-by-created fetch). See issue #404.
-    issues = await ctx.github.list_issues(state="open", max_results=None)
+    # Fetch by priority label (one API call per tier) instead of paging every
+    # open issue. The work loop only ever acts on the highest-priority head of
+    # the list, so pulling untriaged issues just to sort-and-discard them is
+    # pure API cost. list_issues_by_priority returns tiers in order (P1s first,
+    # ...), which is exactly what _select_next_issue walks. See issue #488.
+    issues = await ctx.github.list_issues_by_priority(state="open")
     if not issues:
         return
 
