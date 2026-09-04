@@ -129,6 +129,10 @@ async def db_query_listener(nc, db_pool: asyncpg.Pool, *, queue: str) -> None:
         DB_QUERY,
         handler,
         queue=queue,
+        # 30s is 3× the inner DB timeout (10s). If we hit this the pool
+        # itself is wedged — bound catches it before it blackholes every
+        # subsequent DB query for cortex on this pod (#492).
+        handler_timeout=30.0,
         name="stem.db_query",
     )
 
@@ -193,6 +197,9 @@ async def pattern_query_listener(nc, db_pool: asyncpg.Pool, *, queue: str) -> No
         PATTERN_QUERY,
         handler,
         queue=queue,
+        # Inner query has a 5s timeout; give the handler 4× that headroom
+        # for pool acquisition + response encode + reply (#492).
+        handler_timeout=20.0,
         name="stem.pattern_query",
     )
 
@@ -240,6 +247,10 @@ async def pattern_update_listener(nc, db_pool: asyncpg.Pool, *, queue: str) -> N
         PATTERN_UPDATE,
         handler,
         queue=queue,
+        # Fire-and-forget bump — single UPDATE. Twenty seconds catches a
+        # wedged pool acquire without over-eagerly failing normal writes
+        # (#492).
+        handler_timeout=20.0,
         name="stem.pattern_update",
     )
 
@@ -299,5 +310,8 @@ async def pattern_write_listener(nc, db_pool: asyncpg.Pool, *, queue: str) -> No
         PATTERN_WRITE,
         handler,
         queue=queue,
+        # Inner INSERT has a 5s timeout; give the handler 4× headroom for
+        # pool acquire + conflict resolution (#492).
+        handler_timeout=20.0,
         name="stem.pattern_write",
     )

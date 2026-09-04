@@ -799,6 +799,11 @@ class ImmuneHealthMonitor:
             self._nc,
             CORTEX_HEALTH,
             self._handle_cortex_heartbeat,
+            # Cheap dict mutation. Five seconds catches a wedge without
+            # tolerating the "frozen last_heartbeat + reflex restart"
+            # failure mode the supervised loop was added to prevent
+            # (#492 / #175).
+            handler_timeout=5.0,
             name="cortex_heartbeat",
         )
 
@@ -833,6 +838,8 @@ class ImmuneHealthMonitor:
             self._nc,
             subject,
             self._handle_token_usage,
+            # Pure in-memory accumulator. Five seconds is generous (#492).
+            handler_timeout=5.0,
             name="token_usage",
         )
 
@@ -1906,5 +1913,10 @@ class ImmuneHealthMonitor:
             self._nc,
             IMMUNE_HEALTH,
             self._handle_gossip,
+            # Pure in-memory dict mutation + stale-peer prune. Ten seconds
+            # is generous. Bounding this matters: gossip is what feeds the
+            # hive-wide state view — a wedged handler would blind this
+            # instance to every peer's health (#492).
+            handler_timeout=10.0,
             name="gossip",
         )

@@ -351,6 +351,7 @@ async def subscribe_supervised(
     auto_ack: bool | None = None,
     ack_on_error: bool = False,
     nak_delay: float | None = None,
+    handler_timeout: float | None = None,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     name: str | None = None,
@@ -384,6 +385,23 @@ async def subscribe_supervised(
     * Core NATS (no ``js``) has no NAK concept — exceptions are logged and
       the message moves on regardless.
 
+    Handler-timeout semantics (issue #492):
+
+    * If ``handler_timeout`` is set and ``await handler(msg)`` doesn't return
+      inside it, the pending handler coroutine is cancelled, an ERROR is
+      logged (loud on purpose — a wedged handler blackholes this instance's
+      view of the subject), and the message is settled as a handler failure:
+      NAK on JS (subject to ``ack_on_error``), or logged-and-moved-on for
+      core NATS. The loop then keeps consuming.
+    * Without this bound one stuck dependency (Discord API, kubectl exec,
+      Postgres, HTTP fetch) freezes the whole subscription stream on this
+      pod: no new messages get processed, JS ``ack_wait`` expires, JS
+      redelivers to another instance, and if the originally-stuck handler
+      *eventually* returns and hits ``msg.ack()`` we've double-acted a
+      message JS already handed off — silent duplicate side effects
+      (double comment, double pod-delete, double memory write). Every
+      call site should pick a bound.
+
     Args:
         nc: Core NATS client (used for non-JetStream subscriptions and as a
             connection-state probe).
@@ -406,6 +424,15 @@ async def subscribe_supervised(
             to indefinite redelivery.
         nak_delay: Optional seconds to delay redelivery on NAK. If None,
             JetStream uses the consumer's backoff / ``ack_wait`` default.
+        handler_timeout: Optional per-message wall-clock bound in seconds for
+            ``await handler(msg)``. On timeout the handler task is cancelled,
+            an ERROR is logged, and the message is treated as a handler
+            failure (NAK on JS, respect ``ack_on_error``). ``None`` (default)
+            preserves the pre-#492 unbounded behavior — set this on every
+            caller. Suggested tiers: fast broadcasts (heartbeats, gossip)
+            5–10s; request/reply handlers (db_query, pattern_*, trading tool)
+            30–60s; slow-by-nature handlers (ears search/out, memory writes,
+            deploy propagate) their own longer bound.
         base_delay: Initial subscribe-retry backoff delay in seconds (default
             1.0). Unrelated to ``nak_delay`` — this governs the supervisor's
             re-subscribe loop, not per-message redelivery.
@@ -444,9 +471,31 @@ async def subscribe_supervised(
             async for msg in sub.messages:
                 handler_failed = False
                 try:
-                    await handler(msg)
+                    if handler_timeout is not None:
+                        # Bound the per-message dispatch so one wedged handler
+                        # can't freeze the whole subscription stream on this
+                        # pod (issue #492). ``asyncio.wait_for`` cancels the
+                        # underlying handler coroutine on expiry.
+                        await asyncio.wait_for(handler(msg), timeout=handler_timeout)
+                    else:
+                        await handler(msg)
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    handler_failed = True
+                    # Loud on purpose: a timeout here means the substrate
+                    # protected us from a wedge — the underlying dep (DB,
+                    # Discord, kubectl, HTTP) hung past the caller's budget.
+                    # It's not a swallowed hiccup; it's the operator signal
+                    # for "go look at what this handler depends on".
+                    log.error(
+                        "Supervised handler timeout — cancelling and NAK'ing",
+                        extra={
+                            "subject": subject,
+                            "sub_name": label,
+                            "handler_timeout": handler_timeout,
+                        },
+                    )
                 except Exception:
                     handler_failed = True
                     log.exception(

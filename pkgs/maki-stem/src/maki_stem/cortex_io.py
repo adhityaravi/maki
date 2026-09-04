@@ -125,6 +125,10 @@ async def response_listener(nc, pending) -> None:
         nc,
         CORTEX_TURN_RESPONSE,
         handler,
+        # Chunk push into an in-memory pending queue — sub-millisecond in
+        # the normal path. Five seconds catches a wedge without pretending
+        # this is slow work (#492).
+        handler_timeout=5.0,
         name="stem.cortex_response",
     )
 
@@ -224,6 +228,10 @@ async def cortex_heartbeat_watcher(nc, pending) -> None:
         nc,
         CORTEX_HEALTH,
         handler,
+        # Heartbeat = tiny JSON + dict lookups + pending-queue cancels.
+        # Five seconds is generous and keeps the health signal responsive
+        # (#492).
+        handler_timeout=5.0,
         name="stem.cortex_health",
     )
 

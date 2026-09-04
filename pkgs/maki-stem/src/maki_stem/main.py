@@ -141,6 +141,10 @@ async def _config_sync_listener():
         _nc,
         CONFIG_SYNC,
         _handle_config_sync,
+        # Single KV.put — should be sub-second. Ten seconds gives room for
+        # a transient NATS hiccup without letting a wedged put freeze every
+        # subsequent config-sync on this pod (#492).
+        handler_timeout=10.0,
         name="stem.config_sync",
     )
 

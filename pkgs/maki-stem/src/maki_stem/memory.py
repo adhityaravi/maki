@@ -189,5 +189,9 @@ async def memory_store_listener(nc, *, queue: str) -> None:
         MEMORY_STORE,
         _handle_memory_store,
         queue=queue,
+        # Dispatch-only: JSON decode + spawn_background. Ten seconds catches
+        # a wedge without pretending the actual store HTTP call runs here
+        # (it's spawned as its own task) (#492).
+        handler_timeout=10.0,
         name="stem.memory_store",
     )

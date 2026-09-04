@@ -135,6 +135,10 @@ async def trading_manual_listener(nc, lock_kv) -> None:
         TRADING_MANUAL_TRADE,
         _handle,
         queue=STEM_QUEUE,
+        # Broker roundtrip. Sixty seconds is generous but bounds hung
+        # broker connections so subsequent !trade commands aren't lost
+        # on this pod (#492).
+        handler_timeout=60.0,
         name="stem.trading_manual",
     )
 
@@ -187,5 +191,9 @@ async def trading_tool_listener(nc, tool_registry: dict, permanent_tools: dict) 
         nc,
         TRADING_TOOL_REQUEST,
         _handle,
+        # Cortex-facing tool dispatch. Sixty seconds covers slow broker
+        # calls (quotes, positions) without letting a wedged tool freeze
+        # every subsequent cortex tool call on this pod (#492).
+        handler_timeout=60.0,
         name="stem.trading_tool",
     )

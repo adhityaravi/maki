@@ -128,5 +128,9 @@ async def ears_listener(
         EARS_IN,
         handler,
         queue=queue,
+        # Dispatch-only: JSON decode + spawn_background. Ten seconds catches
+        # a wedge in the dispatch path without pretending this handler runs
+        # the actual turn (#492).
+        handler_timeout=10.0,
         name="stem.ears_in",
     )

@@ -472,6 +472,10 @@ async def _search_listener() -> None:
             _nc,
             EARS_SEARCH,
             _dispatch_search,
+            # Search hits Discord history + memory graph via HTTP; give it
+            # generous headroom but bound it so one hung request can't
+            # blackhole every subsequent search on this instance (issue #492).
+            handler_timeout=120.0,
             name="ears.search",
         )
     finally:
@@ -576,6 +580,10 @@ async def _out_listener():
         _nc,
         EARS_OUT,
         _handle_ears_out,
+        # Sends into Discord (view rendering + channel.send). Bound past the
+        # Discord API's own client-side timeout so a hung upstream call can't
+        # freeze every subsequent chat/loop output on this instance (#492).
+        handler_timeout=60.0,
         name="ears.out",
     )
 
@@ -604,6 +612,10 @@ async def _immune_response_listener():
         _nc,
         EARS_IMMUNE_OUT,
         _handle_immune_response,
+        # Push to an in-process pending-queue — should be sub-millisecond.
+        # A 10s bound catches wedges without pretending this is slow work
+        # (#492).
+        handler_timeout=10.0,
         name="ears.immune_out",
     )
 
@@ -651,6 +663,11 @@ async def _vitals_listener():
         js=_js,
         durable=f"ears-vitals-{INSTANCE_ID}",
         deliver_policy="new",
+        # Posts a digest into Discord — a hung API call would otherwise
+        # freeze the vitals stream on this instance and let JS ack_wait
+        # expire, redelivering to another pod and risking a double-post
+        # if this handler eventually returns (#492).
+        handler_timeout=60.0,
         name="ears.vitals",
     )
 
@@ -692,6 +709,10 @@ async def _alert_listener():
         js=_js,
         durable=f"ears-alert-{INSTANCE_ID}",
         deliver_policy="new",
+        # Posts an alert into Discord — same reasoning as vitals: don't let
+        # one hung API call blackhole subsequent alerts on this instance and
+        # risk a duplicate post via JS ack_wait redelivery (#492).
+        handler_timeout=60.0,
         name="ears.alert",
     )
 

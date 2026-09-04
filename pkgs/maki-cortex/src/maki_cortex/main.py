@@ -881,6 +881,11 @@ async def main():
             CORTEX_TURN_REQUEST,
             _handle_turn_message,
             queue="maki-cortex",
+            # Dispatch-only: the heavy turn work is spawned as a background
+            # task. Ten seconds catches a wedge in the preempt/lock path
+            # without pretending this handler runs the actual LLM turn
+            # (#492).
+            handler_timeout=10.0,
             name="cortex.turn_request",
         ),
         name="cortex.turn_request_listener",

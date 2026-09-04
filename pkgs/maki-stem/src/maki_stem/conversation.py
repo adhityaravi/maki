@@ -124,6 +124,10 @@ async def conversation_sync_listener(nc, js, instance_id: str) -> None:
         js=js,
         durable=consumer_name,
         deliver_policy=nats.js.api.DeliverPolicy.LAST_PER_SUBJECT,
+        # Pure in-memory list mutation — should be sub-millisecond. Ten
+        # seconds catches anything pathological before JS ack_wait fires
+        # and redelivers to another instance (#492).
+        handler_timeout=10.0,
         name="stem.conversation_sync",
     )
 

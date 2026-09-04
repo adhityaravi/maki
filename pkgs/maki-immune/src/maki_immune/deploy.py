@@ -499,6 +499,13 @@ class ImmuneDeployCoordinator:
             # See issue #385 — without redelivery, propagation ACK-and-dropped
             # silently on lock contention and hive sites diverged.
             nak_delay=60.0,
+            # Deploy propagation runs kubectl set image + monitor_rollout,
+            # which can take ~90-150s in the normal path. Ten minutes is a
+            # generous outer bound: if we've held the handler for ten
+            # minutes something is truly wedged (stuck rollout, k8s API
+            # black hole) and JS should get to redeliver rather than let
+            # this pod's listener freeze indefinitely (#492).
+            handler_timeout=600.0,
             name="deploy_propagate",
         )
 
@@ -787,6 +794,11 @@ class ImmuneDeployCoordinator:
             auto_ack=True,
             # See _deploy_propagate_handler for the rationale — issue #385.
             nak_delay=60.0,
+            # kubectl rollout restart + monitor typically completes in a
+            # few minutes. Ten-minute outer bound catches a wedged rollout
+            # or a stuck k8s API rather than let the listener freeze
+            # forever on this pod (#492).
+            handler_timeout=600.0,
             name="restart_propagate",
         )
 

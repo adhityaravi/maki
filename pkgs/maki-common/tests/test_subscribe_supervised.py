@@ -404,3 +404,161 @@ def test_core_nats_message_without_nak_does_not_crash_supervisor(caplog) -> None
     # Failure: no nak attribute → supervisor logs and moves on without ACKing.
     assert bad_msg.acked is False
     assert any("Supervised handler error" in r.getMessage() for r in caplog.records)
+
+
+def test_handler_timeout_naks_wedged_message_and_continues(caplog) -> None:  # type: ignore[no-untyped-def]
+    """A handler that outlasts ``handler_timeout`` is cancelled, the message
+    NAK'd, and the supervisor keeps consuming (issue #492).
+
+    Before this bound, one stuck handler wedged the whole subscription stream
+    on the pod — no further messages were processed until pod restart. The
+    supervisor now enforces a per-message deadline and treats timeout as a
+    normal handler failure.
+    """
+
+    async def scenario() -> tuple[_FakeMessage, _FakeMessage, bool]:
+        slow_msg = _FakeMessage(b"slow")
+        fast_msg = _FakeMessage(b"fast")
+        slow_cancelled = False
+
+        async def handler(msg: _FakeMessage) -> None:
+            nonlocal slow_cancelled
+            if msg.data == b"slow":
+                try:
+                    # Wall-clock hang; wait_for should cancel us well before
+                    # this expires.
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    slow_cancelled = True
+                    raise
+
+        sub = _FakeSubscription([slow_msg, fast_msg])
+        js = _FakeJS(sub)
+        nc = _FakeNC([])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                js=js,
+                durable="test-durable",
+                handler_timeout=0.05,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(400):
+            if slow_msg.nakd and fast_msg.acked:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return slow_msg, fast_msg, slow_cancelled
+
+    with caplog.at_level(logging.ERROR, logger="maki_common.nats"):
+        slow_msg, fast_msg, slow_cancelled = _run(scenario())
+
+    # Wedged handler was NAK'd (JS will redeliver per consumer policy).
+    assert slow_msg.nakd is True, "wedged message must be NAK'd for JS redelivery"
+    assert slow_msg.acked is False, "wedged message must not be double-acted"
+    # Underlying handler task was actually cancelled — no dangling coroutine.
+    assert slow_cancelled is True, "wait_for must cancel the pending handler"
+    # Loop kept going — the next message was processed normally.
+    assert fast_msg.acked is True, "supervisor must keep consuming after a timeout"
+    assert fast_msg.nakd is False
+    # Loud ERROR log (operator signal for a wedged dep).
+    assert any("Supervised handler timeout" in r.getMessage() for r in caplog.records), (
+        f"Expected timeout ERROR log, got: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_handler_timeout_does_not_fire_when_handler_finishes_in_time() -> None:
+    """Fast handlers under ``handler_timeout`` are ACKed exactly like the
+    unbounded path — the bound only bites on wedges."""
+
+    async def scenario() -> _FakeMessage:
+        ok_msg = _FakeMessage(b"ok")
+
+        async def handler(msg: _FakeMessage) -> None:
+            # Tiny yield — well inside the 1s bound.
+            await asyncio.sleep(0)
+
+        sub = _FakeSubscription([ok_msg])
+        js = _FakeJS(sub)
+        nc = _FakeNC([])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                js=js,
+                durable="test-durable",
+                handler_timeout=1.0,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(200):
+            if ok_msg.acked:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return ok_msg
+
+    ok_msg = _run(scenario())
+    assert ok_msg.acked is True
+    assert ok_msg.nakd is False
+
+
+def test_handler_timeout_with_ack_on_error_acks_wedged_message() -> None:
+    """When callers opt into ``ack_on_error``, a timeout consumes the message
+    (matches the semantics for a raised handler exception)."""
+
+    async def scenario() -> _FakeMessage:
+        slow_msg = _FakeMessage(b"slow")
+
+        async def handler(msg: _FakeMessage) -> None:
+            await asyncio.sleep(30)
+
+        sub = _FakeSubscription([slow_msg])
+        js = _FakeJS(sub)
+        nc = _FakeNC([])
+
+        task = asyncio.create_task(
+            subscribe_supervised(
+                nc,
+                "test.subject",
+                handler,
+                js=js,
+                durable="test-durable",
+                handler_timeout=0.05,
+                ack_on_error=True,
+                base_delay=0.01,
+                max_delay=0.01,
+            )
+        )
+        for _ in range(400):
+            if slow_msg.acked:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return slow_msg
+
+    slow_msg = _run(scenario())
+    # ack_on_error opts back into fire-and-forget: wedged message is ACKed
+    # rather than NAK'd. Same semantics as a raised handler exception.
+    assert slow_msg.acked is True
+    assert slow_msg.nakd is False
