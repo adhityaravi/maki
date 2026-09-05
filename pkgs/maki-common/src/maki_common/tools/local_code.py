@@ -14,7 +14,16 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from maki_common.repo import RepoEntry, RepoRegistry, _auth_config_args, redact_token, set_origin
+from maki_common.repo import (
+    GIT_LOCAL_TIMEOUT_S,
+    RepoEntry,
+    RepoRegistry,
+    _auth_config_args,
+    _communicate_with_timeout,
+    _git_op_timeout,
+    redact_token,
+    set_origin,
+)
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -46,6 +55,7 @@ async def _run_git(
     repo_path: str,
     *args: str,
     token: str | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr).
 
@@ -58,27 +68,47 @@ async def _run_git(
     stdout/stderr are pre-redacted of any GitHub token — git's own error
     messages echo the full remote URL (including `x-access-token:TOKEN@`),
     and that text flows into both structured logs and MCP results.
+
+    A per-invocation deadline (``timeout``) bounds the wait for the
+    subprocess — auto-picked via :func:`maki_common.repo._git_op_timeout`
+    when omitted. On expiry the git process is terminated (SIGTERM →
+    SIGKILL) and :class:`TimeoutError` propagates so the caller can
+    surface it as a tool error instead of pinning the MCP request loop
+    forever. See #499.
     """
     cmd_args: list[str] = []
     if token:
         cmd_args.extend(_auth_config_args(token))
     cmd_args.extend(["-C", repo_path, *args])
+    effective_timeout = timeout if timeout is not None else _git_op_timeout(args)
     proc = await asyncio.create_subprocess_exec(
         "git",
         *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, effective_timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
-async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
+async def _run_cmd(
+    repo_path: str,
+    *args: str,
+    timeout: float = GIT_LOCAL_TIMEOUT_S,
+) -> tuple[int, str, str]:
     """Run an arbitrary command in the repo directory and return (returncode, stdout, stderr).
 
     Output is pre-redacted defensively — most callers run linters, but anything
     that shells out near a git context can pick up a token from environment or
     error chaining.
+
+    Per-invocation subprocess timeout guards against a stuck child (a
+    ripgrep/ruff/pytest livelock, a runaway subprocess of the runner
+    itself) wedging the MCP tool loop indefinitely — same failure mode
+    :func:`_run_git` was hardened for in #499. Defaults to
+    :data:`GIT_LOCAL_TIMEOUT_S` (120s), generous enough for lint / test
+    subprocesses run in-band; pass an explicit larger value if a specific
+    caller needs it.
     """
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -86,7 +116,7 @@ async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
@@ -212,7 +242,11 @@ def make_code_tools(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            # Bounded wait so a pathological pattern (catastrophic backtracking
+            # in the regex, a symlink loop grep can't detect, a giant binary
+            # blob it insists on scanning) can't wedge the MCP tool loop
+            # forever — same class of failure as #499's git-timeout gap.
+            stdout, stderr = await _communicate_with_timeout(proc, GIT_LOCAL_TIMEOUT_S, f"grep {query!r}")
             output = stdout.decode(errors="replace")
 
             if not output.strip():
@@ -234,7 +268,12 @@ def make_code_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        rc, stdout, stderr = await _run_git(entry.path, "status", "--short")
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, "status", "--short")
+        except TimeoutError as exc:
+            # Timed-out git — surface as a tool error instead of letting the
+            # exception escape into the MCP dispatcher. See #499.
+            return mcp_result(f"Error: {exc}")
         if rc != 0:
             return mcp_result(f"Error: {stderr}")
         return mcp_result(stdout if stdout.strip() else "Working tree clean.")
@@ -253,7 +292,10 @@ def make_code_tools(
                 return mcp_result(f"Error: path '{path}' is outside the repository.")
             cmd.append("--")
             cmd.append(path)
-        rc, stdout, stderr = await _run_git(entry.path, *cmd)
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, *cmd)
+        except TimeoutError as exc:
+            return mcp_result(f"Error: {exc}")
         if rc != 0:
             return mcp_result(f"Error: {stderr}")
         return mcp_result(stdout if stdout.strip() else "No changes.")
@@ -513,7 +555,12 @@ def make_code_edit_tools(
             parts = parts[1:]
         if not parts:
             return mcp_result("Error: command is just 'git' with no subcommand.")
-        rc, stdout, stderr = await _run_git(entry.path, *parts)
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, *parts)
+        except TimeoutError as exc:
+            # Timed-out git — surface as a tool error instead of letting the
+            # exception escape into the MCP dispatcher. See #499.
+            return mcp_result(f"Error: {exc}")
         output = stdout if stdout.strip() else stderr
         if rc != 0:
             return mcp_result(f"git {command} failed (exit {rc}):\n{output}")
@@ -536,9 +583,18 @@ def make_code_edit_tools(
         results = []
         all_passed = True
 
+        # Generous per-tool subprocess timeout — ruff / ty on the current
+        # tree run in seconds, but keep headroom for a warmed-uv cache miss
+        # or a first-time install pulling wheels. The important thing is
+        # having *some* upper bound so a wedged uv/network can't pin the
+        # MCP loop forever (same failure mode as #499 for git).
+        _QUALITY_TIMEOUT_S = 600.0
+
         # Run ruff lint check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ruff", "check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ruff", "check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ruff check (lint): passed")
             else:
@@ -548,10 +604,15 @@ def make_code_edit_tools(
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ruff check (lint): TIMED OUT — {exc}")
+            all_passed = False
 
         # Run ruff format check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ruff", "format", "--check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ruff", "format", "--check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ruff format: passed")
             else:
@@ -561,10 +622,15 @@ def make_code_edit_tools(
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ruff format: TIMED OUT — {exc}")
+            all_passed = False
 
         # Run ty type check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ty", "check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ty", "check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ty check (types): passed")
             else:
@@ -573,6 +639,9 @@ def make_code_edit_tools(
                 results.append(f"❌ ty check (types): FAILED\n{output}")
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
+            all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ty check (types): TIMED OUT — {exc}")
             all_passed = False
 
         summary = "ALL CHECKS PASSED ✅" if all_passed else "CHECKS FAILED ❌ — fix issues before pushing"

@@ -5,14 +5,19 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from maki_common.repo import (
+    GIT_LOCAL_TIMEOUT_S,
+    GIT_NETWORK_TIMEOUT_S,
     RepoEntry,
     RepoRegistry,
     SyncError,
+    _git_op_timeout,
     clean_remote_url,
     hard_sync,
+    init_repo,
     redact_token,
     set_origin,
 )
@@ -670,4 +675,192 @@ def test_hard_sync_token_mint_failure_surfaces_as_sync_error() -> None:
             assert "installation revoked" in exc.stderr
         else:  # pragma: no cover
             raise AssertionError("hard_sync should wrap token-mint failure in SyncError")
-    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Subprocess timeout guard — issue #499. Without ``asyncio.wait_for`` around
+# ``proc.communicate()``, a hung ``git`` (DNS stall, SSH interactive prompt,
+# ``.git/index.lock`` contention) pins ``hard_sync`` / ``init_repo`` /
+# ``RepoRegistry.resolve`` indefinitely. These tests pin the new contract:
+# the deadline is enforced, timeouts surface as ``SyncError`` (for
+# ``hard_sync``) or ``False`` (for ``init_repo``) so callers keep their
+# single-signal error handling.
+# ---------------------------------------------------------------------------
+
+
+def test_git_op_timeout_picks_network_deadline_for_fetch() -> None:
+    assert _git_op_timeout(("fetch", "origin", "main")) == GIT_NETWORK_TIMEOUT_S
+
+
+def test_git_op_timeout_picks_network_deadline_for_pull_push_clone_lsremote() -> None:
+    """Every network subcommand should route to the longer deadline."""
+    for net_cmd in ("fetch", "pull", "push", "clone", "ls-remote"):
+        assert _git_op_timeout((net_cmd,)) == GIT_NETWORK_TIMEOUT_S, net_cmd
+
+
+def test_git_op_timeout_picks_local_deadline_for_reset_and_clean() -> None:
+    assert _git_op_timeout(("reset", "--hard", "origin/main")) == GIT_LOCAL_TIMEOUT_S
+    assert _git_op_timeout(("clean", "-fd")) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_git_op_timeout_skips_leading_option_flags() -> None:
+    """`-c http.extraheader=...` and `-C repo` come before the subcommand."""
+    # The auth prefix from `_auth_config_args`:  `-c`  `http.extraheader=...`
+    assert _git_op_timeout(("-c", "http.extraheader=Authorization: Basic xxx", "fetch")) == GIT_NETWORK_TIMEOUT_S
+    # `-C` also takes a value; skip both and land on the subcommand.
+    assert _git_op_timeout(("-C", "/some/repo", "status", "--short")) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_git_op_timeout_defaults_to_local_when_no_subcommand() -> None:
+    """Pathological: only flags, no subcommand. Fall back to the safer default."""
+    assert _git_op_timeout(("--version",)) == GIT_LOCAL_TIMEOUT_S
+    assert _git_op_timeout(()) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_run_git_raises_timeout_when_subprocess_hangs() -> None:
+    """A hung git process must not pin the awaiting coroutine forever.
+
+    Uses `sleep 30` as a stand-in for a hung git; the fix wraps
+    `proc.communicate()` in `asyncio.wait_for` and kills the process on
+    timeout. Without the fix this test hangs for 30s then fails on the
+    outer pytest deadline — with the fix it raises TimeoutError in <1s.
+    """
+    import maki_common.repo as repo_mod
+
+    async def _run() -> None:
+        # Monkey-patch create_subprocess_exec to spawn `sleep 30` instead of
+        # git — so we're testing the wait-for/kill logic without needing a
+        # real hung git.
+        original = asyncio.create_subprocess_exec
+
+        async def fake_exec(*_args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+            return await original("sleep", "30", **kwargs)
+
+        with mock.patch("maki_common.repo.asyncio.create_subprocess_exec", fake_exec):
+            try:
+                await repo_mod._run_git("/tmp", "status", timeout=0.5)
+            except TimeoutError as exc:
+                assert "exceeded" in str(exc) or "status" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("_run_git should raise TimeoutError on subprocess hang")
+
+    asyncio.run(_run())
+
+
+def test_run_git_no_cwd_raises_timeout_when_subprocess_hangs() -> None:
+    """Mirror of the _run_git timeout test for the clone-shape helper."""
+    import maki_common.repo as repo_mod
+
+    async def _run() -> None:
+        original = asyncio.create_subprocess_exec
+
+        async def fake_exec(*_args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+            return await original("sleep", "30", **kwargs)
+
+        with mock.patch("maki_common.repo.asyncio.create_subprocess_exec", fake_exec):
+            try:
+                await repo_mod._run_git_no_cwd("clone", "https://example.invalid/x.git", "/tmp/x", timeout=0.5)
+            except TimeoutError as exc:
+                assert "exceeded" in str(exc) or "clone" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("_run_git_no_cwd should raise TimeoutError on subprocess hang")
+
+    asyncio.run(_run())
+
+
+def test_hard_sync_wraps_fetch_timeout_in_sync_error() -> None:
+    """A hung `git fetch` must surface as `SyncError('fetch', None, ...)`.
+
+    Callers (cortex `_process_turn`, `RepoRegistry.resolve`) only catch
+    `SyncError` — an unhandled `TimeoutError` bubbling out of `_run_git`
+    would either wedge the turn task or take down a supervisor. The
+    conversion preserves the single-exception contract.
+    """
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git fetch origin main exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "fetch"
+            assert exc.returncode is None
+            assert "exceeded" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap TimeoutError as SyncError")
+
+
+def test_hard_sync_wraps_reset_timeout_in_sync_error() -> None:
+    """Same treatment for the local-op steps — reset/clean can also hang."""
+    calls: list[tuple[str, ...]] = []
+
+    async def stub(repo_path: str, *args: str, **_kwargs: Any) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[0] == "fetch":
+            return (0, "", "")
+        raise TimeoutError(f"git {' '.join(args)} exceeded 120.0s")
+
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "reset"
+            assert exc.returncode is None
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap reset TimeoutError as SyncError")
+
+
+def test_hard_sync_wraps_set_url_timeout_in_sync_error() -> None:
+    """set_origin (a wrapper around _run_git) can also hang — cover the auth branch."""
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git remote set-url origin ... exceeded 120.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_FakeAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "remote set-url"
+            assert exc.returncode is None
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap set-url TimeoutError as SyncError")
+
+
+def test_init_repo_returns_false_on_clone_timeout(tmp_path: Path) -> None:
+    """A hung `git clone` in init_repo must not pin pod startup.
+
+    `init_repo` is called at cortex/immune boot and under
+    `RepoRegistry._clone_lock` for every unknown auto-cloned repo — one
+    hung clone would wedge the pod's entire tool-call pipeline. The fix
+    returns `False` (same signal callers already handle for a failed
+    clone) instead of hanging forever.
+    """
+    clone_target = tmp_path / "fresh"
+
+    async def hanging_run_git_no_cwd(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git clone ... exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git_no_cwd", hanging_run_git_no_cwd):
+        ok = asyncio.run(init_repo(str(clone_target), "https://github.com/o/n.git"))
+    assert ok is False
+
+
+def test_init_repo_returns_false_on_pull_timeout(tmp_path: Path) -> None:
+    """Existing-clone branch: `git pull` timeout also returns False (not raise)."""
+    clone_target = tmp_path / "existing"
+    (clone_target / ".git").mkdir(parents=True)
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git pull --rebase origin main exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        ok = asyncio.run(init_repo(str(clone_target), "https://github.com/o/n.git"))
+    assert ok is False

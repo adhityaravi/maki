@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 import re
@@ -12,6 +13,100 @@ from dataclasses import dataclass
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+# Per-invocation subprocess deadlines for every `git` process spawned via
+# ``_run_git`` / ``_run_git_no_cwd``. Without these, a hung git subprocess
+# (DNS stall, SSH interactive prompt on a misconfigured URL, TLS handshake
+# with a stuck GitHub edge, ``.git/index.lock`` contention with another
+# process, paused fetch on a giant pack) pins the awaiting coroutine
+# forever. Blast radius: ``hard_sync`` at the top of every cortex
+# reasoning turn, ``init_repo`` at pod startup, and every
+# ``RepoRegistry.resolve`` for an unknown-yet repo — one hung git wedges
+# the entire tool-call pipeline while heartbeats (a separate task) still
+# report healthy. ``claude.py``'s ``DEFAULT_INVOKE_TIMEOUT_S`` guards the
+# same failure mode for the Claude CLI (see #350); the same reasoning
+# applies here, even more so because git hangs on more common failure
+# modes than the Claude CLI. See #499.
+GIT_LOCAL_TIMEOUT_S = 120.0
+"""Deadline for local-only git ops (``reset``, ``clean``, ``config``, ``rev-parse``, ...).
+
+No legitimate local operation should ever run this long — the only paths
+that get there involve pathological repo state or a stuck lock, both of
+which we'd rather fail loudly for than wait on."""
+
+GIT_NETWORK_TIMEOUT_S = 300.0
+"""Deadline for network git ops (``fetch``, ``pull``, ``push``, ``clone``, ``ls-remote``).
+
+Sized to accommodate slow-but-legitimate cases: a fresh clone of a
+several-hundred-MB pack over a mediocre link, or a push of a large
+delta. Well below any reasonable "call is now stuck" threshold."""
+
+# git subcommands that touch the network. Auto-detected from ``args[0]``
+# so callers don't need to plumb a timeout kwarg through every call site
+# — the set is small and stable, and if it drifts, the only cost is the
+# more generous deadline gets used for a local op (still fails loudly).
+_NETWORK_GIT_SUBCOMMANDS = frozenset({"fetch", "pull", "push", "clone", "ls-remote"})
+
+
+def _git_op_timeout(args: tuple[str, ...] | list[str]) -> float:
+    """Pick a subprocess deadline based on the git subcommand in *args*.
+
+    Skips leading option flags (``-C <path>``, ``-c <key>=<value>``) and
+    treats the first bare positional as the subcommand. Network ops
+    (:data:`_NETWORK_GIT_SUBCOMMANDS`) get :data:`GIT_NETWORK_TIMEOUT_S`;
+    everything else gets :data:`GIT_LOCAL_TIMEOUT_S`.
+    """
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "-C" or arg == "-c":
+            # These flags take a value in the NEXT arg.
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return GIT_NETWORK_TIMEOUT_S if arg in _NETWORK_GIT_SUBCOMMANDS else GIT_LOCAL_TIMEOUT_S
+    return GIT_LOCAL_TIMEOUT_S
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    timeout: float,
+    cmd_desc: str,
+) -> tuple[bytes, bytes]:
+    """Await ``proc.communicate()`` under a deadline, killing the process on expiry.
+
+    A zombie git process still holds ``.git/index.lock``; leaving one
+    behind would wedge every subsequent git op on the same repo. Try
+    ``terminate()`` first (SIGTERM), fall back to ``kill()`` (SIGKILL)
+    if the process refuses to exit within a short grace window.
+
+    On expiry raises the builtin :class:`TimeoutError` (which is the same
+    object as ``asyncio.TimeoutError`` on Python 3.11+); *cmd_desc* is
+    embedded in the error message and the log record so operators can
+    tell which git call died.
+    """
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        # Kill the runaway git before it holds .git/index.lock indefinitely.
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+        log.error(
+            "git subprocess timed out",
+            extra={"cmd": cmd_desc, "timeout_s": timeout},
+        )
+        raise TimeoutError(f"git {cmd_desc} exceeded {timeout}s") from None
 
 
 # GitHub installation tokens leak via git's own error messages, e.g.
@@ -72,6 +167,7 @@ async def _run_git(
     repo_path: str,
     *args: str,
     token: str | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr).
 
@@ -86,18 +182,28 @@ async def _run_git(
     git echoes back in errors, or otherwise) is stripped before the bytes
     leave this function. Every caller — logger, MCP tool, exception path —
     therefore sees safe text by construction.
+
+    A per-invocation deadline (``timeout``) bounds the wait for the
+    subprocess: pass an explicit float to override, or leave ``None`` to
+    auto-pick via :func:`_git_op_timeout` (network subcommands get
+    :data:`GIT_NETWORK_TIMEOUT_S`, everything else
+    :data:`GIT_LOCAL_TIMEOUT_S`). On expiry the git process is
+    terminated (SIGTERM, then SIGKILL) so a zombie doesn't hold
+    ``.git/index.lock``, and :class:`TimeoutError` propagates — see
+    :func:`_communicate_with_timeout` and issue #499.
     """
     cmd_args: list[str] = []
     if token:
         cmd_args.extend(_auth_config_args(token))
     cmd_args.extend(["-C", repo_path, *args])
+    effective_timeout = timeout if timeout is not None else _git_op_timeout(args)
     proc = await asyncio.create_subprocess_exec(
         "git",
         *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, effective_timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
@@ -136,23 +242,25 @@ async def set_origin(repo_path: str, url: str) -> tuple[int, str]:
 async def _run_git_no_cwd(
     *args: str,
     token: str | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, str, str]:
     """Run a git command without a ``-C`` working directory (e.g. ``clone``).
 
-    Same per-invocation auth injection and redaction guarantees as
-    ``_run_git``.
+    Same per-invocation auth injection, redaction, and subprocess-timeout
+    guarantees as :func:`_run_git`. See #499 for the timeout rationale.
     """
     cmd_args: list[str] = []
     if token:
         cmd_args.extend(_auth_config_args(token))
     cmd_args.extend(args)
+    effective_timeout = timeout if timeout is not None else _git_op_timeout(args)
     proc = await asyncio.create_subprocess_exec(
         "git",
         *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, effective_timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
@@ -231,11 +339,24 @@ async def hard_sync(
         # `x-access-token:...@github.com` URL written by older versions of
         # this module — see issue #347.
         clean_url = clone_url if clone_url else clean_remote_url(owner, name)
-        rc, stderr = await set_origin(repo_path, clean_url)
+        try:
+            rc, stderr = await set_origin(repo_path, clean_url)
+        except TimeoutError as exc:
+            raise SyncError("remote set-url", None, str(exc)) from exc
         if rc != 0:
             raise SyncError("remote set-url", rc, stderr)
 
-    fetch_rc, _, fetch_err = await _run_git(repo_path, "fetch", "origin", "main", token=token)
+    # A subprocess timeout inside any step is functionally a sync failure
+    # — we haven't landed on ``origin/main`` — so map ``TimeoutError`` onto
+    # ``SyncError`` (rc=None to signal "no exit code available") and let
+    # callers keep their single-exception contract. Without this, cortex's
+    # ``_process_turn`` (which only catches ``SyncError``) would see an
+    # unhandled ``TimeoutError`` and either wedge the turn task or bubble
+    # up to a supervisor. See #499.
+    try:
+        fetch_rc, _, fetch_err = await _run_git(repo_path, "fetch", "origin", "main", token=token)
+    except TimeoutError as exc:
+        raise SyncError("fetch", None, str(exc)) from exc
     if fetch_rc != 0:
         raise SyncError("fetch", fetch_rc, fetch_err)
 
@@ -243,7 +364,10 @@ async def hard_sync(
         ("reset", ("reset", "--hard", "origin/main")),
         ("clean", ("clean", "-fd")),
     ):
-        rc, _, stderr = await _run_git(repo_path, *args)
+        try:
+            rc, _, stderr = await _run_git(repo_path, *args)
+        except TimeoutError as exc:
+            raise SyncError(step, None, str(exc)) from exc
         if rc != 0:
             raise SyncError(step, rc, stderr)
 
@@ -301,20 +425,38 @@ async def init_repo(
         except Exception:
             log.warning("Failed to get GitHub token, cloning without auth")
 
+    # Subprocess timeouts (see #499) surface as ``TimeoutError`` from
+    # ``_run_git`` / ``_run_git_no_cwd``. ``init_repo`` returns ``bool`` and
+    # its callers (cortex/immune startup, ``RepoRegistry.resolve`` under
+    # ``clone_lock``) already treat ``False`` as "clone/pull didn't
+    # succeed" — mapping a hung git onto that same signal preserves the
+    # existing contract without letting the exception escape and pin the
+    # calling coroutine forever.
     if not os.path.exists(os.path.join(repo_path, ".git")):
         log.info("Cloning repo", extra={"repo_path": repo_path})
         parent = os.path.dirname(repo_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        rc, _, stderr = await _run_git_no_cwd("clone", clone_url, repo_path, token=token)
+        try:
+            rc, _, stderr = await _run_git_no_cwd("clone", clone_url, repo_path, token=token)
+        except TimeoutError as exc:
+            log.error("Git clone timed out", extra={"repo_path": repo_path, "error": str(exc)})
+            return False
         if rc != 0:
             log.error("Git clone failed", extra={"stderr": stderr})
             return False
         log.info("Repo cloned", extra={"repo_path": repo_path})
 
-        # Configure git identity
-        await _run_git(repo_path, "config", "user.name", git_user)
-        await _run_git(repo_path, "config", "user.email", git_email)
+        # Configure git identity (local ops — still time-bounded so a stuck
+        # `.git/index.lock` from a sibling process can't wedge startup).
+        try:
+            await _run_git(repo_path, "config", "user.name", git_user)
+            await _run_git(repo_path, "config", "user.email", git_email)
+        except TimeoutError as exc:
+            log.warning("Git identity config timed out", extra={"repo_path": repo_path, "error": str(exc)})
+            # Fall through — the clone succeeded; a missing local identity
+            # only bites at the first commit, and the caller learns via a
+            # loud commit-time failure instead of a silent startup wedge.
         return True
     else:
         log.info("Pulling latest", extra={"repo_path": repo_path})
@@ -324,8 +466,16 @@ async def init_repo(
             # via -c http.extraheader) and scrubs any legacy
             # `x-access-token:...@github.com` URL written by older versions
             # of this module — see issue #347.
-            await set_origin(repo_path, clone_url)
-        rc, _, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main", token=token)
+            try:
+                await set_origin(repo_path, clone_url)
+            except TimeoutError as exc:
+                log.warning("Git remote set-url timed out", extra={"repo_path": repo_path, "error": str(exc)})
+                return False
+        try:
+            rc, _, stderr = await _run_git(repo_path, "pull", "--rebase", "origin", "main", token=token)
+        except TimeoutError as exc:
+            log.warning("Git pull timed out", extra={"repo_path": repo_path, "error": str(exc)})
+            return False
         if rc != 0:
             log.warning("Git pull failed", extra={"stderr": stderr})
             return False
