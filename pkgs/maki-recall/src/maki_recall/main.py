@@ -119,10 +119,32 @@ NEO4J_PROBE_TX_TIMEOUT_S = float(os.environ.get("RECALL_NEO4J_PROBE_TX_TIMEOUT_S
 # Outer wall-clock deadline for each probe inside /health. Backstop in
 # case a future probe forgets its own per-call timeout or the wedge sits
 # below the SQL/cypher layer (kernel TCP retransmit, driver bug). Keeps
-# /health from inheriting the kernel TCP-timeout window. Picked a touch
-# larger than the per-probe layer-specific timeouts so the SQL/cypher
-# kill path runs first when both could fire. See #337.
-PROBE_DEADLINE_S = float(os.environ.get("RECALL_PROBE_DEADLINE_S", "5.0"))
+# /health from inheriting the kernel TCP-timeout window. Picked large
+# enough that the SQL/cypher kill path runs first when both could fire,
+# *and* that libpq has time to iterate every vault host on a multi-host
+# DSN — otherwise every partial-vault failover (up to three hosts each
+# paying ``connect_timeout=3``) trips this outer deadline before the
+# sync probe can surface the real per-host error string (#500). Default
+# bumped from 5.0 → 12.0 for the same reason. See #337, #500.
+PROBE_DEADLINE_S = float(os.environ.get("RECALL_PROBE_DEADLINE_S", "12.0"))
+
+# When the outer deadline fires we don't cancel the sync probe (it can't
+# be cancelled — ``asyncio.to_thread`` cannot signal the OS thread). We
+# instead wait a small grace window for the thread to complete and hand
+# back its real error string (e.g. "OperationalError: session is
+# read-only") rather than replacing it with the generic "TimeoutError:
+# ... exceeded deadline". Before this, a 30-minute vault-no-primary
+# window (#500) emitted 180+ identical timeout warnings with the actual
+# diagnostic visible only in the very last line, once vault started
+# completing connects fast enough to fall out of the timeout wrapper.
+PROBE_GRACE_S = float(os.environ.get("RECALL_PROBE_GRACE_S", "2.0"))
+
+# Minimum interval between identical /health probe failure log lines. The
+# first failure (and any distinct error) logs immediately; subsequent
+# identical failures are suppressed for this many seconds. Prevents 180+
+# identical WARNING lines during a 30-minute upstream outage (#500) —
+# same "first, then every N" pattern #325 wants for vector-init retries.
+PROBE_LOG_INTERVAL_S = float(os.environ.get("RECALL_PROBE_LOG_INTERVAL_S", "60.0"))
 
 
 def _build_pg_uri() -> str:
@@ -198,6 +220,15 @@ _graph_retry_task: asyncio.Task[None] | None = None
 # designed to be created once per application and shared; opening a fresh
 # driver per probe (every ~10s) burns sockets and DNS lookups. See #176.
 _neo4j_probe_driver: neo4j.Driver | None = None
+
+# Log-throttle state for identical /health probe failure warnings. Each entry
+# maps ``probe name → {"last_logged_at", "last_error"}``. First failure of a
+# run (and any distinct error string) logs immediately; subsequent identical
+# failures within ``PROBE_LOG_INTERVAL_S`` are suppressed. State is cleared on
+# probe success so the first failure of the *next* outage always logs. See
+# #500 — a 30-minute vault-no-primary window emitted 180+ identical WARNING
+# lines and drowned the actual last-line diagnostic in noise.
+_probe_log_state: dict[str, dict[str, Any]] = {}
 
 # NATS handle used by the init loop to escalate "still stuck" alerts onto
 # the same subject immune publishes component escalations to (#258). Kept
@@ -1017,29 +1048,90 @@ async def _run_probe_with_deadline(probe: Any, name: str) -> str | None:
     window (~60–120s), which is what produced the recall↔immune
     split-perception incident in #297. See #337.
 
+    Diagnostic preservation (#500): the sync probe cannot be cancelled
+    — ``asyncio.to_thread`` has no way to signal the OS thread. When
+    the outer deadline fires, the thread is still running and will
+    typically complete with a real error string (e.g. libpq's per-host
+    "session is read-only / connection closed unexpectedly" during a
+    Patroni failover) within a second or two. We wrap the awaitable in
+    ``asyncio.shield`` so the underlying Task survives ``wait_for``'s
+    cancellation, then peek at it under a short grace window
+    (``PROBE_GRACE_S``). If it lands in the grace, we return that real
+    error string; only if it *still* hasn't returned do we fall back to
+    the generic "TimeoutError: ... exceeded deadline" line. Before
+    this, the actual failover diagnostic was dropped on the floor and
+    replaced by 180+ identical timeout warnings during a 30-minute
+    vault-no-primary window.
+
     On a neo4j timeout we drop the cached driver — the existing except
     branch in :func:`_probe_neo4j` already does that on
     ``Exception``, but a hung ``session.run`` never reaches its except.
     pgvector opens a fresh psycopg.connect per call so there's no
     cached state to invalidate there.
 
-    Note: ``asyncio.to_thread`` cannot cancel the underlying OS thread
-    on timeout — the thread keeps running until its server-side timeout
-    fires (or the kernel gives up on the socket). That's an acceptable
-    leak: the next /health call sees ``_neo4j_probe_driver is None``
-    and reconnects, and the orphaned thread eventually unwinds.
+    Any orphaned thread that never returns is an acceptable leak: the
+    next /health call sees ``_neo4j_probe_driver is None`` and
+    reconnects, and the thread eventually unwinds when its server-side
+    timeout fires or the kernel gives up on the socket.
     """
     global _neo4j_probe_driver
+    task = asyncio.create_task(asyncio.to_thread(probe))
     try:
-        return await asyncio.wait_for(asyncio.to_thread(probe), timeout=PROBE_DEADLINE_S)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=PROBE_DEADLINE_S)
     except TimeoutError:
-        if name == "neo4j" and _neo4j_probe_driver is not None:
-            try:
-                _neo4j_probe_driver.close()
-            except Exception:
-                pass
-            _neo4j_probe_driver = None
-        return f"TimeoutError: {name} probe exceeded {PROBE_DEADLINE_S}s deadline"
+        # Deadline fired. The task is still running — give it a small
+        # grace window to finish and hand back its real error string
+        # instead of replacing it with the generic timeout message.
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=PROBE_GRACE_S)
+        except TimeoutError:
+            if name == "neo4j" and _neo4j_probe_driver is not None:
+                try:
+                    _neo4j_probe_driver.close()
+                except Exception:
+                    pass
+                _neo4j_probe_driver = None
+            return f"TimeoutError: {name} probe exceeded {PROBE_DEADLINE_S}s deadline"
+
+
+def _should_log_probe_failure(name: str, err: str) -> bool:
+    """Rate-limit identical /health probe failure log lines.
+
+    Returns True if this failure should be logged. The first failure of a
+    run — and any distinct error string — logs immediately. Subsequent
+    failures with the *same* error string are suppressed for
+    ``PROBE_LOG_INTERVAL_S`` before re-logging. On a distinct error, the
+    interval clock resets so operators see transitions between failure
+    modes right away.
+
+    Called from ``/health`` before ``log.warning``. State lives in
+    ``_probe_log_state`` and is cleared by ``_clear_probe_log_state`` on
+    probe success so the first failure of the next outage always logs.
+    See #500.
+    """
+    state = _probe_log_state.setdefault(name, {"last_logged_at": 0.0, "last_error": None})
+    now = time.time()
+    if state["last_error"] != err:
+        # Distinct error — log immediately and reset the interval clock.
+        state["last_error"] = err
+        state["last_logged_at"] = now
+        return True
+    if (now - state["last_logged_at"]) >= PROBE_LOG_INTERVAL_S:
+        state["last_logged_at"] = now
+        return True
+    return False
+
+
+def _clear_probe_log_state(name: str) -> None:
+    """Reset log-throttle state for a probe on success.
+
+    Ensures the first failure of the *next* outage logs immediately
+    regardless of when the previous identical failure last fired. See #500.
+    """
+    state = _probe_log_state.get(name)
+    if state is not None:
+        state["last_error"] = None
+        state["last_logged_at"] = 0.0
 
 
 def _init_snapshot() -> dict[str, Any]:
@@ -1172,16 +1264,25 @@ async def health():
 
     pg_err = await _run_probe_with_deadline(_probe_pgvector, "pgvector")
     if pg_err is not None:
-        log.warning("recall /health pg probe failed: %s", pg_err)
+        # Rate-limit identical warnings — see #500. A 30-minute upstream
+        # outage used to emit 180+ identical WARNING lines and drown the
+        # actual last-line diagnostic in noise.
+        if _should_log_probe_failure("pgvector", pg_err):
+            log.warning("recall /health pg probe failed: %s", pg_err)
         checks["status"] = "degraded"
         checks["pg"] = "down"
+    else:
+        _clear_probe_log_state("pgvector")
 
     if graph_enabled:
         neo_err = await _run_probe_with_deadline(_probe_neo4j, "neo4j")
         if neo_err is not None:
-            log.warning("recall /health neo4j probe failed: %s", neo_err)
+            if _should_log_probe_failure("neo4j", neo_err):
+                log.warning("recall /health neo4j probe failed: %s", neo_err)
             checks["status"] = "degraded"
             checks["neo4j"] = "down"
+        else:
+            _clear_probe_log_state("neo4j")
 
     # Graph-retry surface (#262). Always include for observability; flip to
     # degraded only when the retry has been failing past the threshold so a
