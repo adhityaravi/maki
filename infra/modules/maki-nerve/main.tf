@@ -3,7 +3,7 @@ resource "helm_release" "nats" {
   namespace  = var.namespace
   repository = "https://nats-io.github.io/k8s/helm/charts/"
   chart      = "nats"
-  version    = "2.12.6"
+  version    = "2.14.6"
 
   values = [templatefile("${path.module}/values.yaml.tpl", {
     storage_class          = var.storage_class
