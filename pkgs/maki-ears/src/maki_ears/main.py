@@ -739,7 +739,18 @@ def _create_bot():
     global _bot
     intents = discord.Intents.default()
     intents.message_content = True
-    _bot = MakiDiscordClient(intents=intents)
+    # Default-deny @everyone/@here/role mentions on every send. Model-generated
+    # reply text can echo user input, so without this a literal ``@everyone`` in
+    # any response body would actually ping the guild. ``users=True`` keeps
+    # ``<@userid>`` mentions working for direct replies to Adi; per-message
+    # overrides remain available when Maki genuinely wants to ping a role.
+    allowed_mentions = discord.AllowedMentions(
+        everyone=False,
+        roles=False,
+        users=True,
+        replied_user=True,
+    )
+    _bot = MakiDiscordClient(intents=intents, allowed_mentions=allowed_mentions)
     return _bot
 
 
