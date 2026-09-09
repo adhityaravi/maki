@@ -640,18 +640,34 @@ def make_github_issues_tools(
         if not number:
             return mcp_result("Error: 'number' is required.")
         try:
-            if comment:
-                await client.post(
-                    f"{API}/repos/{repo}/issues/{number}/comments",
-                    headers=await auth.headers(),
-                    json={"body": comment},
-                )
+            # PATCH first — only post the closing comment on success. Otherwise a
+            # transient GitHub 5xx/4xx leaves the "closing because X" rationale
+            # public on a still-open PR, and the caller (which sees Error: ...)
+            # retries and duplicates the comment. See issues #367 and #509.
             resp = await client.patch(
                 f"{API}/repos/{repo}/pulls/{number}",
                 headers=await auth.headers(),
                 json={"state": "closed"},
             )
             resp.raise_for_status()
+            if comment:
+                comment_resp = await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+                # Don't fail the whole close if the comment POST fails — the PR
+                # is already closed. Log and continue.
+                if comment_resp.is_error:
+                    log.warning(
+                        "close_pr: PR closed but comment POST failed",
+                        extra={
+                            "repo": repo,
+                            "number": number,
+                            "status": comment_resp.status_code,
+                            "body": comment_resp.text[:500],
+                        },
+                    )
             return mcp_result(f"Closed PR #{number} in {repo} without merging.")
         except httpx.HTTPStatusError as e:
             return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
@@ -689,19 +705,34 @@ def make_github_issues_tools(
         if not number:
             return mcp_result("Error: 'number' is required.")
         try:
-            # Add closing comment if provided
-            if comment:
-                await client.post(
-                    f"{API}/repos/{repo}/issues/{number}/comments",
-                    headers=await auth.headers(),
-                    json={"body": comment},
-                )
+            # PATCH first — only post the closing comment on success. Otherwise a
+            # transient GitHub 5xx/4xx leaves the "closing because X" rationale
+            # public on a still-open issue, and the caller (which sees Error: ...)
+            # retries and duplicates the comment. See issues #367 and #509.
             resp = await client.patch(
                 f"{API}/repos/{repo}/issues/{number}",
                 headers=await auth.headers(),
                 json={"state": "closed"},
             )
             resp.raise_for_status()
+            if comment:
+                comment_resp = await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+                # Don't fail the whole close if the comment POST fails — the issue
+                # is already closed. Log and continue.
+                if comment_resp.is_error:
+                    log.warning(
+                        "close_issue: issue closed but comment POST failed",
+                        extra={
+                            "repo": repo,
+                            "number": number,
+                            "status": comment_resp.status_code,
+                            "body": comment_resp.text[:500],
+                        },
+                    )
             return mcp_result(f"Closed #{number} in {repo}.")
         except httpx.HTTPStatusError as e:
             return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
