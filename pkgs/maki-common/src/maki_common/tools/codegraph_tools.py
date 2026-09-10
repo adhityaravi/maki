@@ -17,6 +17,22 @@ log = logging.getLogger(__name__)
 # Per-repo graph cache: keyed by absolute workspace path.
 _graphs: dict[str, Any] = {}
 
+# Sentinel values some callers pass to mean "no filter" for an optional param.
+# Downstream (_search_symbol / _find_node_ids) only honours the empty string,
+# so a non-empty placeholder like "-" would otherwise silently zero every
+# result. Belt-and-braces alongside the JSONSchema fix — see issue #521.
+_NO_FILTER_SENTINELS = frozenset({"-", "none", "null", "any", "*", "n/a", "na"})
+
+
+def _norm_filter(value: Any) -> str:
+    """Normalise an optional filter arg: strip whitespace, coerce sentinels to ""."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in _NO_FILTER_SENTINELS:
+        return ""
+    return s
+
 
 def invalidate_graph_cache(repo_path: str | None = None) -> None:
     """Drop the cached graph for `repo_path` (or every repo if None).
@@ -58,9 +74,29 @@ async def _resolve_path(registry: RepoRegistry, args: dict[str, Any]) -> tuple[s
     return entry.path, None
 
 
+# Full JSONSchema for search_code so we can mark filter params optional.
+# The claude-agent-sdk `tool()` decorator forwards any dict that has both
+# "type" and "properties" keys verbatim; a plain `{name: type}` dict is
+# expanded with every key marked required (see claude_agent_sdk
+# _build_schema). Passing a full schema is the only way to keep the filter
+# params optional at the MCP contract layer. See issue #521.
+_SEARCH_CODE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "scope": {"type": "string"},
+        "kind": {"type": "string"},
+        "file": {"type": "string"},
+        "target": {"type": "string"},
+        "repo": {"type": "string"},
+    },
+    "required": ["query", "scope"],
+}
+
+
 def make_codegraph_tools(
     registry: RepoRegistry,
-) -> list[tuple[str, str, dict[str, type], Any]]:
+) -> list[tuple[str, str, dict[str, Any], Any]]:
     """Return (name, description, params, handler) tuples for CodeGraph tools.
 
     Args:
@@ -70,11 +106,15 @@ def make_codegraph_tools(
 
     async def search_code(args: dict[str, Any]) -> dict[str, Any]:
         """Search the code structure graph for symbols, callers, callees, etc."""
-        query = args.get("query", "")
-        scope = args.get("scope", "symbol")
-        kind = args.get("kind", "")
-        file = args.get("file", "")
-        target = args.get("target", "")
+        query = str(args.get("query", "") or "")
+        scope = str(args.get("scope") or "symbol")
+        # Filter args are optional — coerce sentinel placeholders ("-", "none",
+        # "any", ...) to the empty string that downstream logic treats as
+        # "no filter". Without this, callers that pass a non-empty placeholder
+        # get zero results instead of an unfiltered search (issue #521).
+        kind = _norm_filter(args.get("kind"))
+        file = _norm_filter(args.get("file"))
+        target = _norm_filter(args.get("target"))
         log.info(
             "Tool: search_code",
             extra={"query": query, "scope": scope, "kind": kind, "file": file, "repo": args.get("repo")},
@@ -152,8 +192,10 @@ def make_codegraph_tools(
             "Scopes: symbol (default), callers, callees, references, definition, file, path. "
             "Kinds: function, class, module. "
             "Much faster than reading entire files — use this first to find what you need. "
+            "Only `query` and `scope` are required; `kind`, `file`, `target`, and `repo` are "
+            "optional — omit them (or pass an empty string) to search unfiltered. "
             "Optional `repo` arg (e.g. 'owner/name' or short name) selects a non-default repo.",
-            {"query": str, "scope": str, "kind": str, "file": str, "target": str, "repo": str},
+            _SEARCH_CODE_SCHEMA,
             search_code,
         ),
         (
