@@ -314,6 +314,7 @@ async def _publish_response(
     done: bool,
     cancelled: bool = False,
     reason: str | None = None,
+    error: str | None = None,
     log_fail_msg: str = "Failed to publish turn response",
 ) -> None:
     """Publish a CORTEX_TURN_RESPONSE envelope with uniform error handling.
@@ -327,12 +328,19 @@ async def _publish_response(
     ``_turn_response`` still handles stamping ``instance_id`` on every payload
     (issue #394) — this helper builds the base envelope and delegates encoding
     to it so per-instance cancellation keeps working from every publish site.
+
+    ``error`` is an optional short categorical tag (e.g. exception type name)
+    published alongside ``cancelled=True`` so downstream consumers (metrics,
+    immune) can bucket cancellation causes without parsing free-form logs.
+    See issue #526.
     """
     payload = {"turn_id": turn_id, "response": response, "done": done}
     if cancelled:
         payload["cancelled"] = True
     if reason:
         payload["reason"] = reason
+    if error:
+        payload["error"] = error
     try:
         await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(payload))
     except Exception:
@@ -713,6 +721,10 @@ async def handle_turn_request(msg, nc, mcp_server):
                 # flag, the work loop would treat an empty response as success,
                 # auto-close the issue with a blank comment, and wipe the
                 # per-issue failure backoff. See issue #422.
+                #
+                # Publish the exception TYPE (not str(exc) — the pattern text
+                # is what qualified it as silent, and downstream consumers
+                # only need a stable categorical tag). See issue #526.
                 await _publish_response(
                     nc,
                     turn_id,
@@ -720,6 +732,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                     done=True,
                     cancelled=True,
                     reason="cortex_silent_error",
+                    error=type(exc).__name__,
                 )
             else:
                 # Genuine unexpected error — send a brief message. Mark
@@ -734,6 +747,7 @@ async def handle_turn_request(msg, nc, mcp_server):
                     done=True,
                     cancelled=True,
                     reason="cortex_error",
+                    error=type(exc).__name__,
                 )
         finally:
             _turn_state.clear()
