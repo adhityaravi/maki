@@ -156,7 +156,7 @@ resource "kubernetes_stateful_set" "vault" {
       spec {
         init_container {
           name    = "fix-permissions"
-          image   = "busybox:1.36"
+          image   = "busybox:1.38"
           command = ["sh", "-c", "chown -R 999:999 /var/lib/postgresql/data /var/lib/raft && chmod -R 0700 /var/lib/postgresql/data"]
           volume_mount {
             name       = "data"
