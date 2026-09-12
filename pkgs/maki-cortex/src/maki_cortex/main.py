@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import uuid
+from html import escape as _xml_escape
 from typing import Any
 
 from maki_common import (
@@ -400,14 +401,25 @@ def build_conversation_prompt(turn: dict) -> str:
     Kept separate from the system prompt so that injected or replayed
     ``user:``/``assistant:`` lines in context cannot be mistaken for live
     turns by the model.
+
+    For that boundary to actually hold, every user-controlled ``role`` and
+    ``content`` value MUST be XML-escaped before interpolation — otherwise
+    a message containing ``</turn>`` or ``</conversation_history>`` can
+    close the wrapper early and forge fresh system/turn blocks that Claude
+    reads as trusted context. See issue #529.
     """
     conversation = turn.get("conversation", [])
     if not conversation:
         return ""
     conv_lines = []
     for msg in conversation:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
+        # ``quote=True`` on role so a ``"`` in the value can't break out of
+        # the attribute; ``quote=False`` on content because it's element text
+        # (no attribute quotes to escape) and we want to preserve any literal
+        # ``"``/``'`` the user typed. Both still escape ``<``/``>``/``&``,
+        # which is what actually closes the boundary.
+        role = _xml_escape(str(msg.get("role", "unknown")), quote=True)
+        content = _xml_escape(str(msg.get("content", "")), quote=False)
         conv_lines.append(f'<turn role="{role}">{content}</turn>')
     return "<conversation_history>\n" + "\n".join(conv_lines) + "\n</conversation_history>"
 
