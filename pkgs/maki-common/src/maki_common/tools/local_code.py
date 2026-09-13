@@ -51,6 +51,54 @@ def _safe_path(repo_path: str, relative: str) -> Path | None:
     return target
 
 
+def _writable_path(repo_path: str, relative: str) -> Path | None:
+    """Resolve a relative path for **mutating** operations.
+
+    Adds a `.git/` component ban on top of :func:`_safe_path`. `.git/HEAD`,
+    `.git/config`, `.git/hooks/**`, `.git/refs/**` all live *inside* the repo
+    directory, so the base traversal guard alone lets a confused/adversarial
+    agent overwrite them via ``write_file`` / ``edit_file`` — corrupting the
+    index, silently rewriting ``origin`` to an attacker remote before the next
+    ``git_commit_and_push``, or dropping a payload into ``pre-commit`` that
+    fires on the very next commit tool call.
+
+    We already scrub tokens out of ``.git/config`` in :func:`_run_git`
+    (issue #347); the writers next to it must not undo that. Read tools keep
+    using :func:`_safe_path` — inspecting ``.git/`` can't corrupt state.
+
+    The ban is component-wise, so nested ``.git`` dirs (submodules,
+    fixtures) are blocked too. Returns ``None`` when the path escapes the
+    repo *or* targets ``.git``; callers should render a distinct error for
+    the ``.git`` case (see :func:`_git_write_error`).
+    """
+    resolved = _safe_path(repo_path, relative)
+    if resolved is None:
+        return None
+    base = Path(repo_path).resolve()
+    # `relative_to` needs the child-or-equal invariant _safe_path already
+    # enforced above; for `resolved == base` the parts tuple is empty so
+    # the `any(...)` is trivially False, which is what we want.
+    rel_parts = resolved.relative_to(base).parts if resolved != base else ()
+    if any(part == ".git" for part in rel_parts):
+        return None
+    return resolved
+
+
+def _path_touches_git(repo_path: str, relative: str) -> bool:
+    """True iff ``relative`` resolves inside the repo AND targets ``.git/``.
+
+    Used to distinguish "outside repo" from "inside repo but blocked" so we
+    can give the caller a targeted error instead of a misleading traversal
+    message.
+    """
+    inside = _safe_path(repo_path, relative)
+    if inside is None:
+        return False
+    base = Path(repo_path).resolve()
+    rel_parts = inside.relative_to(base).parts if inside != base else ()
+    return any(part == ".git" for part in rel_parts)
+
+
 async def _run_git(
     repo_path: str,
     *args: str,
@@ -369,8 +417,10 @@ def make_code_edit_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        resolved = _safe_path(entry.path, path)
+        resolved = _writable_path(entry.path, path)
         if not resolved:
+            if _path_touches_git(entry.path, path):
+                return mcp_result(f"Error: writes to .git/ are not permitted (path '{path}').")
             return mcp_result(f"Error: path '{path}' is outside the repository.")
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -398,8 +448,10 @@ def make_code_edit_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        resolved = _safe_path(entry.path, path)
+        resolved = _writable_path(entry.path, path)
         if not resolved:
+            if _path_touches_git(entry.path, path):
+                return mcp_result(f"Error: edits to .git/ are not permitted (path '{path}').")
             return mcp_result(f"Error: path '{path}' is outside the repository.")
         if not resolved.is_file():
             return mcp_result(f"Error: '{path}' does not exist or is not a file.")
@@ -438,11 +490,16 @@ def make_code_edit_tools(
             return mcp_result(err or "")
 
         try:
-            # Stage files
+            # Stage files. `_writable_path` guards `.git/` — git's own `add`
+            # already refuses `.git`, but the check here fails fast with a
+            # clear message *before* we shell out, and also blocks nested
+            # `.git` component targets (a repo-in-repo footgun).
             file_list = [f.strip() for f in files.split(",") if f.strip()]
             for f in file_list:
-                resolved = _safe_path(entry.path, f)
+                resolved = _writable_path(entry.path, f)
                 if not resolved:
+                    if _path_touches_git(entry.path, f):
+                        return mcp_result(f"Error: staging paths inside .git/ is not permitted (file '{f}').")
                     return mcp_result(f"Error: file '{f}' is outside the repository.")
                 rc, _, stderr = await _run_git(entry.path, "add", f)
                 if rc != 0:
