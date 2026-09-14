@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -265,26 +266,33 @@ def make_code_tools(
                     return mcp_result(f"Error: path '{path_filter}' is outside the repository.")
                 search_path = str(resolved)
 
+            # No extension whitelist — the old include-list hid *entire trees*.
+            # `infra/` is 100% `.tf` + Terragrunt `.hcl`, so every infra grep
+            # returned "No matches" (issues #77, #276, #293, #383, #384, #612).
+            # `Dockerfile`, `.gitignore`, `.env.example`, `.sql`, `.rs`, `.rb`
+            # were all invisible for the same reason. Rely on `-I` to skip
+            # binaries and `--exclude-dir` to skip vendored/build trees.
             proc = await asyncio.create_subprocess_exec(
                 "grep",
-                "-rn",
-                "--include=*.py",
-                "--include=*.yaml",
-                "--include=*.yml",
-                "--include=*.toml",
-                "--include=*.json",
-                "--include=*.md",
-                "--include=*.txt",
-                "--include=*.cfg",
-                "--include=*.ini",
-                "--include=*.sh",
-                "--include=*.go",
-                "--include=*.js",
-                "--include=*.ts",
+                "-rHnI",
+                "--exclude-dir=.git",
+                "--exclude-dir=node_modules",
+                "--exclude-dir=__pycache__",
+                "--exclude-dir=.venv",
+                "--exclude-dir=venv",
+                "--exclude-dir=.tox",
+                "--exclude-dir=dist",
+                "--exclude-dir=build",
+                "--exclude-dir=.mypy_cache",
+                "--exclude-dir=.ruff_cache",
+                "--exclude-dir=.pytest_cache",
+                "--exclude-dir=.terraform",
                 "-C",
                 "2",
-                "-m",
-                str(MAX_SEARCH_RESULTS),
+                # NOTE: `-m N` was here previously and it's PER-FILE, not total.
+                # Combined with `-r`, a common token like `import` dumped
+                # thousands of lines and starved the tool's context (#612).
+                # We cap the total in Python after the fact — see below.
                 query,
                 search_path,
                 stdout=asyncio.subprocess.PIPE,
@@ -295,18 +303,53 @@ def make_code_tools(
             # blob it insists on scanning) can't wedge the MCP tool loop
             # forever — same class of failure as #499's git-timeout gap.
             stdout, stderr = await _communicate_with_timeout(proc, GIT_LOCAL_TIMEOUT_S, f"grep {query!r}")
-            output = stdout.decode(errors="replace")
 
+            # grep exit codes: 0=matches, 1=no matches, 2=error. The old code
+            # only inspected stdout, so a malformed regex like `(foo` silently
+            # returned "No matches" — Claude thought the codebase was clean
+            # when the query never ran (#612 comment). Surface rc=2 as a real
+            # error with grep's stderr attached.
+            if proc.returncode == 2:
+                err_msg = stderr.decode(errors="replace").strip() or "grep failed"
+                return mcp_result(f"Error: grep failed: {err_msg}")
+
+            output = stdout.decode(errors="replace")
             if not output.strip():
                 return mcp_result(f"No matches found for '{query}'.")
+
+            # Cap TOTAL matches at MAX_SEARCH_RESULTS by walking the output
+            # line-by-line and stopping once we've seen enough match lines
+            # (context lines and `--` group separators don't count).
+            # grep -Hn output: `path:LINE:content` for matches,
+            # `path-LINE-content` for context. We detect matches with a
+            # regex that anchors on `:\d+:` after the path prefix. Non-greedy
+            # so a colon inside the path doesn't shift the anchor.
+            match_line_re = re.compile(r"^[^\n]+?:\d+:")
+            kept: list[str] = []
+            matches = 0
+            truncated = False
+            for line in output.splitlines():
+                if match_line_re.match(line):
+                    if matches >= MAX_SEARCH_RESULTS:
+                        truncated = True
+                        break
+                    matches += 1
+                kept.append(line)
+            result = "\n".join(kept)
 
             # Make paths relative to repo
             base = str(entry.path)
             if base and not base.endswith("/"):
                 base += "/"
-            output = output.replace(base, "")
+            result = result.replace(base, "")
 
-            return mcp_result(output)
+            if truncated:
+                result += (
+                    f"\n\n... truncated at {MAX_SEARCH_RESULTS} matches — "
+                    "narrow the query or pass a `path` to see more."
+                )
+
+            return mcp_result(result)
         except Exception as e:
             return mcp_result(f"Error searching: {e}")
 
@@ -369,7 +412,11 @@ def make_code_tools(
         (
             "search_text",
             "Search for text patterns in a repository (grep-style). "
-            "Returns matching lines with context. Optionally filter by path. "
+            f"Returns matching lines with 2 lines of context, capped at {MAX_SEARCH_RESULTS} total matches. "
+            "Searches every text file (binaries auto-skipped) — no extension whitelist, "
+            "so `.tf`/`.hcl`/`Dockerfile`/`.sql`/`.rs`/dotfiles are all searchable. "
+            "Vendored dirs (.git, node_modules, __pycache__, .venv, dist, build, .terraform, "
+            "caches) are excluded. Optionally filter by path. "
             "Optional `repo` arg selects a non-default repo.",
             {"query": str, "path": str, "repo": str},
             search_text,
