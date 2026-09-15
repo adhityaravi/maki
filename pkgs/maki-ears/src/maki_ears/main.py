@@ -218,18 +218,28 @@ class MakiDiscordClient(discord.Client):
             return
 
     async def on_message(self, message: discord.Message):
-        if message.author == self.user:
+        # Ignore ourselves and any other bot (webhooks, GitHub, dashboards, etc.).
+        # Without the bot guard, two bots in a shared channel can trigger a reply
+        # storm; the previous "Get your own, perv!" reply was also a harassment
+        # and spam vector because it fired for every non-owner Maki could see.
+        if message.author == self.user or message.author.bot:
             return
 
-        if message.author.id != OWNER_ID:
-            await message.channel.send("Get your own, perv!")
-            return
-
+        # Channel filter FIRST — anything outside our allow-list is a silent
+        # no-op regardless of who sent it. This bounds Maki's blast radius to
+        # channels it was explicitly invited to observe.
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_general = message.channel.id in _general_channel_ids
         is_immune = message.channel.id in _immune_channel_ids
 
         if not is_dm and not is_general and not is_immune:
+            return
+
+        # Only the owner drives Maki — non-owner messages in observed channels
+        # (including DMs from strangers in mutual servers) are silently dropped.
+        # No auto-reply: Discord's anti-abuse heuristics flag chatty bots, and
+        # an insult reply is a spam / harassment vector on its own.
+        if message.author.id != OWNER_ID:
             return
 
         content = message.content.strip()
