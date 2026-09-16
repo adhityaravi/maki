@@ -21,8 +21,9 @@ from maki_common.subjects import MEMORY_STORE
 # Owner identity for the whole memory pipeline lives in maki_common (see #160)
 # so stem, cortex, and immune can't drift on who "adi" actually is. Re-exported
 # here as a module-level name to keep the existing import surface (`from
-# maki_stem.memory import MEMORY_USER_ID`) working.
-from maki_common.tools.recall import MEMORY_USER_ID
+# maki_stem.memory import MEMORY_USER_ID`) working. ``MEMORY_TOOL_ROLE`` is the
+# fallback for legacy NATS publishers that don't declare a role — see #624.
+from maki_common.tools.recall import MEMORY_TOOL_ROLE, MEMORY_USER_ID
 
 log = logging.getLogger(__name__)
 
@@ -128,15 +129,28 @@ async def feed_memories(user_message: str, cortex_response: str) -> None:
             return
 
 
-async def _store_memory(content: str, source: str, user_id: str, metadata: dict | None) -> None:
-    """Store a single memory via recall REST API (runs as background task)."""
+async def _store_memory(
+    content: str,
+    source: str,
+    user_id: str,
+    metadata: dict | None,
+    role: str = MEMORY_TOOL_ROLE,
+) -> None:
+    """Store a single memory via recall REST API (runs as background task).
+
+    ``role`` is the mem0 message role — pass ``"assistant"`` for things Maki
+    said/learned (the default; matches every ``add_memory`` tool call), and
+    ``"user"`` only when the memory literally captures something Adi said.
+    mem0's extraction reads the role, so this choice changes how the memory
+    is later attributed (#624).
+    """
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
                     f"{RECALL_URL}/memories",
                     json={
-                        "messages": [{"role": "user", "content": content}],
+                        "messages": [{"role": role, "content": content}],
                         "user_id": user_id,
                         "metadata": metadata or {},
                     },
@@ -164,9 +178,13 @@ async def _handle_memory_store(msg) -> None:
         user_id = data.get("user_id", MEMORY_USER_ID)
         source = data.get("source", "unknown")
         metadata = data.get("metadata")
+        # Honor the publisher's declared role. Falls back to MEMORY_TOOL_ROLE
+        # ("assistant") so any legacy publisher that hasn't set it lands as
+        # Maki-said, matching what every add_memory tool call means (#624).
+        role = data.get("role", MEMORY_TOOL_ROLE)
 
         spawn_background(
-            _store_memory(content, source, user_id, metadata),
+            _store_memory(content, source, user_id, metadata, role),
             name="stem.store_memory",
         )
     except Exception:

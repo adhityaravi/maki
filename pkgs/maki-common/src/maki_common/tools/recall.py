@@ -27,6 +27,14 @@ log = logging.getLogger(__name__)
 # the two sites can't drift.
 MEMORY_USER_ID = os.environ.get("MEMORY_USER_ID", "adi")
 
+# Role every ``add_memory`` tool call writes to mem0 as. The tool is Maki
+# recording something Maki learned, so it lands as ``assistant`` — mem0's
+# extraction is role-aware and a ``user`` message would read as "Adi said X".
+# Pinning this in the NATS payload lets stem's store handler honor whatever
+# the publisher declares instead of hardcoding the role at persist time,
+# which was the drift that made NATS→"user" vs REST→"assistant" (#624).
+MEMORY_TOOL_ROLE = "assistant"
+
 
 def make_recall_tools(
     recall_url: str, nc: Any | None = None, source: str = "cortex"
@@ -58,7 +66,12 @@ def make_recall_tools(
         async def add_memory(args: dict[str, Any]) -> dict[str, Any]:
             content = args.get("content", "")
             log.info("Tool: add_memory (NATS)", extra={"content_len": len(content)})
-            payload = {"content": content, "source": source, "user_id": MEMORY_USER_ID}
+            payload = {
+                "content": content,
+                "source": source,
+                "user_id": MEMORY_USER_ID,
+                "role": MEMORY_TOOL_ROLE,
+            }
             await nc.publish(MEMORY_STORE, json.dumps(payload).encode())
             return mcp_result(f"Memory queued: {content[:100]}")
 
@@ -71,7 +84,7 @@ def make_recall_tools(
                 resp = await client.post(
                     f"{recall_url}/memories",
                     json={
-                        "messages": [{"role": "assistant", "content": content}],
+                        "messages": [{"role": MEMORY_TOOL_ROLE, "content": content}],
                         "user_id": MEMORY_USER_ID,
                     },
                 )
