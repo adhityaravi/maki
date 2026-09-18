@@ -34,3 +34,12 @@ variable "llm_model" {
   type    = string
   default = "claude-sonnet-4-6"
 }
+
+# Kept in sync with infra/modules/maki-embed/variables.tf `embed_model`.
+# If maki-embed preloads model X but maki-recall requests model Y, every
+# recall embed call 404s. Keep both defaults identical.
+variable "embed_model" {
+  description = "Embedding model to request from maki-embed. Must match maki-embed's preloaded model."
+  type        = string
+  default     = "nomic-embed-text"
+}
