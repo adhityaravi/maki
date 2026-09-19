@@ -25,26 +25,42 @@ def make_config_tools(
     effective_keys = allowed_keys or ALLOWED_CONFIG_KEYS
 
     async def get_config(args: dict[str, Any]) -> dict[str, Any]:
-        """Read all configuration values."""
+        """Read all configuration values.
+
+        Values are JSON-decoded so this reader agrees with ``load_kv_config``
+        and every writer (``init_kv`` seed defaults, ``apply_config_updates``,
+        ``update_config`` below). Historically ``get_config`` decoded raw
+        bytes while ``load_kv_config`` decoded JSON — reading the same key
+        two different ways produced a split-brain where an ``update_config``
+        write "showed up" via ``get_config`` but was silently ignored by
+        every consumer that used ``load_kv_config``. See issue #638.
+        """
         log.info("Tool: get_config")
         config = {}
         for key in effective_keys:
             try:
                 entry = await config_kv.get(key)
-                config[key] = entry.value.decode()
+                config[key] = json.loads(entry.value.decode())
             except Exception:
                 config[key] = ""
         return mcp_result(str(config))
 
     async def update_config(args: dict[str, Any]) -> dict[str, Any]:
-        """Update a configuration value."""
+        """Update a configuration value.
+
+        Stores the value as JSON so it round-trips through ``load_kv_config``
+        (which ``json.loads`` the stored bytes). Writing raw ``value.encode()``
+        used to make every consumer of ``load_kv_config`` fall back to the
+        seed default because ``json.loads("claude-opus-4-7")`` raises and the
+        broad ``except`` swallowed it. See issue #638.
+        """
         key = args.get("key", "")
         value = args.get("value", "")
         log.info("Tool: update_config", extra={"key": key, "value": value})
         if key not in effective_keys:
             return mcp_result(f"Key '{key}' not allowed. Allowed keys: {', '.join(sorted(effective_keys))}")
         try:
-            await config_kv.put(key, value.encode())
+            await config_kv.put(key, json.dumps(value).encode())
             # Propagate to all sites so config survives leadership migration
             if nc is not None:
                 await nc.publish(CONFIG_SYNC, json.dumps({"key": key, "value": value}).encode())

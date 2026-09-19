@@ -117,13 +117,20 @@ _db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in 
 
 
 async def _handle_config_sync(msg) -> None:
-    """Apply one config update from a peer site."""
+    """Apply one config update from a peer site.
+
+    Store the value as JSON so it round-trips through ``load_kv_config``
+    (every reader ``json.loads`` the stored bytes). Writing raw
+    ``value.encode()`` here matched the old ``update_config`` MCP tool but
+    disagreed with the reader, so gossip-propagated updates silently
+    reverted to the seed default on every consumer. See issue #638.
+    """
     try:
         data = json.loads(msg.data.decode())
         key = data.get("key", "")
         value = data.get("value", "")
         if key and _config_kv is not None:
-            await _config_kv.put(key, value.encode())
+            await _config_kv.put(key, json.dumps(value).encode())
             log.info("Config synced from peer", extra={"key": key, "value": value})
     except Exception:
         log.exception("Config sync error")

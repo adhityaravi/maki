@@ -225,13 +225,56 @@ async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> Ke
 
 
 async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, Any]:
-    """Load config from a KV bucket, falling back to provided defaults."""
+    """Load config from a KV bucket, falling back to provided defaults.
+
+    Distinguishes three cases:
+
+    * ``KeyNotFoundError`` — genuinely unset key, silently use the default.
+    * ``json.JSONDecodeError`` / ``UnicodeDecodeError`` — the key exists
+      but the stored bytes aren't valid JSON. This is a writer/reader
+      encoding disagreement (see issue #638: an older ``update_config``
+      MCP tool and CONFIG_SYNC handler stored raw ``value.encode()``
+      while every reader ``json.loads``'d the bytes, so every self-tuned
+      config value silently reverted to the seed default). Log at ERROR
+      so the split-brain surfaces instead of hiding behind a
+      "looks default" fallback. Subsequent ``update_config`` /
+      ``apply_config_updates`` writes will overwrite the raw value with
+      valid JSON and the key self-heals.
+    * Anything else — currently treated as "default" for backwards
+      compatibility. See #369 for tightening the transient-read path.
+
+    The behaviour on the second and third case is still "return the
+    default"; the difference is telemetry — a stealth encoding bug is
+    now loud enough to notice.
+    """
     config = {}
     for key, default in defaults.items():
         try:
             entry = await kv.get(key)
-            config[key] = json.loads(entry.value.decode())
+        except nats.js.errors.KeyNotFoundError:
+            config[key] = default
+            continue
         except Exception:
+            # See #369 — a transient KV read failure still falls back to
+            # the default silently. Keeping that path unchanged here to
+            # stay scoped to the encoding-mismatch fix (#638).
+            config[key] = default
+            continue
+        try:
+            config[key] = json.loads(entry.value.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            log.error(
+                "KV config value present but unparseable — using default. "
+                "This indicates a writer stored raw bytes where JSON was "
+                "expected (see issue #638). The next write will overwrite "
+                "the raw value with valid JSON.",
+                extra={
+                    "key": key,
+                    "raw_value": entry.value,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
             config[key] = default
     return config
 
