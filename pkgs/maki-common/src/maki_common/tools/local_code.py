@@ -33,6 +33,199 @@ MAX_READ_LINES = 500
 MAX_SEARCH_RESULTS = 30
 
 
+# ---------------------------------------------------------------------------
+# git_run — read-only allowlist (#639).
+#
+# The MCP `git_run` tool used to accept ANY git subcommand: an LLM turn could
+# call `git_run(command="push --force origin main")`, `reset --hard`,
+# `remote set-url origin https://attacker/…`, `checkout -f`, `clean -fdx`, or
+# `branch -D main`. The reflection prompt says "don't do that" — a soft
+# guardrail on the model, not the tool. Prompt injection through issue bodies
+# (#316), tool results, or Discord input can bypass it. The tool has to
+# enforce this itself.
+#
+# The docstring already advertised `git_run` as "useful for read-mostly
+# operations". We now match implementation to contract: subcommands the model
+# might legitimately want for inspection are on `_GIT_READ_ONLY_SUBCOMMANDS`,
+# and per-subcommand argument bans strip out the flags that turn a "read"
+# into a mutation (e.g. `branch -D`, `reflog delete`, `diff --output=/tmp/x`).
+# Anything else — including `push`, `reset`, `remote`, `config`, `checkout`,
+# `clean`, `stash`, `rebase`, `merge`, `commit` — is refused with a message
+# pointing at `git_commit_and_push` for legitimate writes.
+# ---------------------------------------------------------------------------
+
+_GIT_READ_ONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "log",
+        "show",
+        "diff",
+        "blame",
+        "status",
+        "branch",
+        "tag",
+        "rev-parse",
+        "rev-list",
+        "describe",
+        "ls-files",
+        "ls-tree",
+        "cat-file",
+        "shortlog",
+        "reflog",
+        "for-each-ref",
+        "name-rev",
+        "grep",
+    }
+)
+
+# Per-subcommand bans: even inside an "allowed" verb, certain flags/subverbs
+# escalate a read into a mutation. Matched against each arg after the
+# subcommand; both bare form (`--delete`) and `key=value` form
+# (`--output=/tmp/x`) hit because we split on `=` before comparing.
+_GIT_READ_ONLY_ARG_BANS: dict[str, frozenset[str]] = {
+    # `git branch` LISTS with no args (or `-a`, `-r`, `--list`, `--contains`,
+    # `-v`, `--merged`, `--no-merged` etc). It DELETES / RENAMES / FORCES /
+    # sets upstream with the flags below — all of which mutate refs.
+    "branch": frozenset(
+        {
+            "-d",
+            "-D",
+            "--delete",
+            "-m",
+            "-M",
+            "--move",
+            "-c",
+            "-C",
+            "--copy",
+            "-f",
+            "--force",
+            "--edit-description",
+            "--set-upstream",
+            "--set-upstream-to",
+            "--unset-upstream",
+            "--track",
+            "--no-track",
+            "--create-reflog",
+        }
+    ),
+    # `git tag` LISTS with `-l` / no args; the flags below create, delete,
+    # sign, or force-move a tag — all writes.
+    "tag": frozenset(
+        {
+            "-d",
+            "-D",
+            "--delete",
+            "-f",
+            "--force",
+            "-a",
+            "--annotate",
+            "-s",
+            "--sign",
+            "-u",
+            "--local-user",
+            "-m",
+            "--message",
+            "-F",
+            "--file",
+            "--cleanup",
+            "-e",
+            "--edit",
+            "--create-reflog",
+        }
+    ),
+    # `git reflog` defaults to `show`; the subverbs below expire / delete /
+    # drop reflog entries — irreversible state loss.
+    "reflog": frozenset({"delete", "expire", "drop"}),
+    # `git diff --output=<file>` writes the diff to <file>, bypassing the
+    # repo-boundary check that our filesystem tools enforce. `--ext-diff`
+    # / `--textconv` shell out to configured external commands. Same for
+    # log/show/blame which honour `--output` for patch generation.
+    "diff": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "log": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "show": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "blame": frozenset({"--textconv"}),
+    # `git grep --open-files-in-pager` / `-O` invokes a pager binary of the
+    # caller's choosing. Not a write per se, but arbitrary command exec.
+    "grep": frozenset({"-O", "--open-files-in-pager"}),
+}
+
+# Flags rejected regardless of subcommand — these either point at a remote
+# side-channel that can execute arbitrary code (`--upload-pack`,
+# `--receive-pack`, `--exec`) or relocate the git dir / worktree
+# (`--git-dir`, `--work-tree`, `--namespace`). Both bare and `flag=value`
+# forms are caught because we compare against `arg.split("=", 1)[0]`.
+_GIT_READ_ONLY_GLOBAL_BANNED_FLAGS: frozenset[str] = frozenset(
+    {
+        "--upload-pack",
+        "--receive-pack",
+        "--exec",
+        "--exec-path",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+    }
+)
+
+
+def _validate_git_read_only(parts: list[str]) -> str | None:
+    """Return an error string if *parts* is not a safe read-only git invocation.
+
+    *parts* is the argv-style token list AFTER an optional leading ``git``
+    has been stripped. Returns ``None`` when the invocation passes; a
+    human-readable error otherwise (safe to hand straight back to the
+    caller as the tool result).
+
+    The check has three layers:
+
+    1. **Global git options are refused.** A leading token starting with
+       ``-`` (e.g. ``-c http.extraheader=…``, ``-C /some/other/repo``,
+       ``--git-dir /tmp/attacker``) would let the caller inject config or
+       redirect the operation before we even see the subcommand.
+    2. **Subcommand must be on the read-only allowlist.** Anything else —
+       ``push``, ``reset``, ``checkout``, ``clean``, ``remote``,
+       ``config``, ``stash``, ``rebase``, ``merge``, ``commit``,
+       ``filter-branch``, ``update-ref``, … — is rejected with a pointer
+       to ``git_commit_and_push`` for legitimate writes.
+    3. **Per-subcommand argument bans.** Even inside an allowed verb, some
+       flags mutate state (``branch -D``, ``reflog delete``,
+       ``tag --delete``) or exfiltrate data outside the repo boundary
+       (``diff --output=/tmp/x``). Global bans (``--upload-pack``,
+       ``--git-dir``) apply everywhere.
+    """
+    if not parts:
+        return "Error: empty command."
+    head = parts[0]
+    if head.startswith("-"):
+        return (
+            f"Error: global git option '{head}' is not permitted before the subcommand "
+            "(no `-c`, `-C`, `--git-dir`, `--work-tree`, …). Pass a plain subcommand."
+        )
+    subcommand = head
+    if subcommand not in _GIT_READ_ONLY_SUBCOMMANDS:
+        allowed = ", ".join(sorted(_GIT_READ_ONLY_SUBCOMMANDS))
+        return (
+            f"Error: git '{subcommand}' is not permitted via git_run — this tool is read-only. "
+            f"Use git_commit_and_push for writes, git_pull for pulls. "
+            f"Allowed read subcommands: {allowed}."
+        )
+    banned = _GIT_READ_ONLY_ARG_BANS.get(subcommand, frozenset())
+    for arg in parts[1:]:
+        # Match both `--foo` and `--foo=bar` forms by stripping the value.
+        key = arg.split("=", 1)[0]
+        if key in _GIT_READ_ONLY_GLOBAL_BANNED_FLAGS:
+            return (
+                f"Error: argument '{arg}' is not permitted (global ban — remote-side "
+                "exec / git-dir redirect flags are blocked on every subcommand)."
+            )
+        if key in banned:
+            return (
+                f"Error: argument '{arg}' is not permitted for git {subcommand} via git_run — "
+                "it would mutate refs / write outside the repo. Use git_commit_and_push for writes."
+            )
+    return None
+
+
 def _safe_path(repo_path: str, relative: str) -> Path | None:
     """Resolve a relative path within repo_path, rejecting traversal.
 
@@ -635,11 +828,20 @@ def make_code_edit_tools(
             return mcp_result(f"Error: {e}")
 
     async def git_run(args: dict[str, Any]) -> dict[str, Any]:
-        """Run an arbitrary git command in the repo workspace.
+        """Run a **read-only** git command in the repo workspace.
 
-        Useful for read-mostly operations (`log`, `show`, `branch -a`, `rev-parse`)
-        and ad-hoc git that doesn't have a dedicated tool. The command is parsed
-        with shlex; `git` is prepended automatically.
+        The tool enforces a subcommand allowlist (log, show, diff, blame,
+        status, branch, tag, rev-parse, rev-list, describe, ls-files,
+        ls-tree, cat-file, shortlog, reflog, for-each-ref, name-rev, grep)
+        plus per-subcommand argument bans that block the flags that turn a
+        "read" into a state-changing write (`branch -D`, `tag --delete`,
+        `reflog delete`, `diff --output=…`, etc.). Global git options
+        before the subcommand (`-c`, `-C`, `--git-dir`, …) and remote-side
+        exec flags (`--upload-pack`, `--receive-pack`, `--exec`) are
+        rejected outright.
+
+        For writes, use ``git_commit_and_push`` (which mints and scopes an
+        installation token per push) or ``git_pull``. See issue #639.
         """
         command = args.get("command", "")
         log.info("Tool: git_run", extra={"command": command, "repo": args.get("repo")})
@@ -659,6 +861,16 @@ def make_code_edit_tools(
             parts = parts[1:]
         if not parts:
             return mcp_result("Error: command is just 'git' with no subcommand.")
+        # Read-only enforcement (#639). Any write path — push, reset,
+        # remote set-url, config, checkout -f, clean, branch -D — is
+        # refused here so a prompt-injected LLM turn can't reach it.
+        rejection = _validate_git_read_only(parts)
+        if rejection is not None:
+            log.warning(
+                "git_run rejected (read-only guard)",
+                extra={"command": command, "repo": args.get("repo"), "reason": rejection},
+            )
+            return mcp_result(rejection)
         try:
             rc, stdout, stderr = await _run_git(entry.path, *parts)
         except TimeoutError as exc:
@@ -785,8 +997,13 @@ def make_code_edit_tools(
         ),
         (
             "git_run",
-            "Run an arbitrary git command in the repo workspace (e.g. 'log -n 5 --oneline', "
-            "'branch -a', 'show HEAD'). The leading 'git' is added automatically. "
+            "Run a READ-ONLY git command in the repo workspace (e.g. 'log -n 5 --oneline', "
+            "'branch -a', 'show HEAD', 'diff HEAD~1', 'rev-parse HEAD'). The leading 'git' "
+            "is added automatically. Enforces an allowlist: log, show, diff, blame, status, "
+            "branch, tag, rev-parse, rev-list, describe, ls-files, ls-tree, cat-file, "
+            "shortlog, reflog, for-each-ref, name-rev, grep — with per-subcommand bans on "
+            "flags that mutate state (branch -D, tag --delete, reflog delete, diff --output, "
+            "…). For writes, use git_commit_and_push (commit+push) or git_pull. "
             "Optional `repo` arg selects a non-default repo.",
             {"command": str, "repo": str},
             git_run,

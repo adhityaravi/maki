@@ -20,7 +20,9 @@ from maki_common.tools.local_code import (
     MAX_SEARCH_RESULTS,
     _path_touches_git,
     _safe_path,
+    _validate_git_read_only,
     _writable_path,
+    make_code_edit_tools,
     make_code_tools,
 )
 
@@ -333,6 +335,180 @@ def test_search_text_empty_query_errors(tmp_path: Path) -> None:
     tool = _search_text_tool(tmp_path)
     result = asyncio.run(tool({"query": ""}))
     assert "Error" in _result_text(result)
+
+
+# ---------------------------------------------------------------------------
+# git_run — read-only enforcement (#639). The tool used to accept ANY git
+# subcommand: an LLM turn could reach `push --force`, `reset --hard`,
+# `remote set-url`, `checkout -f`, `clean -fdx`, or `branch -D main`. These
+# tests pin the allowlist / denylist behaviour so a regression can't
+# silently reopen that hole.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_git_read_only_accepts_common_reads() -> None:
+    """The verbs the docstring advertises — plus common flags — must pass."""
+    for parts in (
+        ["log", "-n", "5", "--oneline"],
+        ["show", "HEAD"],
+        ["diff", "HEAD~1"],
+        ["blame", "src/a.py"],
+        ["status"],
+        ["branch", "-a"],
+        ["branch", "--list", "--contains", "HEAD"],
+        ["tag"],
+        ["tag", "-l"],
+        ["rev-parse", "HEAD"],
+        ["rev-list", "--count", "HEAD"],
+        ["describe", "--tags"],
+        ["ls-files"],
+        ["ls-tree", "-r", "HEAD"],
+        ["cat-file", "-p", "HEAD"],
+        ["shortlog", "-sn"],
+        ["reflog"],
+        ["reflog", "show"],
+        ["for-each-ref", "refs/heads/"],
+        ["name-rev", "HEAD"],
+        ["grep", "TODO"],
+    ):
+        assert _validate_git_read_only(parts) is None, f"expected {parts} to pass, got rejection"
+
+
+@pytest.mark.parametrize(
+    "parts,label",
+    [
+        (["push", "--force", "origin", "main"], "push --force"),
+        (["push"], "bare push"),
+        (["reset", "--hard", "HEAD~50"], "reset --hard"),
+        (["remote", "set-url", "origin", "https://attacker/x.git"], "remote set-url"),
+        (["remote", "-v"], "even remote -v"),  # remote is fully banned as a subcommand
+        (["config", "user.email", "x@x"], "config write"),
+        (["checkout", "-f", "other"], "checkout -f"),
+        (["clean", "-fdx"], "clean -fdx"),
+        (["commit", "-am", "x"], "commit"),
+        (["stash"], "stash"),
+        (["rebase", "-i", "HEAD~5"], "rebase"),
+        (["merge", "other"], "merge"),
+        (["filter-branch"], "filter-branch"),
+        (["update-ref", "refs/heads/main", "sha"], "update-ref"),
+        (["worktree", "remove", "x"], "worktree"),
+        (["submodule", "deinit", "x"], "submodule"),
+        (["fetch"], "fetch is a network op — use git_pull"),
+    ],
+)
+def test_validate_git_read_only_rejects_writes(parts: list[str], label: str) -> None:
+    """The whole point: the sharp-edge subcommands must be refused."""
+    err = _validate_git_read_only(parts)
+    assert err is not None, f"{label}: expected rejection, got pass"
+    assert "not permitted" in err or "read-only" in err
+
+
+def test_validate_git_read_only_rejects_leading_global_option() -> None:
+    """`git -c foo.bar=baz log` injects config for the invocation. Blocked."""
+    err = _validate_git_read_only(["-c", "http.extraheader=Authorization: X", "log"])
+    assert err is not None
+    assert "global git option" in err
+
+
+@pytest.mark.parametrize(
+    "leader",
+    ["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"],
+)
+def test_validate_git_read_only_rejects_every_leading_dash_form(leader: str) -> None:
+    """Any leading `-` before the subcommand — every form of global git option."""
+    assert _validate_git_read_only([leader, "log"]) is not None
+
+
+@pytest.mark.parametrize(
+    "parts,note",
+    [
+        (["branch", "-D", "main"], "branch -D deletes"),
+        (["branch", "-d", "topic"], "branch -d deletes"),
+        (["branch", "--delete", "topic"], "branch --delete deletes"),
+        (["branch", "-m", "old", "new"], "branch -m renames"),
+        (["branch", "-M", "old", "new"], "branch -M force-renames"),
+        (["branch", "--force", "topic", "sha"], "branch --force resets ref"),
+        (["branch", "--set-upstream-to", "origin/main"], "branch --set-upstream-to writes config"),
+        (["tag", "-d", "v1"], "tag -d deletes"),
+        (["tag", "--delete", "v1"], "tag --delete deletes"),
+        (["tag", "-a", "v1", "-m", "msg"], "tag -a creates"),
+        (["tag", "-f", "v1"], "tag -f force-moves"),
+        (["reflog", "delete", "HEAD@{1}"], "reflog delete"),
+        (["reflog", "expire", "--all"], "reflog expire"),
+        (["reflog", "drop", "HEAD@{1}"], "reflog drop"),
+        (["diff", "--output=/tmp/attacker.patch"], "diff --output escapes repo"),
+        (["diff", "--output", "/tmp/attacker.patch"], "diff --output space form"),
+        (["log", "--output=/tmp/x"], "log --output"),
+        (["show", "--output", "/tmp/x"], "show --output"),
+    ],
+)
+def test_validate_git_read_only_rejects_mutating_flags(parts: list[str], note: str) -> None:
+    """Per-subcommand flag bans — flags that turn a read into a write."""
+    err = _validate_git_read_only(parts)
+    assert err is not None, f"{note}: expected rejection, got pass"
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        ["log", "--upload-pack=/tmp/evil"],
+        ["log", "--upload-pack", "/tmp/evil"],
+        ["log", "--receive-pack=/tmp/evil"],
+        ["log", "--exec=/tmp/evil"],
+        ["ls-tree", "--git-dir=/tmp/other"],
+    ],
+)
+def test_validate_git_read_only_rejects_global_ban_prefixes(parts: list[str]) -> None:
+    """Remote-side exec / git-dir redirect flags are banned on every subcommand."""
+    err = _validate_git_read_only(parts)
+    assert err is not None
+    assert "not permitted" in err
+
+
+def test_validate_git_read_only_rejects_empty() -> None:
+    """Empty argv is not a valid git command."""
+    assert _validate_git_read_only([]) is not None
+
+
+def _git_run_tool(tmp_path: Path):
+    """Build a wired `git_run` callable against `tmp_path` as the (fake) repo.
+
+    `sync_ttl_seconds=inf` disables auto-fetch that would trip on a
+    fixture directory with no real `.git`.
+    """
+    registry = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
+    registry.register(
+        RepoEntry(path=str(tmp_path), owner="test", name="fixture"),
+        default=True,
+    )
+    tools = make_code_edit_tools(registry)
+    for name, _desc, _schema, fn in tools:
+        if name == "git_run":
+            return fn
+    raise AssertionError("git_run tool not registered")
+
+
+def test_git_run_rejects_push_force_without_shelling_out(tmp_path: Path) -> None:
+    """End-to-end wiring: a `push --force` request never reaches `_run_git`.
+
+    We don't init a real git repo here — if the guard fires FIRST, we
+    never invoke git, so we get the rejection message; if the guard is
+    accidentally bypassed we'd see git's own error about the missing
+    repo, not the read-only message.
+    """
+    tool = _git_run_tool(tmp_path)
+    result = asyncio.run(tool({"command": "push --force origin main"}))
+    text = _result_text(result)
+    assert "not permitted" in text or "read-only" in text
+    assert "git_commit_and_push" in text
+
+
+def test_git_run_rejects_leading_git_prefix_with_dashopt(tmp_path: Path) -> None:
+    """`git -c foo=bar log` — leading `git` stripped, then `-c` rejected."""
+    tool = _git_run_tool(tmp_path)
+    result = asyncio.run(tool({"command": "git -c http.extraheader=X log"}))
+    text = _result_text(result)
+    assert "global git option" in text
 
 
 # `grep` must exist for the search_text tests to run — every dev/CI env has
