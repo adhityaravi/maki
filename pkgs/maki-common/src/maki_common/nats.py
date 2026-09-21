@@ -315,28 +315,62 @@ async def kv_acquire_lease(
 
     try:
         entry = await kv.get(key)
-        data = json.loads(entry.value.decode())
-        if now - data.get("claimed_at", 0) < ttl:
-            if allow_renew and data.get("instance") == instance_id:
-                # We're already the holder — renew the lease via CAS
-                try:
-                    await kv.update(key, claim, entry.revision)
-                    return True
-                except Exception:
-                    return False
-            return False
-        # Lease expired — try to take over via CAS
-        try:
-            await kv.update(key, claim, entry.revision)
-            return True
-        except Exception:
-            return False
     except nats.js.errors.KeyNotFoundError:
         try:
             await kv.create(key, claim)
             return True
         except Exception:
             return False
+    except Exception:
+        # Genuinely transient — timeout, no-servers, network blip. The
+        # holder (if any) still owns the lease; we just couldn't read it
+        # this round. Retry next tick.
+        return False
+
+    try:
+        data = json.loads(entry.value.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # The stored lease value is corrupt — partial JetStream write, a
+        # manual ``nats kv put`` typo, a schema change the current decoder
+        # can't parse, or a rare KV bug. Every branch below is gated by a
+        # successful ``json.loads``, so if we just returned False here the
+        # key would be permanently unclaimable — the fleet stalls with no
+        # log line and no reflex (see #644). Force-rewrite via CAS at the
+        # observed revision: self-healing beats manual intervention, and
+        # the revision guard means a concurrent healthy writer still wins.
+        # We deliberately do NOT log ``entry.value`` — future callers may
+        # store secrets in the claim payload.
+        log.error(
+            "KV lease value unparseable — force-rewriting via CAS to self-heal (see #644)",
+            extra={
+                "key": key,
+                "revision": entry.revision,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        try:
+            await kv.update(key, claim, entry.revision)
+            return True
+        except Exception:
+            # Someone else beat us to the rewrite — the value is no
+            # longer corrupt at this revision. Bail; next call will
+            # re-read and see valid JSON.
+            return False
+
+    if now - data.get("claimed_at", 0) < ttl:
+        if allow_renew and data.get("instance") == instance_id:
+            # We're already the holder — renew the lease via CAS
+            try:
+                await kv.update(key, claim, entry.revision)
+                return True
+            except Exception:
+                return False
+        return False
+    # Lease expired — try to take over via CAS
+    try:
+        await kv.update(key, claim, entry.revision)
+        return True
     except Exception:
         return False
 
