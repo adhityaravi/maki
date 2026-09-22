@@ -310,16 +310,29 @@ class CodeGraph:
         return self._search_symbol(query, kind, file)
 
     def _search_symbol(self, query: str, kind: str, file: str) -> list[dict]:
-        """Find symbols matching query by name."""
+        """Find symbols matching query by name.
+
+        The ``query`` names a symbol — it is matched against ``node.name`` only,
+        not against the fully-qualified ``node_id``. Node IDs embed the file
+        path (e.g. ``pkgs/maki-recall/src/maki_recall/main.py::init_task``),
+        so matching against them lets a directory or package token pollute
+        the results with every symbol in every containing file (#646).
+        Callers that want path-scoped search should use the explicit
+        ``file=`` filter instead.
+        """
         results: list[SearchResult] = []
-        for node_id, node in self._nodes.items():
+        query_lower = query.lower() if query else ""
+        for node in self._nodes.values():
             if kind and node.kind != kind:
                 continue
             if file and node.file != file:
                 continue
-            if query and query.lower() not in node.name.lower() and query.lower() not in node_id.lower():
+            name_lower = node.name.lower()
+            if query and query_lower not in name_lower:
                 continue
-            relevance = "exact" if node.name == query else "substring"
+            # Case-insensitive exact tier so casing (e.g. "codegraph" vs
+            # "CodeGraph") does not silently demote real exact matches.
+            relevance = "exact" if name_lower == query_lower else "substring"
             results.append(SearchResult(node=node, relevance=relevance))
 
         # Sort: exact matches first, then by file + line
