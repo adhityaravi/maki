@@ -325,6 +325,22 @@ class ImmuneHealthMonitor:
         # failure re-arms cleanly. In-memory only.
         self._terminal_zombie_alerted: dict[str, dict[str, Any]] = {}
 
+        # Reflex-restart burst cooldown (#753). Keyed by component name ->
+        # ``cooldown_expires_at`` (unix seconds). Set once the 1h burst
+        # counter hits ``reflex_restart_max`` — either the escalate-to-Claude
+        # branch or the hive-healthy-elsewhere skip branch — and blocks any
+        # further reflex work on that component until the timestamp passes.
+        # Without this gate the sliding-window prune (``[t for t in history
+        # if t > hour_ago]``) reopened the burst every ~60 min forever: at
+        # t0+60m the oldest entry ages out, ``len(history)`` drops to 2, the
+        # gate re-opens, and immune deletes another pod against a root cause
+        # (Postgres HA outage, vault split-brain, …) that pod deletion cannot
+        # fix. Cleared when the component recovers so the next fresh outage
+        # re-arms cleanly. In-memory only — an immune restart mid-cooldown
+        # costs at most one extra burst before this dict re-populates, which
+        # is the safe direction.
+        self._reflex_cooldown_until: dict[str, float] = {}
+
     # --- Health State Tracking ---
 
     def _update_health(self, component: str, healthy: bool, details: dict | None = None) -> None:
@@ -352,6 +368,10 @@ class ImmuneHealthMonitor:
         elif not was_healthy and healthy:
             state["last_state_change"] = now
             state["consecutive_failures"] = 0
+            # #753: recovery clears the reflex burst cooldown so the next
+            # fresh outage re-arms cleanly rather than being suppressed by
+            # a stale timestamp from the previous incident.
+            self._reflex_cooldown_until.pop(component, None)
             log.info("Component recovered", extra={"component": component})
         elif not healthy:
             state["consecutive_failures"] += 1
@@ -914,27 +934,63 @@ class ImmuneHealthMonitor:
         now = time.time()
         hour_ago = now - 3600
         max_restarts = config.get("reflex_restart_max", 3)
+        cooldown_hours = config.get("reflex_cooldown_hours", 6)
+
+        # #753: hard gate first — once we hit the burst limit and either
+        # escalated or bailed on the hive-healthy-elsewhere branch, sit on
+        # this component for ``cooldown_hours`` before doing anything else.
+        # Without this the sliding-window prune below would reopen the burst
+        # every ~60 min: at t0+60m the oldest entry ages out, ``len(history)``
+        # drops back to ``max_restarts - 1``, and immune deletes another pod
+        # against a root cause pod deletion cannot fix. Log at DEBUG so the
+        # skip is greppable but doesn't add tick-rate warning noise.
+        cooldown_until = self._reflex_cooldown_until.get(component, 0.0)
+        if cooldown_until > now:
+            log.debug(
+                "Skipping reflex restart — component in reflex cooldown",
+                extra={
+                    "component": component,
+                    "cooldown_expires_at": cooldown_until,
+                    "cooldown_remaining_s": cooldown_until - now,
+                },
+            )
+            return
 
         history = self._restart_history.get(component, [])
         history = [t for t in history if t > hour_ago]
         self._restart_history[component] = history
 
         if len(history) >= max_restarts:
+            # #753: burst wall — mark this decision as an attempt and set
+            # the cooldown *before* either branch returns, so a subsequent
+            # tick can't slip back through once the 1h prune shortens the
+            # window. Both branches are terminal for the current burst; the
+            # cooldown re-arms them consistently.
+            cooldown_s = cooldown_hours * 3600
+            self._reflex_cooldown_until[component] = now + cooldown_s
+
             hive_healthy_elsewhere = self.component_healthy_in_hive(component)
             if hive_healthy_elsewhere:
                 log.warning(
-                    "Reflex limit reached but component healthy on other sites — skipping escalation",
+                    "Reflex limit reached but component healthy on other sites — "
+                    "skipping escalation and entering cooldown",
                     extra={
                         "component": component,
                         "restarts": len(history),
                         "hive_healthy_sites": hive_healthy_elsewhere,
+                        "cooldown_hours": cooldown_hours,
                     },
                 )
                 return
 
             log.warning(
-                "Reflex limit reached, escalating to Claude",
-                extra={"component": component, "restarts": len(history), "max": max_restarts},
+                "Reflex limit reached, escalating to Claude and entering cooldown",
+                extra={
+                    "component": component,
+                    "restarts": len(history),
+                    "max": max_restarts,
+                    "cooldown_hours": cooldown_hours,
+                },
             )
             await self._publish_alert(
                 f"Reflex limit reached for {component}: {len(history)} restarts in last hour, escalating to Claude"

@@ -88,6 +88,16 @@ DEFAULT_CONFIG = {
     "heartbeat_interval": 21600,
     "health_check_interval": 30,
     "reflex_restart_max": 3,
+    # Reflex cooldown after burst limit (#753): once ``reflex_restart_max``
+    # attempts fire in the 1h window and either escalate to Claude or get
+    # skipped because a hive peer is healthy, sit on this component for
+    # ``reflex_cooldown_hours`` before the reflex path is allowed to touch
+    # it again. Without this gate the sliding-window prune re-opened the
+    # burst every ~60 min forever — pod deletes against a root cause pod
+    # deletion cannot fix (e.g. Postgres HA outage, vault split-brain).
+    # 6h is long enough that a real hive-wide outage that flips a peer to
+    # unhealthy still gets escalated on the next tick.
+    "reflex_cooldown_hours": 6,
     "lock_ttl": 300,
     "passive_patrol_interval_seconds": 2700,
     # Stuck-component escalation (#245): how long a pod may sit unhealthy in a
