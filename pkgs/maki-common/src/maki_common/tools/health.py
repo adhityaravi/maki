@@ -73,6 +73,20 @@ def make_health_tools(
            ``/health`` directly for a fresh single-shot reading. Useful when
            you want to compare immune's monitor-loop verdict against the
            component's own current answer.
+
+        Return states (see #754 / #657 for the three-state disambiguation):
+
+        - **HEALTHY / UNHEALTHY** — component is in ``component_health``, we
+          know what it's doing right now.
+        - **KNOWN_BUT_MISSING_FROM_CLUSTER** — immune has seen this component
+          before (it's in the sticky known-components registry) but it's
+          absent from the current pod/probe scan. The Deployment/Service/pods
+          appear to be gone from the cluster; downstream consumers will see
+          NXDOMAIN. Distinct from UNHEALTHY (probe failing) and UNKNOWN
+          (name never observed).
+        - **UNKNOWN** — no immune entry, no local endpoint, and not in the
+          known-components registry either. Either a typo, a name that was
+          never a Maki component, or the immune query itself failed.
         """
         name = (args.get("name") or "").strip()
         log.info("Tool: check_component", extra={"component": name})
@@ -89,9 +103,16 @@ def make_health_tools(
             immune_line = f"immune view: failed to query ({e})"
 
         component_info: dict[str, Any] | None = None
+        known_entry: dict[str, Any] | None = None
+        missing_entry: dict[str, Any] | None = None
         if immune_state is not None:
             component_health = immune_state.get("component_health") or {}
             component_info = _lookup(component_health, name)
+            known_components = immune_state.get("known_components") or {}
+            missing_components = immune_state.get("missing_components") or {}
+            known_entry = _lookup(known_components, name)
+            missing_entry = _lookup(missing_components, name)
+
             if component_info is None:
                 available = ", ".join(sorted(component_health.keys()))
                 immune_line = (
@@ -129,11 +150,55 @@ def make_health_tools(
             except Exception as e:
                 http_line = f"http probe ({url}/health): unreachable ({e})"
 
+        # #754: KNOWN_BUT_MISSING_FROM_CLUSTER — the component's k8s
+        # objects are gone. We report this ahead of the "unknown" fallthrough
+        # so the caller sees the meaningful state instead of the same shape
+        # as a name that never existed. Prefer the escalation tracker's
+        # numbers when it's already been ticking (real "missing" duration
+        # since the vanished detector engaged); fall back to the registry
+        # ``last_seen_at`` when it's a fresh miss the detector hasn't scored
+        # yet (< threshold ticks — see immune ``_check_missing_components``).
+        if component_info is None and known_entry is not None:
+            now = time.time()
+            last_seen = known_entry.get("last_seen_at")
+            first_seen = known_entry.get("first_seen_at")
+            last_seen_age_s = round(now - last_seen, 1) if isinstance(last_seen, (int, float)) and last_seen else None
+            first_seen_age_s = (
+                round(now - first_seen, 1) if isinstance(first_seen, (int, float)) and first_seen else None
+            )
+            note_bits = [f"last_seen_age_s={last_seen_age_s}", f"first_seen_age_s={first_seen_age_s}"]
+            if missing_entry is not None:
+                note_bits.extend(
+                    [
+                        f"missing_tick_count={missing_entry.get('missing_tick_count')}",
+                        f"escalation_fire_count={missing_entry.get('fire_count')}",
+                    ]
+                )
+                first_missing = missing_entry.get("first_missing_at")
+                if isinstance(first_missing, (int, float)) and first_missing:
+                    note_bits.append(f"first_missing_age_s={round(now - first_missing, 1)}")
+            note = ", ".join(note_bits)
+            parts = [
+                f"{name}: KNOWN_BUT_MISSING_FROM_CLUSTER",
+                (
+                    "  immune has this component in the known-components registry but its "
+                    "k8s objects are absent from the current pod/probe scan — the Deployment/"
+                    "Service/pods have been removed or scaled to zero. Downstream consumers "
+                    "will see NXDOMAIN / connection refused."
+                ),
+                f"  {note}",
+                f"  {immune_line}",
+            ]
+            if http_line is not None:
+                parts.append(f"  {http_line}")
+            return mcp_result("\n".join(parts))
+
         # If neither source produced anything actionable, say so explicitly.
         if component_info is None and http_line is None:
             local_known = ", ".join(sorted(health_endpoints.keys())) or "(none)"
             return mcp_result(
-                f"{name}: no immune entry and no local /health endpoint.\n"
+                f"{name}: UNKNOWN — no immune entry, no local /health endpoint, and "
+                f"no known-components registry match.\n"
                 f"  {immune_line}\n"
                 f"  local endpoints: {local_known}"
             )

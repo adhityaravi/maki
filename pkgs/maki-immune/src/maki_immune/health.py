@@ -186,6 +186,40 @@ TERMINAL_ERROR_PATTERNS: tuple[str, ...] = (
     "NatsTerminalError",
 )
 
+# Known-components registry (#754). Immune's health tracking used to be purely
+# membership-driven: it enumerated whatever the current k8s pod scan / HTTP
+# probe fan-out returned and reported on *that* set. When a Deployment/Service
+# was deleted or scaled to zero, the component silently disappeared from
+# ``_component_health`` and from the ``get_system_health`` snapshot — no
+# ``component_vanished`` reflex, no alert, and ``check_component`` returned
+# the same "unknown" shape as a name that had never existed. Meanwhile
+# downstream consumers (recall's Neo4j probe, stem's DNS resolution) flooded
+# logs with ``Name or service not known`` errors for the vanished dependency
+# and nothing joined the two signals.
+#
+# We now keep a sticky registry of every component name we've ever observed
+# (persisted to STATE_BUCKET), diff it against each health tick, and escalate
+# when a known component has been missing from the cluster for more than a
+# few consecutive ticks. The ``check_component`` tool gets a third return
+# state (``KNOWN_BUT_MISSING_FROM_CLUSTER``) distinct from the reachability
+# failure and the "you asked about a name that never existed" case.
+#
+# The threshold is deliberately small (2 ticks ≈ 1 minute at the 30s cadence):
+# by the time this fires we've missed the component in two consecutive scans,
+# which is well past any single-tick k8s API blip. The re-alert interval
+# matches the ``STUCK_REALERT_INTERVAL_S`` shape so a missed alert doesn't
+# leave the incident silent for days, without spamming every tick.
+KNOWN_COMPONENT_MISSING_TICK_THRESHOLD = int(os.environ.get("KNOWN_COMPONENT_MISSING_TICK_THRESHOLD", "2"))
+KNOWN_COMPONENT_MISSING_REALERT_INTERVAL_S = int(os.environ.get("KNOWN_COMPONENT_MISSING_REALERT_INTERVAL_S", "3600"))
+
+# How long to keep a component in the registry after we last saw it. Default
+# 30 days: long enough that a short-window deletion (deploy churn, manifest
+# migration mid-flight) still fires the vanished alert, short enough that a
+# component we've truly retired stops nagging forever. Explicit removal via
+# the ``known_component_ignore`` config knob is the faster path when Adi
+# wants to intentionally decommission something.
+KNOWN_COMPONENT_FORGET_AFTER_S = int(os.environ.get("KNOWN_COMPONENT_FORGET_AFTER_S", str(30 * 86400)))
+
 log = logging.getLogger(__name__)
 
 
@@ -231,6 +265,8 @@ class ImmuneHealthMonitor:
         publish_vitals: Any,
         schedule_persist_recent_actions: Any,
         escalate_to_claude: Any,
+        known_components: dict[str, dict[str, float]] | None = None,
+        schedule_persist_known_components: Any = None,
     ) -> None:
         self._nc = nc
         self._k8s_v1 = k8s_v1
@@ -261,6 +297,24 @@ class ImmuneHealthMonitor:
         # :class:`ImmuneClaudeReasoner` — the ex-workaround-callback is now
         # just a normal collaborator with no circular-import baggage.
         self._escalate_to_claude = escalate_to_claude
+
+        # #754: known-components registry. Keyed by component name (matches
+        # the ``app=`` label / HTTP endpoint key convention used by
+        # ``_component_health``). Value: ``{"first_seen_at": ts,
+        # "last_seen_at": ts}``. Persisted to STATE_BUCKET by main.py so a
+        # restart of immune preserves the sticky set — otherwise a restart
+        # during a vanished-component incident would silently forget the
+        # component ever existed and the alert would never fire.
+        self._known_components: dict[str, dict[str, float]] = known_components if known_components is not None else {}
+        self._schedule_persist_known_components = schedule_persist_known_components
+
+        # #754: per-incident tracker for known-but-missing components. Keyed
+        # by component -> ``{first_missing_at, missing_tick_count,
+        # last_seen_at, last_fired_at, fire_count}``. Cleared when the
+        # component re-appears so a re-vanish re-arms cleanly. In-memory
+        # only; a restart of immune costs at most one extra alert per
+        # currently-missing component, which is the safe direction.
+        self._missing_components: dict[str, dict[str, Any]] = {}
 
         # --- Per-instance mutable state ---
         self._last_incident_time: float = 0
@@ -618,6 +672,278 @@ class ImmuneHealthMonitor:
                 healthy, details = k8s
             self._update_health(component, healthy, details)
 
+    # --- Known-Components Registry (#754) ---
+
+    def get_known_components(self) -> dict[str, dict[str, float]]:
+        """Return the current known-components registry (shallow copy).
+
+        Exposed so :func:`main._state_request_handler` can fold the sticky
+        set into the ``get_system_health`` snapshot without touching the
+        monitor's internal dict.
+        """
+        return {k: dict(v) for k, v in self._known_components.items()}
+
+    def get_missing_components(self) -> dict[str, dict[str, Any]]:
+        """Return the per-component "missing from cluster" tracker.
+
+        Used by :func:`main._state_request_handler` so ``check_component``
+        can render the ``KNOWN_BUT_MISSING_FROM_CLUSTER`` state distinct
+        from ``UNKNOWN`` (name never observed) and ``UNREACHABLE``
+        (component present but probe failing). See #754 / #657.
+        """
+        return {k: dict(v) for k, v in self._missing_components.items()}
+
+    def _relevant_component(self, component: str) -> bool:
+        """Skip synthetic / derived components from the vanished-check.
+
+        The registry is meant to track *real* cluster components — anything
+        that corresponds to an ``app=maki-*`` pod or an HTTP endpoint
+        immune probes. Synthetic keys like ``maki-cortex-heartbeat`` come
+        from ``_check_cortex_heartbeat`` and don't have a pod / Service
+        that could vanish; they're their own alerting path.
+        """
+        if component.endswith("-heartbeat"):
+            return False
+        return True
+
+    def _update_known_components(self, observed: set[str], config: dict) -> None:
+        """Fold this tick's observed set into the sticky registry.
+
+        - Every observed component's ``last_seen_at`` advances to ``now``.
+          A brand-new observation adds ``first_seen_at`` too and schedules
+          a persist so the entry survives an immune restart.
+        - The registry is *sticky*: entries stay past the current tick and
+          are only pruned after ``KNOWN_COMPONENT_FORGET_AFTER_S`` (or when
+          Adi explicitly retires the component via
+          ``known_component_ignore``). This is deliberate — the whole point
+          is to notice when a previously-observed component vanishes.
+        - ``known_component_ignore`` (comma-separated) is honoured here so
+          a deliberately-retired component is dropped from the registry on
+          the next tick instead of nagging forever.
+        """
+        now = time.time()
+        ignore_raw = config.get("known_component_ignore", "") or ""
+        ignore = {c.strip() for c in ignore_raw.split(",") if c.strip()}
+        forget_after = float(config.get("known_component_forget_after_s", KNOWN_COMPONENT_FORGET_AFTER_S))
+
+        added_or_pruned = False
+
+        # Advance last_seen for observed components; add new ones.
+        for component in observed:
+            if not self._relevant_component(component):
+                continue
+            if component in ignore:
+                if component in self._known_components:
+                    del self._known_components[component]
+                    added_or_pruned = True
+                continue
+            entry = self._known_components.get(component)
+            if entry is None:
+                self._known_components[component] = {"first_seen_at": now, "last_seen_at": now}
+                added_or_pruned = True
+                log.info("New component observed — adding to known-components registry", extra={"component": component})
+            else:
+                entry["last_seen_at"] = now
+
+        # Prune ignored entries even if unobserved this tick.
+        for component in list(self._known_components):
+            if component in ignore:
+                del self._known_components[component]
+                added_or_pruned = True
+                continue
+            last_seen = self._known_components[component].get("last_seen_at", 0.0)
+            if forget_after > 0 and last_seen and (now - last_seen) > forget_after:
+                log.warning(
+                    "Pruning stale known-component (never re-observed within forget window)",
+                    extra={
+                        "component": component,
+                        "last_seen_age_s": round(now - last_seen, 1),
+                        "forget_after_s": forget_after,
+                    },
+                )
+                del self._known_components[component]
+                # A pruned component drops its missing tracker too — no
+                # further alerts for something we've explicitly forgotten.
+                self._missing_components.pop(component, None)
+                added_or_pruned = True
+
+        if added_or_pruned and self._schedule_persist_known_components is not None:
+            try:
+                self._schedule_persist_known_components()
+            except Exception:
+                log.exception("Failed to schedule known-components persist")
+
+    async def _check_missing_components(self, observed: set[str], config: dict) -> None:
+        """Escalate known components missing from the current pod/probe scan (#754).
+
+        The other autonomy tiers all assume the component is *present* in
+        ``_component_health`` — a pod that's Running-but-Ready-False, a
+        pod that's CrashLoopBackOff, a pod with a 503 body. None of them
+        fire when the pod / Service / Deployment is *gone* from the cluster:
+
+        - ``_trigger_reflex`` has no pod name to act on.
+        - ``_check_stuck_components`` iterates ``_component_health`` and
+          finds no entry.
+        - ``_check_long_unhealthy_components`` same.
+        - ``_check_terminal_zombies`` same.
+
+        Meanwhile the downstream damage is real: recall's Neo4j probe hits
+        ``Name or service not known`` for ``maki-graph`` every 10s, stem's
+        DNS resolution fails, and no signal joins these to "the component
+        immune knew about a minute ago is now missing from the cluster".
+
+        This path fires an ALERT (which reaches Adi via ears) and hands the
+        incident to Claude with an explicit "the component's k8s objects
+        have vanished; check the manifest, deploy history, and neighbouring
+        pods for the flood of DNS errors" hint. Distinct from every other
+        escalation because the remediation is likely a manifest re-apply
+        (or a discussion about whether the deletion was intentional), not
+        a pod delete.
+        """
+        if self._nc is None:
+            return
+
+        threshold_ticks = int(
+            config.get("known_component_missing_tick_threshold", KNOWN_COMPONENT_MISSING_TICK_THRESHOLD)
+        )
+        realert_s = float(
+            config.get("known_component_missing_realert_interval_s", KNOWN_COMPONENT_MISSING_REALERT_INTERVAL_S)
+        )
+        now = time.time()
+
+        # Clear trackers for components that came back this tick, so a
+        # re-vanish re-arms cleanly and Claude doesn't get a stale reason
+        # blob referencing the previous outage.
+        for component in list(self._missing_components):
+            if component in observed:
+                log.info(
+                    "Vanished component returned to cluster — clearing missing tracker",
+                    extra={
+                        "component": component,
+                        "was_missing_for_s": round(
+                            now - self._missing_components[component].get("first_missing_at", now), 1
+                        ),
+                    },
+                )
+                del self._missing_components[component]
+
+        for component, entry in list(self._known_components.items()):
+            if not self._relevant_component(component):
+                continue
+            if component in observed:
+                continue
+
+            last_seen = entry.get("last_seen_at", 0.0)
+            tracker = self._missing_components.get(component)
+            if tracker is None:
+                tracker = {
+                    "first_missing_at": now,
+                    "last_seen_at": last_seen,
+                    "missing_tick_count": 1,
+                    "last_fired_at": 0.0,
+                    "fire_count": 0,
+                }
+                self._missing_components[component] = tracker
+            else:
+                tracker["missing_tick_count"] = int(tracker.get("missing_tick_count") or 0) + 1
+
+            if tracker["missing_tick_count"] < threshold_ticks:
+                continue
+
+            last_fired = tracker.get("last_fired_at") or 0.0
+            first_fire = last_fired == 0.0
+            if not first_fire and (now - last_fired) < realert_s:
+                continue
+
+            fire_count = int(tracker.get("fire_count") or 0) + 1
+            tracker["last_fired_at"] = now
+            tracker["fire_count"] = fire_count
+
+            missing_for_s = now - tracker["first_missing_at"]
+            last_seen_age_s = now - last_seen if last_seen else None
+
+            log.error(
+                "Known component missing from cluster — escalating",
+                extra={
+                    "component": component,
+                    "missing_tick_count": tracker["missing_tick_count"],
+                    "missing_for_s": round(missing_for_s, 1),
+                    "last_seen_age_s": round(last_seen_age_s, 1) if last_seen_age_s else None,
+                    "fire_count": fire_count,
+                },
+            )
+
+            last_seen_note = (
+                f"last observed {round(last_seen_age_s / 60, 1)}min ago"
+                if last_seen_age_s is not None
+                else "no last-seen timestamp on record"
+            )
+            await self._publish_alert(
+                f"COMPONENT-VANISHED: {component} is in the known-components registry but "
+                f"has been missing from the current pod/probe scan for "
+                f"{tracker['missing_tick_count']} consecutive ticks "
+                f"(~{round(missing_for_s / 60, 1)}min; {last_seen_note}). "
+                f"Its Deployment/Service/pods appear to be gone from the cluster — "
+                f"downstream consumers will see NXDOMAIN / connection refused. "
+                f"Escalation #{fire_count}."
+            )
+
+            action = {
+                "type": "component_vanished_escalation",
+                "component": component,
+                "missing_tick_count": tracker["missing_tick_count"],
+                "missing_for_s": round(missing_for_s, 1),
+                "last_seen_at": last_seen,
+                "fire_count": fire_count,
+                "timestamp": now,
+            }
+            self._recent_actions.append(action)
+            if len(self._recent_actions) > self._recent_actions_max:
+                self._recent_actions.pop(0)
+            self._schedule_persist()
+            try:
+                await self._nc.publish(IMMUNE_ACTION, json.dumps(action).encode())
+            except Exception:
+                log.exception("Failed to publish component-vanished action")
+
+            # Only spawn the Claude turn on the first fire per incident so
+            # a stalled Claude semaphore doesn't queue one extra turn every
+            # re-alert window for the same underlying deletion.
+            if first_fire and self._escalate_to_claude is not None:
+                # Synthesise a minimal state blob for Claude — the component
+                # is missing from ``_component_health``, but Claude's
+                # escalation contract still expects one.
+                synthetic_state = {
+                    "healthy": False,
+                    "consecutive_failures": tracker["missing_tick_count"],
+                    "last_state_change": tracker["first_missing_at"],
+                    "last_check": now,
+                    "details": {
+                        "vanished": True,
+                        "last_seen_at": last_seen,
+                        "missing_for_s": round(missing_for_s, 1),
+                    },
+                }
+                reason = (
+                    f"Component-vanished classification: {component} is in the known-components "
+                    f"registry (first seen {round((now - entry.get('first_seen_at', now)) / 3600, 1)}h ago, "
+                    f"last observed at {last_seen}) but is entirely absent from the current pod/probe "
+                    f"scan for {tracker['missing_tick_count']} consecutive ticks. This is not a "
+                    f"reachability failure — the pod, Service or Deployment appears to have been "
+                    f"removed from the cluster (CoreDNS won't resolve the name, so downstream "
+                    f"consumers see NXDOMAIN). Investigate: was the deletion intentional (deploy "
+                    f"churn, deliberate retire) or an accident (kubectl delete against the wrong "
+                    f"namespace, Terraform drift)? Check `kubectl get deploy,svc,statefulset -l "
+                    f"app={component} -n maki`, deploy history, and neighbouring pods' logs for a "
+                    f"flood of DNS errors that will tell you what depends on it. If intentional, "
+                    f"add {component} to the ``known_component_ignore`` config so the alert stops. "
+                    f"If accidental, re-apply the manifest."
+                )
+                spawn_background(
+                    self._escalate_to_claude(component, synthetic_state, reason),
+                    name="immune.component_vanished_escalation",
+                )
+
     async def _check_pod_metrics(self) -> None:
         """Fetch pod resource usage from K8s metrics API."""
         try:
@@ -883,6 +1209,15 @@ class ImmuneHealthMonitor:
                 self._check_cortex_heartbeat()
 
                 config = await load_kv_config(self._config_kv, self._default_config)
+
+                # #754: fold this tick's observed set into the sticky
+                # known-components registry, then diff to catch anything
+                # that used to be there and is now gone from the cluster.
+                # Order matters: update before check so a re-appearance
+                # this tick clears its missing tracker cleanly.
+                observed = set(http_verdicts) | set(k8s_verdicts)
+                self._update_known_components(observed, config)
+
                 for component, state in self._component_health.items():
                     if not state["healthy"] and state["consecutive_failures"] >= 2:
                         await self._trigger_reflex(component, state, config)
@@ -892,6 +1227,7 @@ class ImmuneHealthMonitor:
                 await self._check_long_unhealthy_components(config)
                 await self._check_immune_self_health(config)
                 await self._check_stuck_recovery(config)
+                await self._check_missing_components(observed, config)
 
             except Exception:
                 log.exception("Health monitor error")

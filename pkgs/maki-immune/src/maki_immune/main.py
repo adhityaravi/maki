@@ -79,6 +79,11 @@ DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
 STATE_BUCKET = "maki-immune-state"
 RECENT_ACTIONS_KEY = "recent_actions"
 RECENT_ACTIONS_MAX = 100
+# #754: sticky registry of every component immune has ever observed. Persisted
+# so a restart of immune during a vanished-component incident doesn't silently
+# forget the component ever existed (which would leave the escalation path
+# blind and make ``check_component`` conflate it with "unknown name").
+KNOWN_COMPONENTS_KEY = "known_components"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
@@ -143,6 +148,22 @@ DEFAULT_CONFIG = {
     # without spamming every 30s tick.
     "terminal_zombie_min_failures": 10,
     "terminal_zombie_realert_interval_s": 3600,
+    # Known-components registry (#754): sticky per-component observation
+    # tracking. A component that immune has previously seen but is now
+    # entirely absent from the pod/probe scan for
+    # ``known_component_missing_tick_threshold`` consecutive ticks (default
+    # 2 ticks ≈ 60s) fires a COMPONENT-VANISHED alert and hands the
+    # incident to Claude — this closes the autonomy gap where a deleted
+    # Deployment/Service silently dropped from ``get_system_health`` with
+    # no alert, no reflex, and ``check_component`` conflating it with
+    # "name never existed". ``known_component_forget_after_s`` (default
+    # 30d) drops entries never re-observed inside that window, and the
+    # comma-separated ``known_component_ignore`` list lets Adi retire a
+    # component intentionally so the alert stream stays quiet.
+    "known_component_missing_tick_threshold": 2,
+    "known_component_missing_realert_interval_s": 3600,
+    "known_component_forget_after_s": 30 * 86400,
+    "known_component_ignore": "",
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
@@ -302,6 +323,11 @@ _semaphore = asyncio.Semaphore(1)
 _failed_image_blacklist: set[str] = set()
 _hive_state: dict[str, dict] = {}
 _running_images: dict[str, str] = {}
+# #754: sticky registry of every component immune has ever seen. Mutated by
+# :class:`ImmuneHealthMonitor` on every tick and persisted to STATE_BUCKET so
+# a mid-incident immune restart doesn't silently forget the component ever
+# existed. Value shape: ``{component: {"first_seen_at": ts, "last_seen_at": ts}}``.
+_known_components: dict[str, dict[str, float]] = {}
 _cortex_state: dict = {
     "last_heartbeat": 0,
     "active_turn": None,
@@ -461,6 +487,65 @@ def _schedule_persist_recent_actions():
     spawn_background(_persist_recent_actions(), name="immune.persist_recent_actions")
 
 
+# --- Known-Components Registry Persistence (#754) ---
+
+
+async def _load_known_components():
+    """Load the known-components registry from KV on startup.
+
+    Without this, every immune restart would present as a fresh
+    membership-driven view: no history of "what have we ever seen", no
+    signal when a component that used to exist is now missing from the
+    cluster. The whole point of the registry is stickiness — we persist
+    it so a mid-incident restart doesn't silently forget the vanished
+    component ever existed.
+    """
+    global _known_components
+    try:
+        entry = await _state_kv.get(KNOWN_COMPONENTS_KEY)
+        loaded = json.loads(entry.value.decode())
+        if isinstance(loaded, dict):
+            # Defensive: only accept entries with the expected shape so a
+            # hand-edit / prior-version schema mismatch doesn't wedge the
+            # loop later. Silently drop anything malformed.
+            cleaned: dict[str, dict[str, float]] = {}
+            for name, meta in loaded.items():
+                if not isinstance(name, str) or not isinstance(meta, dict):
+                    continue
+                first = meta.get("first_seen_at")
+                last = meta.get("last_seen_at")
+                if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
+                    continue
+                cleaned[name] = {"first_seen_at": float(first), "last_seen_at": float(last)}
+            _known_components.update(cleaned)
+            log.info("Known-components registry loaded from KV", extra={"entries": len(cleaned)})
+    except Exception:
+        log.info("No known-components registry found in KV (first run)")
+
+
+async def _persist_known_components():
+    """Persist the current known-components registry to KV."""
+    try:
+        await _state_kv.put(
+            KNOWN_COMPONENTS_KEY,
+            json.dumps(_known_components, default=str).encode(),
+        )
+    except Exception:
+        log.warning("Failed to persist known_components to KV")
+
+
+def _schedule_persist_known_components():
+    """Schedule _persist_known_components as a background task.
+
+    Mirrors ``_schedule_persist_recent_actions`` — the monitor calls this
+    on the tick that adds/prunes an entry, and we fire-and-forget the KV
+    write so the health loop isn't blocked on JetStream latency. Uses
+    ``spawn_background`` so exceptions are logged instead of vanishing
+    (issue #123).
+    """
+    spawn_background(_persist_known_components(), name="immune.persist_known_components")
+
+
 # --- NATS Publishing ---
 
 
@@ -516,6 +601,14 @@ async def _state_request_handler(msg):
         except Exception:
             pass
 
+        # #754: fold the sticky known-components registry and the
+        # per-incident missing tracker into the snapshot so ``check_component``
+        # can render the ``KNOWN_BUT_MISSING_FROM_CLUSTER`` state and cortex/
+        # stem can reason about the diff between "what we've ever seen" and
+        # "what's here right now" without another round trip.
+        known_components = _health_monitor.get_known_components() if _health_monitor else {}
+        missing_components = _health_monitor.get_missing_components() if _health_monitor else {}
+
         state = {
             "component_health": _component_health,
             "recent_actions": _recent_actions[-10:],
@@ -528,9 +621,18 @@ async def _state_request_handler(msg):
             "site_name": SITE_NAME,
             "hive_state": _hive_state,
             "images": dict(_running_images),
+            "known_components": known_components,
+            "missing_components": missing_components,
         }
         await msg.respond(json.dumps(state).encode())
-        log.info("State request served", extra={"components": len(_component_health)})
+        log.info(
+            "State request served",
+            extra={
+                "components": len(_component_health),
+                "known": len(known_components),
+                "missing": len(missing_components),
+            },
+        )
     except Exception:
         log.exception("Failed to serve state request")
         await msg.respond(b"{}")
@@ -744,6 +846,11 @@ async def _site_query_handler(msg):
                 "turn_mode": _cortex_state["turn_mode"],
                 "turn_started": _cortex_state["turn_started"],
             },
+            # #754: same known/missing shape as the local state request so a
+            # remote immune's Claude can reason about a peer site's vanished
+            # components.
+            "known_components": _health_monitor.get_known_components() if _health_monitor else {},
+            "missing_components": _health_monitor.get_missing_components() if _health_monitor else {},
         }
         await msg.respond(json.dumps(state, default=str).encode())
         log.info("Site query served", extra={"components": len(_component_health)})
@@ -792,6 +899,7 @@ async def main():
 
     # Load persistent state
     await _load_recent_actions()
+    await _load_known_components()
 
     # Clone or pull the repo for local code access (read-only)
     from maki_common.repo import clean_remote_url, init_repo
@@ -911,6 +1019,8 @@ async def main():
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
         escalate_to_claude=_claude_reasoner.escalate_to_claude,
+        known_components=_known_components,
+        schedule_persist_known_components=_schedule_persist_known_components,
     )
 
     # Subscriptions
