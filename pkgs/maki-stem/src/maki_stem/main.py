@@ -17,6 +17,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import asyncpg
@@ -97,6 +98,23 @@ DEFAULT_CORTEX_CONFIG = {
     "chat_model": "",  # empty = cortex default; set to e.g. "claude-opus-4-6" to override
 }
 
+# Startup retry tunables for lifespan dependencies (KV inits, Postgres pool
+# creation). Any of these raising a transient error used to kill the pod
+# outright — one TCP RST on pgvector at pod-start became CrashLoopBackOff
+# with K8s exponential backoff maxing at 5 min, so a single blip locked us
+# out for ≥5 min even after the dependency came back. See #750. Values
+# picked so a normal ~30s upstream blip survives without any operator
+# involvement, while a genuinely wedged dependency still surfaces the pod
+# as unhealthy within a few minutes rather than silently retrying forever.
+STARTUP_RETRY_BASE_DELAY_S = 1.0
+STARTUP_RETRY_MAX_DELAY_S = 30.0
+# Total attempts ≈ ~15 = ~7 min of patience at capped 30s spacing. Longer
+# than K8s CrashLoopBackOff's 5-min max so an operator would rather see
+# the pod stay up in `initializing`-shaped state than see it thrash. If
+# every attempt still fails after this many tries, we raise and let K8s
+# reschedule — at that point the dependency is genuinely down.
+STARTUP_RETRY_MAX_ATTEMPTS = 15
+
 # ---- Global state ----------------------------------------------------------
 _nc = None
 _kv = None
@@ -114,6 +132,73 @@ _stem_ctx: StemContext | None = None
 _trading_tool_registry: dict = {}  # name → async handler, populated per trading run
 _permanent_trading_tools: dict = {}  # name → async handler, always-on read-only KV
 _db_pool: asyncpg.Pool | None = None  # asyncpg connection pool, initialized in lifespan
+
+
+async def _retry_startup[T](
+    what: str,
+    factory: Callable[[], Awaitable[T]],
+    *,
+    max_attempts: int = STARTUP_RETRY_MAX_ATTEMPTS,
+    base_delay: float = STARTUP_RETRY_BASE_DELAY_S,
+    max_delay: float = STARTUP_RETRY_MAX_DELAY_S,
+) -> T:
+    """Run ``factory()`` with exponential backoff on transient failures.
+
+    Wraps every fragile startup dependency in ``lifespan`` — KV bucket
+    creates, JetStream stream inits, and the asyncpg pool bootstrap — so a
+    single upstream TCP RST at pod-start doesn't crash uvicorn and take stem
+    into CrashLoopBackOff for ≥5 minutes. See #750.
+
+    Retries any ``Exception``. That's intentional: the failure modes we've
+    actually seen here (`ConnectionRefusedError`, `OSError`, `TimeoutError`,
+    various NATS `TimeoutError`/`NoServersError`) are all transient, and the
+    permanent-config-error class (bad Postgres credentials, unresolvable
+    hostname) will keep failing forever anyway — we cap ``max_attempts`` so
+    we surface the failure to K8s after roughly the same window
+    CrashLoopBackOff would have imposed, without the intervening 5-min
+    penalty. The final failing exception is re-raised so uvicorn's normal
+    startup-failed path still fires.
+
+    ``connect_nats`` already has its own dedicated retry loop with terminal-
+    error classification (#470), so it does NOT go through this helper.
+    """
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await factory()
+            if attempt > 1:
+                log.info(
+                    "Startup dependency recovered after retry",
+                    extra={"what": what, "attempt": attempt},
+                )
+            return result
+        except Exception as exc:
+            if attempt >= max_attempts:
+                log.error(
+                    "Startup dependency failed after all retries — surfacing to K8s",
+                    extra={
+                        "what": what,
+                        "attempts": attempt,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+            log.warning(
+                "Startup dependency failed, retrying",
+                extra={
+                    "what": what,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "retry_in_s": delay,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 async def _handle_config_sync(msg) -> None:
@@ -161,16 +246,25 @@ async def lifespan(app: FastAPI):
     global _nc, _js, _kv, _config_kv, _lock_kv, _github, _db_pool, _stem_ctx, _loop_specs
     log.info("maki-stem starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
 
+    # connect_nats has its own retry loop (max_retries=12 by default, with
+    # terminal-error short-circuit for bad tokens — see #470). Everything
+    # else below goes through ``_retry_startup`` because a transient
+    # ConnectionRefusedError / TimeoutError on any of these calls used to
+    # crash uvicorn and wedge stem into CrashLoopBackOff for ≥5 minutes on
+    # a single upstream blip (#750).
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
-    _kv = await seed_identity(_js)
-    await init_conversation_stream(_js)
+    _kv = await _retry_startup("seed_identity", lambda: seed_identity(_js))
+    await _retry_startup("init_conversation_stream", lambda: init_conversation_stream(_js))
 
-    _config_kv = await init_kv(_js, CONFIG_BUCKET)
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
+    _config_kv = await _retry_startup(f"init_kv:{CONFIG_BUCKET}", lambda: init_kv(_js, CONFIG_BUCKET))
+    _lock_kv = await _retry_startup(f"init_kv:{LOCK_BUCKET}", lambda: init_kv(_js, LOCK_BUCKET))
 
-    _db_pool = await asyncpg.create_pool(dsn=build_pg_dsn(), min_size=1, max_size=3)
+    _db_pool = await _retry_startup(
+        "asyncpg.create_pool",
+        lambda: asyncpg.create_pool(dsn=build_pg_dsn(), min_size=1, max_size=3),
+    )
     log.info("PostgreSQL pool created")
 
     from maki_common.tools.trading_portfolio import make_trading_portfolio_tools
