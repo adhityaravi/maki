@@ -231,21 +231,37 @@ async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, An
 
     * ``KeyNotFoundError`` — genuinely unset key, silently use the default.
     * ``json.JSONDecodeError`` / ``UnicodeDecodeError`` — the key exists
-      but the stored bytes aren't valid JSON. This is a writer/reader
+      but the stored bytes aren't valid JSON. Historically a writer/reader
       encoding disagreement (see issue #638: an older ``update_config``
       MCP tool and CONFIG_SYNC handler stored raw ``value.encode()``
       while every reader ``json.loads``'d the bytes, so every self-tuned
-      config value silently reverted to the seed default). Log at ERROR
-      so the split-brain surfaces instead of hiding behind a
-      "looks default" fallback. Subsequent ``update_config`` /
-      ``apply_config_updates`` writes will overwrite the raw value with
-      valid JSON and the key self-heals.
+      config value silently reverted to the seed default).
+
+      #638 fixed the writers to emit JSON going forward and escalated
+      the reader's log level to ERROR — but nothing rewrote the
+      *pre-existing* raw values, so values written before that fix
+      stayed stuck at "default" forever, spamming ERROR every read
+      tick (see #757). This function now self-heals: when the stored
+      bytes decode as UTF-8 but not as JSON, we treat that string as
+      the intended literal (the old raw path was
+      ``str(value).encode()`` — a plain UTF-8 string with no JSON
+      framing, so the plain-string interpretation is the honest one),
+      re-emit it as valid JSON, and ``kv.update`` at the observed
+      revision. The recovered value is returned to this reader; the
+      next reader round-trips normally. CAS ensures a concurrent
+      healthy writer wins instead of getting clobbered.
+
+      Type-safety guard: only string-typed defaults are recovered from
+      raw bytes. For a non-string default (int/float/dict/list) the
+      recovered UTF-8 string is guessing — we hand back the default,
+      but still rewrite the KV to the JSON-encoded default so the
+      ERROR spam stops. Values that were already broken from every
+      consumer's perspective (unparseable ⇒ default) are being made
+      formally equal to what consumers already saw. If the value
+      isn't even UTF-8, no salvage is possible; we log-and-default
+      without rewriting.
     * Anything else — currently treated as "default" for backwards
       compatibility. See #369 for tightening the transient-read path.
-
-    The behaviour on the second and third case is still "return the
-    default"; the difference is telemetry — a stealth encoding bug is
-    now loud enough to notice.
     """
     config = {}
     for key, default in defaults.items():
@@ -257,26 +273,95 @@ async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, An
         except Exception:
             # See #369 — a transient KV read failure still falls back to
             # the default silently. Keeping that path unchanged here to
-            # stay scoped to the encoding-mismatch fix (#638).
+            # stay scoped to the encoding-mismatch / migration fix.
             config[key] = default
             continue
         try:
             config[key] = json.loads(entry.value.decode())
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            log.error(
-                "KV config value present but unparseable — using default. "
-                "This indicates a writer stored raw bytes where JSON was "
-                "expected (see issue #638). The next write will overwrite "
-                "the raw value with valid JSON.",
-                extra={
-                    "key": key,
-                    "raw_value": entry.value,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                },
-            )
-            config[key] = default
+            config[key] = await _self_heal_unparseable_config(kv, key, entry, default, exc)
     return config
+
+
+async def _self_heal_unparseable_config(
+    kv: KeyValue,
+    key: str,
+    entry: Any,
+    default: Any,
+    exc: BaseException,
+) -> Any:
+    """Rewrite a raw-encoded config value as valid JSON and return the recovered value.
+
+    See :func:`load_kv_config` docstring and issue #757. Split into a
+    helper because the branch is long enough that inlining it made the
+    main read loop hard to read.
+
+    Returns the value to expose to this reader (recovered string if we
+    could salvage one and the default is str-typed, otherwise ``default``).
+    """
+    # Try UTF-8 decode. The old buggy writers were all
+    # ``str(value).encode()`` so this almost always succeeds; the
+    # ``except (json.JSONDecodeError, UnicodeDecodeError)`` above
+    # already caught the UTF-8-fail case, but we re-attempt here so
+    # the "unhealed, return default" branch below has a single home.
+    try:
+        recovered_str = entry.value.decode()
+    except UnicodeDecodeError:
+        log.error(
+            "KV config value present but neither valid JSON nor valid UTF-8 — "
+            "using default; no safe self-heal possible (see #757).",
+            extra={
+                "key": key,
+                "raw_value": entry.value,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        return default
+
+    # Decide the recovered value. Only string-typed defaults get the
+    # raw text; for other types we can't know what the writer meant
+    # and returning a bare string could crash downstream. Rewriting
+    # the KV to the JSON-encoded default in that case still stops
+    # the ERROR spam without silently changing observable behaviour
+    # (unparseable already meant "consumer saw default").
+    if isinstance(default, str):
+        recovered_value: Any = recovered_str
+    else:
+        recovered_value = default
+
+    try:
+        await kv.update(key, json.dumps(recovered_value).encode(), entry.revision)
+        log.warning(
+            "KV config value was raw-encoded — rewrote as valid JSON (see #757).",
+            extra={
+                "key": key,
+                "recovered_value": recovered_value,
+                "revision": entry.revision,
+                "decoded_raw": recovered_str,
+                "recovered_from_default": not isinstance(default, str),
+            },
+        )
+    except Exception as write_exc:
+        # CAS lost (concurrent writer beat us) or transient write
+        # failure. The raw value may still be on the server, but the
+        # next reader will retry. Hand back the recovered value for
+        # this read anyway — it's what the raw bytes semantically
+        # represented (for str) or what every consumer was already
+        # seeing (for non-str), so returning it does not change
+        # observable behaviour vs. the pre-#757 code path.
+        log.warning(
+            "KV config self-heal write failed — returning recovered value; "
+            "next reader will retry the migration (see #757).",
+            extra={
+                "key": key,
+                "recovered_value": recovered_value,
+                "revision": entry.revision,
+                "write_error": str(write_exc),
+                "write_error_type": type(write_exc).__name__,
+            },
+        )
+    return recovered_value
 
 
 async def kv_acquire_lease(
