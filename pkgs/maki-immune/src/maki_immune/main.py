@@ -743,15 +743,40 @@ async def _logs_request_handler(msg):
             )
             return
 
-        # Prefer a Running pod for current logs; for --previous any pod with
-        # a terminated previous container will do.
+        # Prefer a Running+Ready pod for current logs; for --previous any pod
+        # with a terminated previous container will do so ready-preference is
+        # skipped there. Without the ready tiebreaker two Running pods (one
+        # ready, one orphaned old-RS survivor) fall back to newest-wins and
+        # silently serve logs from the wrong process — see #744, and the
+        # same-shape bugs #691 (health scan) and #715 (rollout monitor).
+        def _is_pod_ready(p) -> bool:
+            """True iff every container reports ready. Matches the readiness
+            check the health scan uses in ``health.py`` (container_statuses
+            over the ``Ready`` condition — the health-monitor is the canonical
+            source for this predicate in immune)."""
+            css = p.status.container_statuses if p.status else None
+            if not css:
+                return False
+            return all(bool(cs.ready) for cs in css)
+
         def _pod_rank(p):
             phase_priority = {"Running": 0, "Pending": 1, "Failed": 2, "Succeeded": 3, "Unknown": 4}
+            # For ``previous=True`` we want the terminated container's logs, so
+            # the currently-ready flag doesn't help pick between candidates —
+            # collapse the ready dimension to a constant so the phase+age
+            # ordering still wins.
+            ready_rank = 0 if (previous or _is_pod_ready(p)) else 1
             created_ts = p.metadata.creation_timestamp.timestamp() if p.metadata.creation_timestamp else 0
-            return (phase_priority.get(p.status.phase, 5), -created_ts)
+            return (phase_priority.get(p.status.phase, 5), ready_rank, -created_ts)
 
-        pod = sorted(pods.items, key=_pod_rank)[0]
+        ranked = sorted(pods.items, key=_pod_rank)
+        pod = ranked[0]
         pod_name = pod.metadata.name
+        # Surface the sibling pods so callers know a divergence exists — the
+        # ghost pod that motivated #744 was invisible to the operator until
+        # they cross-referenced ``check_component``. Names only; keep the
+        # payload small.
+        other_pods = [p.metadata.name for p in ranked[1:]]
 
         try:
             logs = await asyncio.to_thread(
@@ -773,6 +798,7 @@ async def _logs_request_handler(msg):
                         "component": component,
                         "previous": previous,
                         "error": f"failed to read logs: {e}",
+                        "other_pods": other_pods,
                     }
                 ).encode()
             )
@@ -795,6 +821,7 @@ async def _logs_request_handler(msg):
                     "tail_lines": tail_lines,
                     "truncated": truncated,
                     "logs": logs,
+                    "other_pods": other_pods,
                 }
             ).encode()
         )
@@ -807,6 +834,7 @@ async def _logs_request_handler(msg):
                 "tail_lines": tail_lines,
                 "chars": len(logs),
                 "truncated": truncated,
+                "other_pods": other_pods,
             },
         )
     except Exception:
