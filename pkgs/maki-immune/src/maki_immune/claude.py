@@ -182,7 +182,25 @@ class ImmuneClaudeReasoner:
     # --- System State Builder ---
 
     def _build_system_state(self) -> str:
-        """Build system state summary for Claude, including latency and resource data."""
+        """Build system state summary for Claude, including latency and resource data.
+
+        Multi-pod split state (#759): when a component has more than one pod
+        and at least one is unhealthy, the pod-level details (``ready``,
+        ``total_pods``, ``unhealthy_pods``, ``waiting_reason``) are surfaced
+        inline so Claude / stem / anyone eyeballing ``get_system_health`` can
+        tell a "green Service routing to a healthy replica while one pod
+        bleeds 503s" split apart from an ordinary crashloop. Without this,
+        the summary read as generic ``UNHEALTHY`` and the actual failure mode
+        (recall wedged on DNS resolution of ``maki-graph:7687`` for 5+ min
+        while a peer pod kept the Service green) was invisible.
+
+        Probe-level failure detail (#759): on UNHEALTHY, add a second
+        indented line with the last ``body_excerpt`` (from a non-200
+        response) or transport ``error_type`` so the actual error text —
+        e.g. ``"Failed to DNS resolve address maki-graph:7687: [Errno -2]
+        Name or service not known"`` — makes it into the summary without a
+        follow-up ``get_pod_logs`` round-trip.
+        """
         lines = []
         for component, state in sorted(self._component_health.items()):
             status = "HEALTHY" if state["healthy"] else "UNHEALTHY"
@@ -199,6 +217,28 @@ class ImmuneClaudeReasoner:
                 parts.append(f"k8s_restarts={details['restarts']}")
             if details.get("phase"):
                 parts.append(f"phase={details['phase']}")
+            # #759: surface the pod-ready flag when the pod is Running-but-
+            # unready. The composite verdict (``http_ok AND k8s_ok``) already
+            # flips to UNHEALTHY in that case, but the pod-level ``ready=False``
+            # marker never made it into the summary — so a "green Service, red
+            # pod" split read as an ordinary UNHEALTHY line indistinguishable
+            # from a crashloop.
+            if details.get("phase") == "Running" and details.get("ready") is False:
+                parts.append("ready=False")
+            # #759: surface the multi-pod split when at least one replica is
+            # unhealthy. ``total_pods``/``unhealthy_pods`` only get written when
+            # a component has >1 pod (see ``health.py:_check_k8s_pods``), so
+            # their presence alone signals a split. Without this, immune
+            # reported ``maki-recall: UNHEALTHY`` with no hint that the Service
+            # was still routing to a healthy replica while another pod bled
+            # 503s on DNS resolution for 5+ minutes.
+            total_pods = details.get("total_pods")
+            if total_pods is not None:
+                unhealthy_pods = details.get("unhealthy_pods", 0)
+                healthy_pods = max(total_pods - unhealthy_pods, 0)
+                parts.append(f"pods={healthy_pods}/{total_pods}_healthy")
+            if details.get("waiting_reason"):
+                parts.append(f"waiting_reason={details['waiting_reason']}")
             if details.get("mem_limit"):
                 parts.append(f"mem_limit={details['mem_limit']}")
             if details.get("cpu_limit"):
@@ -218,6 +258,25 @@ class ImmuneClaudeReasoner:
                     parts.append(f"turn_running={round(turn_running / 60, 1)}min")
 
             lines.append(f"- {component}: {status} ({', '.join(parts)})")
+
+            # #759: on UNHEALTHY, add a second indented line with the last
+            # probe-level failure signal so the actual error mode is legible
+            # from the summary alone. Body excerpt captures the /health JSON
+            # (which recall stuffs with the neo4j DNS-resolve error text on
+            # failure); ``error_type`` covers the transport-exception case
+            # where no response body existed. Keep it short so a long stack
+            # trace doesn't blow up the Claude prompt budget.
+            if not state["healthy"]:
+                body_excerpt = details.get("body_excerpt")
+                error_type = details.get("error_type")
+                error_msg = details.get("error")
+                if body_excerpt:
+                    lines.append(f"    last_body_excerpt: {body_excerpt[:180]!r}")
+                elif error_type:
+                    err_summary = f"{error_type}"
+                    if error_msg:
+                        err_summary += f": {error_msg[:140]}"
+                    lines.append(f"    last_probe_error: {err_summary}")
 
         if not lines:
             lines.append("No health data collected yet.")
