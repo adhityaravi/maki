@@ -18,7 +18,7 @@ from maki_common import (
     configure_logging,
     connect_nats,
     default_health_endpoints,
-    init_kv,
+    init_kv_with_retry,
     load_kv_config,
     spawn_background,
 )
@@ -899,11 +899,18 @@ async def main():
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
-    _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
-    _cortex_config_kv = await init_kv(_js, CORTEX_CONFIG_BUCKET)
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
-    _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
-    _state_kv = await init_kv(_js, STATE_BUCKET)
+    # init_kv_with_retry: cold-start KV bootstraps used to crash immune on a
+    # single ``nats.errors.TimeoutError`` from a JetStream API blip, wedging
+    # the health monitor + deploy pipeline for ≥5 min of CrashLoopBackOff on
+    # every transient hiccup (#758). ~60s of bounded retry per bucket covers
+    # 99% of blips; a genuinely dead NATS still surfaces to k8s on the final
+    # attempt. Each bucket retries independently — a slow first bucket does
+    # not steal budget from later ones.
+    _config_kv = await init_kv_with_retry(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
+    _cortex_config_kv = await init_kv_with_retry(_js, CORTEX_CONFIG_BUCKET)
+    _lock_kv = await init_kv_with_retry(_js, LOCK_BUCKET)
+    _deploy_history_kv = await init_kv_with_retry(_js, DEPLOY_HISTORY_BUCKET)
+    _state_kv = await init_kv_with_retry(_js, STATE_BUCKET)
 
     # JetStream streams
     from nats.js.api import RetentionPolicy, StorageType

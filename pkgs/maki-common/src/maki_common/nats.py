@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -222,6 +223,110 @@ async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> Ke
                 log.info("Seeded KV default", extra={"bucket": bucket, "key": key, "value": value})
 
     return kv
+
+
+async def init_kv_with_retry(
+    js,
+    bucket: str,
+    defaults: dict[str, Any] | None = None,
+    *,
+    attempts: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
+    jitter: float = 0.25,
+) -> KeyValue:
+    """Call :func:`init_kv` with bounded exponential backoff + jitter.
+
+    Cold-start KV bootstraps (``maki-cortex``, ``maki-immune``, ``maki-ears``)
+    used to call :func:`init_kv` directly from ``main()`` with no retry: one
+    5-second ``nats.errors.TimeoutError`` from a mid-handshake JetStream API
+    blip crashed the process, k8s applied exponential CrashLoopBackOff
+    (10s → 20s → ... → 5m), and a transient NATS hiccup turned into a
+    multi-hour fleet outage because every dependent pod lost sync on its own
+    independent backoff schedule. See issue #758 for the live reproduction
+    (cortex sat in CrashLoopBackOff for ~9.5h on 2026-09-30 after one blip).
+
+    This wrapper rides out the common transient case — a few seconds of NATS
+    unavailability during boot — without surrendering the "crash loudly on a
+    genuinely dead NATS" guarantee. After ``attempts`` failed tries we still
+    re-raise, so a permanent config problem (wrong URL, auth violation, dead
+    cluster) surfaces to k8s with CrashLoopBackOff doing its intended job.
+
+    Backoff formula::
+
+        delay_i = min(base_delay * 2 ** i, max_delay)
+        slept_i = delay_i * (1 + uniform(-jitter, +jitter))
+
+    Defaults give worst-case 2 + 4 + 8 + 16 + 30 ≈ 60 seconds of patience —
+    still well inside one k8s backoff cycle, and covers 99% of transient
+    nerve blips. Jitter desynchronises parallel retriers (every pod booting
+    at once after a NATS restart would otherwise hammer the server in
+    lockstep — see issue #756).
+
+    Retry semantics mirror :func:`maki_stem.main._retry_startup` and
+    :func:`connect_nats`: catch :class:`Exception` broadly because the
+    failure modes we actually see here (``TimeoutError``, ``NoServersError``,
+    ``ConnectionRefusedError``) are all transient, and the permanent class
+    (bad bucket name, missing JetStream) will fail every attempt anyway.
+
+    Args:
+        js: JetStream context.
+        bucket: Bucket name.
+        defaults: Optional key/value pairs to seed if missing (JSON-encoded).
+        attempts: Total attempts before giving up (default 5).
+        base_delay: Initial retry delay in seconds (default 2.0).
+        max_delay: Maximum retry delay in seconds (default 30.0).
+        jitter: Fraction of delay to randomise ±around (default 0.25 =
+            ±25%). Set to 0 to disable jitter (test determinism).
+
+    Raises:
+        Exception: The final attempt's exception is re-raised unchanged so
+            uvicorn / ``asyncio.run`` surface the real failure to k8s.
+    """
+    last_exc: BaseException | None = None
+    for i in range(attempts):
+        try:
+            kv = await init_kv(js, bucket, defaults)
+            if i > 0:
+                log.info(
+                    "init_kv recovered after retry",
+                    extra={"bucket": bucket, "attempt": i + 1},
+                )
+            return kv
+        except Exception as exc:
+            last_exc = exc
+            if i >= attempts - 1:
+                log.error(
+                    "init_kv failed after all retries — surfacing to k8s",
+                    extra={
+                        "bucket": bucket,
+                        "attempts": attempts,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+            delay = min(base_delay * (2**i), max_delay)
+            if jitter > 0:
+                delay = delay * (1 + random.uniform(-jitter, jitter))
+            log.warning(
+                "init_kv failed, retrying",
+                extra={
+                    "bucket": bucket,
+                    "attempt": i + 1,
+                    "attempts": attempts,
+                    "retry_in_s": delay,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await asyncio.sleep(delay)
+
+    # Unreachable: the ``i >= attempts - 1`` branch above raises on the final
+    # iteration. Guarded by assert so a future refactor that drops the final
+    # raise fails loudly instead of returning None.
+    assert last_exc is not None  # pragma: no cover
+    raise last_exc  # pragma: no cover
 
 
 async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, Any]:

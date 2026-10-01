@@ -32,7 +32,7 @@ from typing import Any
 
 import nats.errors
 import nats.js.errors
-from maki_common.nats import init_kv
+from maki_common.nats import init_kv, init_kv_with_retry
 
 
 def _run(coro):
@@ -203,3 +203,119 @@ def test_init_kv_seeds_only_missing_keys_in_mixed_batch() -> None:
     assert seeded == {"retention_days": 30, "max_tokens": 4096}
     # And the pre-existing tuned value is still intact.
     assert json.loads(kv.stored["chat_model"].decode()) == "claude-opus-4-7"
+
+
+# --- init_kv_with_retry: the #758 cold-start retry wrapper ------------------
+#
+# These guard the inverse of the "propagate" contract above: the outer
+# wrapper MUST ride out transient blips without crashing the pod, but MUST
+# still re-raise once attempts are exhausted so a genuinely dead NATS still
+# surfaces to k8s. See issue #758 — cortex sat in CrashLoopBackOff for ~9.5h
+# because one 5s JetStream timeout at boot killed the process every time k8s
+# re-ran it.
+
+
+class _FlakyJS:
+    """JetStream stub whose ``key_value`` fails N times, then succeeds.
+
+    Models the #758 scenario: NATS connect works (``connect_nats`` has its
+    own retry) but the first JetStream ``stream_info`` request after the TCP
+    handshake times out while a leader election / disk flush completes. A
+    retry a few seconds later succeeds.
+    """
+
+    def __init__(self, kv: _FakeKV, fail_first: int, exc: BaseException) -> None:
+        self._kv = kv
+        self._fail_first = fail_first
+        self._exc = exc
+        self.key_value_calls = 0
+        self.create_calls = 0
+
+    async def key_value(self, bucket: str) -> _FakeKV:
+        self.key_value_calls += 1
+        if self.key_value_calls <= self._fail_first:
+            raise self._exc
+        return self._kv
+
+    async def create_key_value(self, bucket: str) -> _FakeKV:  # pragma: no cover
+        self.create_calls += 1
+        return self._kv
+
+
+def test_init_kv_with_retry_recovers_from_transient_timeout() -> None:
+    """Two TimeoutErrors in a row then success → one healthy KV handle returned.
+
+    The #758 happy path: ~5s of JetStream unavailability at cold start, which
+    before this wrapper crashed the pod and cost 5+ min of exp-backoff. Now
+    the wrapper sleeps ~2s + ~4s and the third attempt wins.
+    """
+    kv = _FakeKV(stored={})
+    js = _FlakyJS(kv, fail_first=2, exc=nats.errors.TimeoutError())
+
+    async def scenario() -> _FakeKV:
+        # jitter=0 for test determinism; tiny delays so the test is fast.
+        return await init_kv_with_retry(js, "cfg", attempts=5, base_delay=0.001, max_delay=0.01, jitter=0)
+
+    result = _run(scenario())
+    assert result is kv
+    assert js.key_value_calls == 3  # 2 failures + 1 success
+
+
+def test_init_kv_with_retry_raises_after_exhausting_attempts() -> None:
+    """A permanently-dead NATS still surfaces to k8s after N attempts.
+
+    Defense against the "retry forever and silently mask a config bug"
+    anti-pattern. If every attempt fails we re-raise unchanged — kubelet
+    then enters CrashLoopBackOff as intended and the real error shows up
+    in ``kubectl logs --previous``.
+    """
+    kv = _FakeKV(stored={})
+    # 999 > attempts, so every call fails.
+    js = _FlakyJS(kv, fail_first=999, exc=nats.errors.TimeoutError("nats: timeout"))
+
+    async def scenario() -> None:
+        await init_kv_with_retry(js, "cfg", attempts=3, base_delay=0.001, max_delay=0.01, jitter=0)
+
+    exc = _assert_raises(nats.errors.TimeoutError, scenario())
+    assert "timeout" in str(exc).lower()
+    assert js.key_value_calls == 3  # all attempts consumed, no silent extra tries
+
+
+def test_init_kv_with_retry_first_attempt_succeeds_no_sleep() -> None:
+    """Happy-path cold start: NATS healthy, one call, no retry delay burned."""
+    kv = _FakeKV(stored={})
+    js = _FlakyJS(kv, fail_first=0, exc=RuntimeError("should never raise"))
+
+    async def scenario() -> _FakeKV:
+        return await init_kv_with_retry(js, "cfg", attempts=5, base_delay=1.0, max_delay=10.0, jitter=0)
+
+    result = _run(scenario())
+    assert result is kv
+    assert js.key_value_calls == 1  # single attempt, no retry sleep incurred
+
+
+def test_init_kv_with_retry_passes_defaults_through() -> None:
+    """Defaults handed to the wrapper reach init_kv on the successful attempt.
+
+    Guards against a refactor that drops the ``defaults`` kwarg on the inner
+    call — immune relies on this to seed DEFAULT_CONFIG at cold start.
+    """
+    kv = _FakeKV(stored={})
+    js = _FlakyJS(kv, fail_first=1, exc=nats.errors.TimeoutError())
+
+    async def scenario() -> None:
+        await init_kv_with_retry(
+            js,
+            "cfg",
+            defaults={"chat_model": "claude-sonnet-4"},
+            attempts=3,
+            base_delay=0.001,
+            max_delay=0.01,
+            jitter=0,
+        )
+
+    _run(scenario())
+
+    assert js.key_value_calls == 2  # 1 fail + 1 success
+    seeded = {k: json.loads(v.decode()) for k, v in kv.puts}
+    assert seeded == {"chat_model": "claude-sonnet-4"}

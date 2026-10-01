@@ -24,7 +24,7 @@ from maki_common import (
     format_graph_block,
     format_memories_block,
     format_system_state_lines,
-    init_kv,
+    init_kv_with_retry,
     spawn_background,
     subscribe_supervised,
 )
@@ -810,7 +810,12 @@ async def main():
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _nc_ref = nc
     js = nc.jetstream()
-    config_kv = await init_kv(js, "maki-cortex-config")
+    # init_kv_with_retry: a single ``nats.errors.TimeoutError`` from a
+    # mid-handshake JetStream API blip used to crash cortex and wedge it in
+    # CrashLoopBackOff for ≥5 min on every transient nerve hiccup (#758).
+    # ~60s of bounded retry rides out 99% of blips without masking a dead
+    # NATS — the final attempt still raises so k8s surfaces the real failure.
+    config_kv = await init_kv_with_retry(js, "maki-cortex-config")
 
     # Load GitHub App private key if configured
     global _github_private_key, _github_auth

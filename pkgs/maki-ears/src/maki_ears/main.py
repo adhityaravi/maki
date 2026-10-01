@@ -16,7 +16,7 @@ from maki_common import (
     PendingQueues,
     configure_logging,
     connect_nats,
-    init_kv,
+    init_kv_with_retry,
     kv_acquire_lease,
     spawn_background,
     subscribe_supervised,
@@ -789,9 +789,16 @@ async def main():
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
+    # init_kv_with_retry: cold-start KV bootstrap used to crash ears on a
+    # single JetStream API blip, taking Discord offline for a 5-min k8s
+    # backoff cycle every time nerve hiccuped (#758). ~60s of bounded
+    # retry rides out transient blips; genuinely dead NATS still surfaces.
+    _lock_kv = await init_kv_with_retry(_js, LOCK_BUCKET)
 
-    # Dedup bucket with 5-minute TTL — prevents duplicate Discord event processing
+    # Dedup bucket with 5-minute TTL — prevents duplicate Discord event processing.
+    # Inline rather than going through init_kv_with_retry because the TTL arg is
+    # bucket-specific; one transient hiccup here still crashes the pod, which is
+    # fine — dedup only matters once Discord events start flowing (post-startup).
     try:
         _dedup_kv = await _js.key_value(DEDUP_BUCKET)
     except Exception:
