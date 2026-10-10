@@ -48,6 +48,7 @@ from maki_stem.conversation import (
     publish_turn_to_stream,
 )
 from maki_stem.loops import StemContext
+from maki_stem.loops.base import load_identity
 from maki_stem.memory import feed_memories, search_memories
 from maki_stem.system_state import (
     gather_system_state,
@@ -60,7 +61,6 @@ log = logging.getLogger(__name__)
 
 TURN_TIMEOUT = int(os.environ.get("TURN_TIMEOUT", "1800"))
 
-KV_KEY = "identity"
 
 # instance_id → session_id (session_id changes when cortex restarts mid-turn).
 _cortex_sessions: dict[str, str] = {}
@@ -256,11 +256,7 @@ async def process_turn(
     active_turns[turn_id] = time.time()
     log.info("Turn started", extra={"turn_id": turn_id, "message_len": len(message)})
 
-    try:
-        entry = await ctx.kv.get(KV_KEY)
-        identity = entry.value.decode()
-    except Exception:
-        identity = default_identity
+    identity = await load_identity(ctx.kv, default_identity)
 
     memories, graph_context = await search_memories(message)
     system_state = await gather_system_state(

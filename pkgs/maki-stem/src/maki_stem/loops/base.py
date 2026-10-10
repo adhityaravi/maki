@@ -19,6 +19,9 @@ from maki_common import (
     try_claim_loop,
 )
 
+from maki_stem.identity import DEFAULT_IDENTITY
+from maki_stem.identity import KV_KEY as IDENTITY_KV_KEY
+
 log = logging.getLogger(__name__)
 
 # Shared thresholds used by multiple loops
@@ -29,10 +32,6 @@ USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 # Unknown-author issues get tagged with UNKNOWN_ISSUER_LABEL and ignored.
 UNKNOWN_ISSUER_LABEL = "unknown-issuer"
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
-
-# Identity KV — shared by every loop that needs to prepend Maki's self-description.
-IDENTITY_KV_KEY = "identity"
-DEFAULT_IDENTITY = "You are Maki."
 
 
 def is_verified_issue_author(issue: dict) -> bool:
@@ -131,7 +130,7 @@ def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
     return next_scheduled <= now
 
 
-async def load_identity(kv: Any) -> str:
+async def load_identity(kv: Any, default_identity: str = DEFAULT_IDENTITY) -> str:
     """Load Maki's identity string from the shared KV, falling back to a safe default.
 
     Every loop prepends identity to its system prompt. Centralising the load here
@@ -142,7 +141,7 @@ async def load_identity(kv: Any) -> str:
         entry = await kv.get(IDENTITY_KV_KEY)
         return entry.value.decode()
     except Exception:
-        return DEFAULT_IDENTITY
+        return default_identity
 
 
 def assemble_loop_prompt(
