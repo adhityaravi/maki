@@ -10,11 +10,27 @@ import logging
 import os
 import time
 import uuid
+from functools import partial
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-from maki_common import configure_logging, connect_nats, init_kv, load_kv_config
+from maki_common import (
+    configure_logging,
+    connect_nats,
+    default_health_endpoints,
+    init_kv_with_retry,
+    load_kv_config,
+    spawn_background,
+)
 from maki_common.health import tcp_health_server
+from maki_common.settings import (
+    NATS_TOKEN,
+    NATS_URL,
+    RECALL_URL,
+    REPO_NAME,
+    REPO_OWNER,
+    REPO_PATH,
+)
 from maki_common.subjects import (
     CORTEX_STUCK,
     DEPLOY_PROPAGATE,
@@ -24,36 +40,34 @@ from maki_common.subjects import (
     EARS_VITALS_OUT,
     IMMUNE_ALERT,
     IMMUNE_COMMAND,
+    IMMUNE_LOGS_REQUEST,
     IMMUNE_SITE_QUERY,
     IMMUNE_STATE_REQUEST,
     RESTART_PROPAGATE,
     RESTART_REQUEST,
 )
 
-from maki_immune import claude as claude_mod
-from maki_immune import deploy as deploy_mod
-from maki_immune import health as health_mod
+from maki_immune.claude import ImmuneClaudeReasoner
+from maki_immune.deploy import ImmuneDeployCoordinator
+from maki_immune.health import ImmuneHealthMonitor
+from maki_immune.lock import infra_lock as _infra_lock_impl
 
 configure_logging()
 log = logging.getLogger(__name__)
 
 # --- Config ---
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 NAMESPACE = os.environ.get("NAMESPACE", "maki")
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 GHCR_PREFIX = os.environ.get("GHCR_PREFIX", "ghcr.io/adhityaravi")
-REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
 
-HEALTH_ENDPOINTS = {
-    "maki-stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
-    "maki-cortex": os.environ.get("CORTEX_URL", "http://maki-cortex:8080"),
-    "maki-recall": os.environ.get("RECALL_URL", "http://maki-recall:8000"),
-    "maki-synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
-    "maki-finbert": os.environ.get("FINBERT_URL", "http://maki-finbert:8080"),
-}
+# ``maki-`` prefix is required here: immune's HTTP verdicts are merged with
+# k8s pod verdicts (keyed on ``app=`` labels, which are ``maki-*``) inside
+# ``_merge_and_update_health``. Bare-name keys would produce ghost entries
+# in ``_component_health`` and prevent the composite ``http_ok AND k8s_ok``
+# verdict from firing. Ports + env-var overrides come from the shared table
+# in ``maki_common.endpoints`` — see #137.
+HEALTH_ENDPOINTS = default_health_endpoints(prefix="maki-")
 
 VITALS_STREAM = "maki-vitals"
 DEPLOY_STREAM = "maki-deploy"
@@ -65,6 +79,11 @@ DEPLOY_HISTORY_BUCKET = "maki-deploy-history"
 STATE_BUCKET = "maki-immune-state"
 RECENT_ACTIONS_KEY = "recent_actions"
 RECENT_ACTIONS_MAX = 100
+# #754: sticky registry of every component immune has ever observed. Persisted
+# so a restart of immune during a vanished-component incident doesn't silently
+# forget the component ever existed (which would leave the escalation path
+# blind and make ``check_component`` conflate it with "unknown name").
+KNOWN_COMPONENTS_KEY = "known_components"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 INSTANCE_ID = f"immune-{uuid.uuid4().hex[:8]}"
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
@@ -74,6 +93,16 @@ DEFAULT_CONFIG = {
     "heartbeat_interval": 21600,
     "health_check_interval": 30,
     "reflex_restart_max": 3,
+    # Reflex cooldown after burst limit (#753): once ``reflex_restart_max``
+    # attempts fire in the 1h window and either escalate to Claude or get
+    # skipped because a hive peer is healthy, sit on this component for
+    # ``reflex_cooldown_hours`` before the reflex path is allowed to touch
+    # it again. Without this gate the sliding-window prune re-opened the
+    # burst every ~60 min forever — pod deletes against a root cause pod
+    # deletion cannot fix (e.g. Postgres HA outage, vault split-brain).
+    # 6h is long enough that a real hive-wide outage that flips a peer to
+    # unhealthy still gets escalated on the next tick.
+    "reflex_cooldown_hours": 6,
     "lock_ttl": 300,
     "passive_patrol_interval_seconds": 2700,
     # Stuck-component escalation (#245): how long a pod may sit unhealthy in a
@@ -81,6 +110,60 @@ DEFAULT_CONFIG = {
     # escalates, and how often it re-alerts while still stuck.
     "stuck_escalation_threshold_s": 600,
     "stuck_realert_interval_s": 3600,
+    # Long-unhealthy re-escalation (#260): once a component has been unhealthy
+    # for this many hours (in any shape, not just non-Running pods), re-fire
+    # the Claude escalation. Plugs the autonomy gap where the restart-reflex's
+    # single-shot escalation goes silent for days if not resolved (#259).
+    "long_unhealthy_re_escalate_hours": 6,
+    "long_unhealthy_realert_interval_s": 21600,
+    # Tier-2 hive-guard breakthrough (#311): past this many hours of being
+    # unhealthy, _check_long_unhealthy_components escalates even if a peer
+    # has the component healthy. The default hive guard ("local-only, don't
+    # page") is correct for hour-scale incidents but became a dead-zone at
+    # week-scale: recall crashlooped silently for 13 days because hive
+    # suppression + a narrow stuck-recovery allowlist left it with no path
+    # back to human or autonomous attention. The breakthrough alert is
+    # labelled LOCAL-ONLY-LONG-UNHEALTHY so the policy is visible.
+    "long_unhealthy_local_only_escalate_hours": 72,
+    # Tier-3 auto-recovery (#264, widened in #311): after this many seconds
+    # stuck in a non-Running / initializing phase (or CrashLoopBackOff —
+    # ``is_pod_stuck`` matches both), immune performs an automated
+    # `delete pod` to break out of a multi-day wedge that reflex restarts
+    # couldn't fix. Opt-in via allowlist, gated by a hive sanity check
+    # (act only if a peer has the component healthy — proves the recipe
+    # works). #311 widened the default from just ``maki-vault`` to also
+    # cover the stateless application services (recall/cortex/stem/
+    # ears/synapse) where ``delete pod`` is safe (kubelet recreates from
+    # spec, no PVC concerns).
+    "stuck_recovery_threshold_s": 86400,
+    "stuck_recovery_cooldown_s": 21600,
+    "stuck_recovery_allowlist": "maki-vault,maki-recall,maki-cortex,maki-stem,maki-ears,maki-synapse",
+    # Terminal-zombie escalation (#470): a pod stuck Running+ready=False
+    # whose /health body advertises a permanent error (bad NATS token, TLS
+    # required, etc.) gets escalated to Claude with a config-mismatch hint
+    # instead of a pointless pod delete. ``min_failures`` gates on
+    # consecutive tick-failures (≈5 min at 30s cadence) so a single
+    # rollout-race body-read doesn't fire; ``realert_interval_s`` keeps
+    # the alert stream loud enough to survive an ignored escalation
+    # without spamming every 30s tick.
+    "terminal_zombie_min_failures": 10,
+    "terminal_zombie_realert_interval_s": 3600,
+    # Known-components registry (#754): sticky per-component observation
+    # tracking. A component that immune has previously seen but is now
+    # entirely absent from the pod/probe scan for
+    # ``known_component_missing_tick_threshold`` consecutive ticks (default
+    # 2 ticks ≈ 60s) fires a COMPONENT-VANISHED alert and hands the
+    # incident to Claude — this closes the autonomy gap where a deleted
+    # Deployment/Service silently dropped from ``get_system_health`` with
+    # no alert, no reflex, and ``check_component`` conflating it with
+    # "name never existed". ``known_component_forget_after_s`` (default
+    # 30d) drops entries never re-observed inside that window, and the
+    # comma-separated ``known_component_ignore`` list lets Adi retire a
+    # component intentionally so the alert stream stays quiet.
+    "known_component_missing_tick_threshold": 2,
+    "known_component_missing_realert_interval_s": 3600,
+    "known_component_forget_after_s": 30 * 86400,
+    "known_component_ignore": "",
 }
 
 IMMUNE_CONFIG_VALIDATORS: dict[str, list] = {
@@ -240,6 +323,11 @@ _semaphore = asyncio.Semaphore(1)
 _failed_image_blacklist: set[str] = set()
 _hive_state: dict[str, dict] = {}
 _running_images: dict[str, str] = {}
+# #754: sticky registry of every component immune has ever seen. Mutated by
+# :class:`ImmuneHealthMonitor` on every tick and persisted to STATE_BUCKET so
+# a mid-incident immune restart doesn't silently forget the component ever
+# existed. Value shape: ``{component: {"first_seen_at": ts, "last_seen_at": ts}}``.
+_known_components: dict[str, dict[str, float]] = {}
 _cortex_state: dict = {
     "last_heartbeat": 0,
     "active_turn": None,
@@ -257,16 +345,23 @@ _health_monitor_task: asyncio.Task | None = None
 # the readiness probe must flip red so kubelet restarts the pod (issue #175).
 _critical_listener_tasks: dict[str, asyncio.Task] = {}
 
+# The three subsystem instances (#102/#167). Constructed in :func:`main` after
+# NATS + KV + K8s handles are ready. Kept as module-level so the state-request
+# handlers and readiness probe can reach the monitor's ``get_last_incident_time``.
+_deploy_coordinator: ImmuneDeployCoordinator | None = None
+_claude_reasoner: ImmuneClaudeReasoner | None = None
+_health_monitor: ImmuneHealthMonitor | None = None
 
-def _health_check() -> tuple[bool, str | None]:
-    """Return (ok, reason) for the readiness/liveness probe."""
-    if _nc is None or not _nc.is_connected:
-        return False, "NATS not connected"
-    if _lock_kv is None:
-        return False, "Infrastructure-lock KV not initialised"
-    if _health_monitor_task is None:
-        return False, "Health-monitor task not started"
-    if _health_monitor_task.done():
+
+def _liveness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/live`` liveness probe.
+
+    Only restart-worthy conditions fail here: the health-monitor task or a
+    supervised critical listener has exited. NATS disconnection is *not*
+    liveness — it either self-heals via reconnect or belongs to readiness'
+    "don't route to me" side. See issue #373 for the split rationale.
+    """
+    if _health_monitor_task is not None and _health_monitor_task.done():
         if _health_monitor_task.cancelled():
             return False, "Health-monitor task cancelled"
         exc = _health_monitor_task.exception()
@@ -278,6 +373,27 @@ def _health_check() -> tuple[bool, str | None]:
             exc = task.exception()
             return False, f"{label} listener crashed: {exc!r}"
     return True, None
+
+
+def _readiness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/health`` readiness probe.
+
+    Includes everything liveness checks plus startup/connectivity gates —
+    NATS, lock KV, health-monitor task presence — that don't warrant a
+    restart but should keep traffic off until they resolve.
+    """
+    if _nc is None or not _nc.is_connected:
+        return False, "NATS not connected"
+    if _lock_kv is None:
+        return False, "Infrastructure-lock KV not initialised"
+    if _health_monitor_task is None:
+        return False, "Health-monitor task not started"
+    return _liveness_check()
+
+
+# Legacy alias — semantically identical to readiness, matching the
+# pre-split behaviour of the single ``_health_check`` callable.
+_health_check = _readiness_check
 
 
 # --- Infrastructure Lock ---
@@ -328,6 +444,15 @@ async def _release_lock(holder: str):
         pass
 
 
+# ``async with _infra_lock("immune-X", ttl=Y)`` for deploy/health call sites.
+# Raises ``LockNotAcquired`` when the lock is held elsewhere; always releases on
+# exit. Callers use ``try/except LockNotAcquired`` to render their site-specific
+# "lock held" response (see #127). ``partial`` binds the module-level
+# acquire/release functions so submodules don't need to know they exist — the
+# CM they receive already carries the correct kv-backed implementation.
+_infra_lock = partial(_infra_lock_impl, acquire=_acquire_lock, release=_release_lock)
+
+
 # --- Recent Actions Persistence ---
 
 
@@ -353,32 +478,114 @@ async def _persist_recent_actions():
 
 
 def _schedule_persist_recent_actions():
-    """Schedule _persist_recent_actions as a background task."""
-    asyncio.ensure_future(_persist_recent_actions())
+    """Schedule _persist_recent_actions as a background task.
+
+    Uses ``spawn_background`` (not bare ``ensure_future``) so the task is
+    anchored against mid-flight GC and any uncaught exception is logged
+    instead of vanishing silently (issue #123).
+    """
+    spawn_background(_persist_recent_actions(), name="immune.persist_recent_actions")
+
+
+# --- Known-Components Registry Persistence (#754) ---
+
+
+async def _load_known_components():
+    """Load the known-components registry from KV on startup.
+
+    Without this, every immune restart would present as a fresh
+    membership-driven view: no history of "what have we ever seen", no
+    signal when a component that used to exist is now missing from the
+    cluster. The whole point of the registry is stickiness — we persist
+    it so a mid-incident restart doesn't silently forget the vanished
+    component ever existed.
+    """
+    global _known_components
+    try:
+        entry = await _state_kv.get(KNOWN_COMPONENTS_KEY)
+        loaded = json.loads(entry.value.decode())
+        if isinstance(loaded, dict):
+            # Defensive: only accept entries with the expected shape so a
+            # hand-edit / prior-version schema mismatch doesn't wedge the
+            # loop later. Silently drop anything malformed.
+            cleaned: dict[str, dict[str, float]] = {}
+            for name, meta in loaded.items():
+                if not isinstance(name, str) or not isinstance(meta, dict):
+                    continue
+                first = meta.get("first_seen_at")
+                last = meta.get("last_seen_at")
+                if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
+                    continue
+                cleaned[name] = {"first_seen_at": float(first), "last_seen_at": float(last)}
+            _known_components.update(cleaned)
+            log.info("Known-components registry loaded from KV", extra={"entries": len(cleaned)})
+    except Exception:
+        log.info("No known-components registry found in KV (first run)")
+
+
+async def _persist_known_components():
+    """Persist the current known-components registry to KV."""
+    try:
+        await _state_kv.put(
+            KNOWN_COMPONENTS_KEY,
+            json.dumps(_known_components, default=str).encode(),
+        )
+    except Exception:
+        log.warning("Failed to persist known_components to KV")
+
+
+def _schedule_persist_known_components():
+    """Schedule _persist_known_components as a background task.
+
+    Mirrors ``_schedule_persist_recent_actions`` — the monitor calls this
+    on the tick that adds/prunes an entry, and we fire-and-forget the KV
+    write so the health loop isn't blocked on JetStream latency. Uses
+    ``spawn_background`` so exceptions are logged instead of vanishing
+    (issue #123).
+    """
+    spawn_background(_persist_known_components(), name="immune.persist_known_components")
 
 
 # --- NATS Publishing ---
 
 
 async def _publish_alert(alert_text: str):
-    """Publish urgent alert to JetStream."""
+    """Publish urgent alert to JetStream (fire-and-forget; swallows publish errors).
+
+    Callers invoke this mid-flow right after a critical side effect (pod deleted,
+    deploy rolled back, escalation classified). A JetStream hiccup here must not
+    propagate up and short-circuit the tail of the caller's block or cause its
+    ``except`` handler to mis-attribute the failure — see #472.
+    """
     payload = {"alert": alert_text, "timestamp": time.time()}
-    await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
-    log.info("Alert published", extra={"alert_preview": alert_text[:100]})
+    try:
+        await _js.publish(IMMUNE_ALERT, json.dumps(payload).encode())
+        log.info("Alert published", extra={"alert_preview": alert_text[:100]})
+    except Exception:
+        log.exception("Failed to publish alert", extra={"alert_preview": alert_text[:100]})
 
 
 async def _publish_vitals(digest: str):
-    """Publish health digest to JetStream for #maki-vitals."""
+    """Publish health digest to JetStream for #maki-vitals (fire-and-forget; see #472)."""
     payload = {"digest": digest, "timestamp": time.time()}
-    await _js.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
-    log.info("Vitals digest published", extra={"digest_len": len(digest)})
+    try:
+        await _js.publish(EARS_VITALS_OUT, json.dumps(payload).encode())
+        log.info("Vitals digest published", extra={"digest_len": len(digest)})
+    except Exception:
+        log.exception("Failed to publish vitals digest", extra={"digest_len": len(digest)})
 
 
 async def _publish_immune_response(message_id: str, response: str):
-    """Publish immune command response back to ears for #maki-immune."""
+    """Publish immune command response back to ears for #maki-immune (fire-and-forget; see #472)."""
     payload = {"message_id": message_id, "response": response}
-    await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
-    log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
+    try:
+        await _nc.publish(EARS_IMMUNE_OUT, json.dumps(payload).encode())
+        log.info("Immune response published", extra={"message_id": message_id, "response_len": len(response)})
+    except Exception:
+        log.exception(
+            "Failed to publish immune response",
+            extra={"message_id": message_id, "response_len": len(response)},
+        )
 
 
 # --- State Request Handlers ---
@@ -394,6 +601,14 @@ async def _state_request_handler(msg):
         except Exception:
             pass
 
+        # #754: fold the sticky known-components registry and the
+        # per-incident missing tracker into the snapshot so ``check_component``
+        # can render the ``KNOWN_BUT_MISSING_FROM_CLUSTER`` state and cortex/
+        # stem can reason about the diff between "what we've ever seen" and
+        # "what's here right now" without another round trip.
+        known_components = _health_monitor.get_known_components() if _health_monitor else {}
+        missing_components = _health_monitor.get_missing_components() if _health_monitor else {}
+
         state = {
             "component_health": _component_health,
             "recent_actions": _recent_actions[-10:],
@@ -402,16 +617,232 @@ async def _state_request_handler(msg):
             "cortex_active_turn": _cortex_state["active_turn"],
             "cortex_turn_mode": _cortex_state["turn_mode"],
             "cortex_turn_started": _cortex_state["turn_started"],
-            "last_incident_time": health_mod.get_last_incident_time(),
+            "last_incident_time": _health_monitor.get_last_incident_time() if _health_monitor else 0,
             "site_name": SITE_NAME,
             "hive_state": _hive_state,
             "images": dict(_running_images),
+            "known_components": known_components,
+            "missing_components": missing_components,
         }
         await msg.respond(json.dumps(state).encode())
-        log.info("State request served", extra={"components": len(_component_health)})
+        log.info(
+            "State request served",
+            extra={
+                "components": len(_component_health),
+                "known": len(known_components),
+                "missing": len(missing_components),
+            },
+        )
     except Exception:
         log.exception("Failed to serve state request")
         await msg.respond(b"{}")
+
+
+_LOG_REDACTION_PATTERNS: list = []
+
+
+def _build_log_redaction_patterns() -> list:
+    """Compile redaction regexes for pod-log responses.
+
+    Logs can leak DB DSNs, bearer tokens, and env-style secrets. Strip the
+    secret-bearing portion before handing the bytes back across NATS to cortex
+    so the reflection loop never sees the raw credential (#252).
+    """
+    import re
+
+    return [
+        # postgres://user:password@host -> postgres://user:***@host
+        (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^:\s/@]+:)([^@\s]+)(@)"), r"\1***\3"),
+        # Authorization: Bearer xxx / Authorization: Basic xxx
+        (re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)\S+"), r"\1***"),
+        # Bearer/Token <value> standalone
+        (re.compile(r"(?i)\b(bearer|token)\s+[A-Za-z0-9._\-]{12,}"), r"\1 ***"),
+        # KEY=value / KEY: value for sensitive-looking env names
+        (
+            re.compile(
+                r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|DSN))"
+                r"(\s*[:=]\s*)(['\"]?)([^\s'\"]+)"
+            ),
+            r"\1\2\3***",
+        ),
+    ]
+
+
+def _redact_log_text(text: str) -> str:
+    """Apply the compiled redaction patterns to a log blob."""
+    global _LOG_REDACTION_PATTERNS
+    if not _LOG_REDACTION_PATTERNS:
+        _LOG_REDACTION_PATTERNS = _build_log_redaction_patterns()
+    for pattern, replacement in _LOG_REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+async def _logs_request_handler(msg):
+    """Serve pod logs for a component to the reflection loop (#252).
+
+    Payload (JSON): ``{"component": str, "previous": bool, "tail_lines": int}``.
+    Resolves component → pod via ``app=<component>`` label, reads logs from the
+    kube-apiserver, redacts likely secrets, and replies with a JSON blob
+    containing ``pod``, ``logs``, ``previous``, ``truncated`` and (on failure)
+    ``error``.
+    """
+    try:
+        try:
+            payload = json.loads(msg.data.decode() or "{}")
+        except Exception:
+            payload = {}
+        component = (payload.get("component") or "").strip()
+        previous = bool(payload.get("previous", False))
+        try:
+            tail_lines = int(payload.get("tail_lines") or 200)
+        except (TypeError, ValueError):
+            tail_lines = 200
+        tail_lines = max(1, min(tail_lines, 1000))
+
+        if not component:
+            await msg.respond(json.dumps({"error": "component is required"}).encode())
+            return
+
+        if _k8s_v1 is None:
+            await msg.respond(json.dumps({"error": "K8s client unavailable on this immune instance"}).encode())
+            return
+
+        try:
+            pods = await asyncio.to_thread(
+                _k8s_v1.list_namespaced_pod,
+                namespace=NAMESPACE,
+                label_selector=f"app={component}",
+            )
+        except Exception as e:
+            log.exception("logs request: pod lookup failed", extra={"component": component})
+            await msg.respond(json.dumps({"error": f"pod lookup failed: {e}"}).encode())
+            return
+
+        if not pods.items:
+            try:
+                all_pods = await asyncio.to_thread(_k8s_v1.list_namespaced_pod, namespace=NAMESPACE)
+                available = sorted(
+                    {
+                        p.metadata.labels.get("app")
+                        for p in all_pods.items
+                        if p.metadata.labels and p.metadata.labels.get("app")
+                    }
+                )
+            except Exception:
+                available = []
+            await msg.respond(
+                json.dumps(
+                    {
+                        "error": (
+                            f"No pods found with app={component}. "
+                            f"Available components: {', '.join(available) or '(none)'}"
+                        )
+                    }
+                ).encode()
+            )
+            return
+
+        # Prefer a Running+Ready pod for current logs; for --previous any pod
+        # with a terminated previous container will do so ready-preference is
+        # skipped there. Without the ready tiebreaker two Running pods (one
+        # ready, one orphaned old-RS survivor) fall back to newest-wins and
+        # silently serve logs from the wrong process — see #744, and the
+        # same-shape bugs #691 (health scan) and #715 (rollout monitor).
+        def _is_pod_ready(p) -> bool:
+            """True iff every container reports ready. Matches the readiness
+            check the health scan uses in ``health.py`` (container_statuses
+            over the ``Ready`` condition — the health-monitor is the canonical
+            source for this predicate in immune)."""
+            css = p.status.container_statuses if p.status else None
+            if not css:
+                return False
+            return all(bool(cs.ready) for cs in css)
+
+        def _pod_rank(p):
+            phase_priority = {"Running": 0, "Pending": 1, "Failed": 2, "Succeeded": 3, "Unknown": 4}
+            # For ``previous=True`` we want the terminated container's logs, so
+            # the currently-ready flag doesn't help pick between candidates —
+            # collapse the ready dimension to a constant so the phase+age
+            # ordering still wins.
+            ready_rank = 0 if (previous or _is_pod_ready(p)) else 1
+            created_ts = p.metadata.creation_timestamp.timestamp() if p.metadata.creation_timestamp else 0
+            return (phase_priority.get(p.status.phase, 5), ready_rank, -created_ts)
+
+        ranked = sorted(pods.items, key=_pod_rank)
+        pod = ranked[0]
+        pod_name = pod.metadata.name
+        # Surface the sibling pods so callers know a divergence exists — the
+        # ghost pod that motivated #744 was invisible to the operator until
+        # they cross-referenced ``check_component``. Names only; keep the
+        # payload small.
+        other_pods = [p.metadata.name for p in ranked[1:]]
+
+        try:
+            logs = await asyncio.to_thread(
+                _k8s_v1.read_namespaced_pod_log,
+                name=pod_name,
+                namespace=NAMESPACE,
+                tail_lines=tail_lines,
+                previous=previous,
+            )
+        except Exception as e:
+            log.warning(
+                "logs request: read failed",
+                extra={"component": component, "pod": pod_name, "previous": previous, "err": str(e)},
+            )
+            await msg.respond(
+                json.dumps(
+                    {
+                        "pod": pod_name,
+                        "component": component,
+                        "previous": previous,
+                        "error": f"failed to read logs: {e}",
+                        "other_pods": other_pods,
+                    }
+                ).encode()
+            )
+            return
+
+        logs = _redact_log_text(logs or "")
+        # NATS request/reply has a default 1MB cap; keep payloads bounded.
+        max_chars = 60_000
+        truncated = False
+        if len(logs) > max_chars:
+            logs = logs[-max_chars:]
+            truncated = True
+
+        await msg.respond(
+            json.dumps(
+                {
+                    "pod": pod_name,
+                    "component": component,
+                    "previous": previous,
+                    "tail_lines": tail_lines,
+                    "truncated": truncated,
+                    "logs": logs,
+                    "other_pods": other_pods,
+                }
+            ).encode()
+        )
+        log.info(
+            "Logs request served",
+            extra={
+                "component": component,
+                "pod": pod_name,
+                "previous": previous,
+                "tail_lines": tail_lines,
+                "chars": len(logs),
+                "truncated": truncated,
+                "other_pods": other_pods,
+            },
+        )
+    except Exception:
+        log.exception("Failed to serve logs request")
+        try:
+            await msg.respond(json.dumps({"error": "internal error"}).encode())
+        except Exception:
+            pass
 
 
 async def _site_query_handler(msg):
@@ -443,6 +874,11 @@ async def _site_query_handler(msg):
                 "turn_mode": _cortex_state["turn_mode"],
                 "turn_started": _cortex_state["turn_started"],
             },
+            # #754: same known/missing shape as the local state request so a
+            # remote immune's Claude can reason about a peer site's vanished
+            # components.
+            "known_components": _health_monitor.get_known_components() if _health_monitor else {},
+            "missing_components": _health_monitor.get_missing_components() if _health_monitor else {},
         }
         await msg.respond(json.dumps(state, default=str).encode())
         log.info("Site query served", extra={"components": len(_component_health)})
@@ -463,11 +899,18 @@ async def main():
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
-    _config_kv = await init_kv(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
-    _cortex_config_kv = await init_kv(_js, CORTEX_CONFIG_BUCKET)
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
-    _deploy_history_kv = await init_kv(_js, DEPLOY_HISTORY_BUCKET)
-    _state_kv = await init_kv(_js, STATE_BUCKET)
+    # init_kv_with_retry: cold-start KV bootstraps used to crash immune on a
+    # single ``nats.errors.TimeoutError`` from a JetStream API blip, wedging
+    # the health monitor + deploy pipeline for ≥5 min of CrashLoopBackOff on
+    # every transient hiccup (#758). ~60s of bounded retry per bucket covers
+    # 99% of blips; a genuinely dead NATS still surfaces to k8s on the final
+    # attempt. Each bucket retries independently — a slow first bucket does
+    # not steal budget from later ones.
+    _config_kv = await init_kv_with_retry(_js, CONFIG_BUCKET, defaults=DEFAULT_CONFIG)
+    _cortex_config_kv = await init_kv_with_retry(_js, CORTEX_CONFIG_BUCKET)
+    _lock_kv = await init_kv_with_retry(_js, LOCK_BUCKET)
+    _deploy_history_kv = await init_kv_with_retry(_js, DEPLOY_HISTORY_BUCKET)
+    _state_kv = await init_kv_with_retry(_js, STATE_BUCKET)
 
     # JetStream streams
     from nats.js.api import RetentionPolicy, StorageType
@@ -491,11 +934,12 @@ async def main():
 
     # Load persistent state
     await _load_recent_actions()
+    await _load_known_components()
 
     # Clone or pull the repo for local code access (read-only)
-    from maki_common.repo import init_repo
+    from maki_common.repo import clean_remote_url, init_repo
 
-    await init_repo(REPO_PATH, clone_url="https://github.com/adhityaravi/maki.git")
+    await init_repo(REPO_PATH, clone_url=clean_remote_url(REPO_OWNER, REPO_NAME))
 
     # K8s client
     try:
@@ -529,8 +973,13 @@ async def main():
     )
     log.info("Immune MCP tools registered")
 
-    # Initialize modules
-    deploy_mod.init(
+    # Construct the three subsystem instances (#102/#167). The reasoner is
+    # built before the health monitor so we can hand its bound
+    # ``escalate_to_claude`` method in as the monitor's escalation callback —
+    # explicit dependency injection instead of the old
+    # ``escalate_to_claude=claude_mod.escalate_to_claude`` global-lookup trick.
+    global _deploy_coordinator, _claude_reasoner, _health_monitor
+    _deploy_coordinator = ImmuneDeployCoordinator(
         nc=_nc,
         js=_js,
         k8s_v1=_k8s_v1,
@@ -543,15 +992,14 @@ async def main():
         recent_actions_max=RECENT_ACTIONS_MAX,
         deploy_history=_deploy_history,
         failed_image_blacklist=_failed_image_blacklist,
-        acquire_lock=_acquire_lock,
-        release_lock=_release_lock,
+        infra_lock=_infra_lock,
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
     )
-    await deploy_mod.load_deploy_history()
+    await _deploy_coordinator.load_deploy_history()
 
-    claude_mod.init(
+    _claude_reasoner = ImmuneClaudeReasoner(
         nc=_nc,
         namespace=NAMESPACE,
         instance_id=INSTANCE_ID,
@@ -560,6 +1008,7 @@ async def main():
         component_health=_component_health,
         pod_metrics=_pod_metrics,
         recent_actions=_recent_actions,
+        recent_actions_max=RECENT_ACTIONS_MAX,
         running_images=_running_images,
         hive_state=_hive_state,
         cortex_state=_cortex_state,
@@ -573,11 +1022,12 @@ async def main():
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         publish_immune_response=_publish_immune_response,
+        schedule_persist_recent_actions=_schedule_persist_recent_actions,
         k8s_v1=_k8s_v1,
         lock_kv=_lock_kv,
     )
 
-    health_mod.init(
+    _health_monitor = ImmuneHealthMonitor(
         nc=_nc,
         k8s_v1=_k8s_v1,
         k8s_apps_v1=_k8s_apps_v1,
@@ -599,12 +1049,13 @@ async def main():
         hive_state=_hive_state,
         failed_image_blacklist=_failed_image_blacklist,
         cortex_state=_cortex_state,
-        acquire_lock=_acquire_lock,
-        release_lock=_release_lock,
+        infra_lock=_infra_lock,
         publish_alert=_publish_alert,
         publish_vitals=_publish_vitals,
         schedule_persist_recent_actions=_schedule_persist_recent_actions,
-        escalate_to_claude=claude_mod.escalate_to_claude,
+        escalate_to_claude=_claude_reasoner.escalate_to_claude,
+        known_components=_known_components,
+        schedule_persist_known_components=_schedule_persist_known_components,
     )
 
     # Subscriptions
@@ -615,49 +1066,60 @@ async def main():
     await _nc.subscribe(site_query_subject, cb=_site_query_handler)
     log.info("Subscribed", extra={"subject": site_query_subject})
 
-    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_request_handler)
+    # Pod logs proxy for cortex / reflection loop (#252). Queue-grouped so any
+    # immune instance in the hive can answer — they all have the same RBAC and
+    # can read pods/log via the in-cluster ServiceAccount.
+    await _nc.subscribe(IMMUNE_LOGS_REQUEST, queue="maki-immune", cb=_logs_request_handler)
+    log.info("Subscribed", extra={"subject": IMMUNE_LOGS_REQUEST})
+
+    await _nc.subscribe(DEPLOY_REQUEST, queue="maki-immune", cb=_deploy_coordinator.deploy_request_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_REQUEST})
 
-    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=deploy_mod.deploy_status_handler)
+    await _nc.subscribe(DEPLOY_STATUS_REQUEST, queue="maki-immune", cb=_deploy_coordinator.deploy_status_handler)
     log.info("Subscribed", extra={"subject": DEPLOY_STATUS_REQUEST})
 
-    await _nc.subscribe(RESTART_REQUEST, queue="maki-immune", cb=deploy_mod.restart_request_handler)
+    await _nc.subscribe(RESTART_REQUEST, queue="maki-immune", cb=_deploy_coordinator.restart_request_handler)
     log.info("Subscribed", extra={"subject": RESTART_REQUEST})
 
-    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=claude_mod.cortex_stuck_handler)
+    await _nc.subscribe(CORTEX_STUCK, queue="maki-immune", cb=_claude_reasoner.cortex_stuck_handler)
     log.info("Subscribed", extra={"subject": CORTEX_STUCK})
 
-    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=claude_mod.handle_immune_command)
+    await _nc.subscribe(IMMUNE_COMMAND, queue="maki-immune", cb=_claude_reasoner.handle_immune_command)
     log.info("Subscribed", extra={"subject": IMMUNE_COMMAND})
 
     # Background tasks (tracked in ``_critical_listener_tasks`` so the
     # readiness probe flips red if any listener dies — see #175.)
-    _critical_listener_tasks["deploy_propagate"] = asyncio.create_task(
-        deploy_mod.deploy_propagate_listener(), name="deploy_propagate_listener"
+    # ``spawn_background`` also anchors each task against GC and logs any
+    # uncaught exception (issue #123).
+    _critical_listener_tasks["deploy_propagate"] = spawn_background(
+        _deploy_coordinator.deploy_propagate_listener(), name="deploy_propagate_listener"
     )
     log.info("Started JetStream propagation listener", extra={"subject": DEPLOY_PROPAGATE})
 
-    _critical_listener_tasks["restart_propagate"] = asyncio.create_task(
-        deploy_mod.restart_propagate_listener(), name="restart_propagate_listener"
+    _critical_listener_tasks["restart_propagate"] = spawn_background(
+        _deploy_coordinator.restart_propagate_listener(), name="restart_propagate_listener"
     )
     log.info("Started JetStream restart propagation listener", extra={"subject": RESTART_PROPAGATE})
 
-    _health_monitor_task = asyncio.create_task(health_mod.health_monitor_loop())
-    asyncio.create_task(claude_mod.immune_heartbeat_loop())
-    asyncio.create_task(claude_mod.passive_log_monitor_loop())
-    asyncio.create_task(claude_mod.loop_heartbeat_watcher())
+    _health_monitor_task = spawn_background(_health_monitor.health_monitor_loop(), name="immune.health_monitor_loop")
+    spawn_background(_claude_reasoner.immune_heartbeat_loop(), name="immune.heartbeat_loop")
+    spawn_background(_claude_reasoner.passive_log_monitor_loop(), name="immune.passive_log_monitor_loop")
+    spawn_background(_claude_reasoner.loop_heartbeat_watcher(), name="immune.loop_heartbeat_watcher")
     # Track these supervised listeners so the readiness probe can fail if any
     # of them dies — see ``_critical_listener_tasks`` and #175.
-    _critical_listener_tasks["cortex_heartbeat"] = asyncio.create_task(
-        health_mod.cortex_heartbeat_listener(), name="cortex_heartbeat_listener"
+    _critical_listener_tasks["cortex_heartbeat"] = spawn_background(
+        _health_monitor.cortex_heartbeat_listener(), name="cortex_heartbeat_listener"
     )
-    _critical_listener_tasks["token_usage"] = asyncio.create_task(
-        health_mod.token_usage_listener(), name="token_usage_listener"
+    _critical_listener_tasks["token_usage"] = spawn_background(
+        _health_monitor.token_usage_listener(), name="token_usage_listener"
     )
-    _critical_listener_tasks["gossip"] = asyncio.create_task(health_mod.gossip_listener(), name="gossip_listener")
-    asyncio.create_task(health_mod.gossip_publisher())
+    _critical_listener_tasks["gossip"] = spawn_background(_health_monitor.gossip_listener(), name="gossip_listener")
+    spawn_background(_health_monitor.gossip_publisher(), name="immune.gossip_publisher")
 
-    server = await tcp_health_server(port=HEALTH_PORT, check=_health_check)
+    server = await tcp_health_server(
+        port=HEALTH_PORT,
+        checks={"/live": _liveness_check, "/health": _readiness_check},
+    )
     log.info("Health server listening", extra={"port": HEALTH_PORT})
 
     await server.serve_forever()

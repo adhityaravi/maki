@@ -90,25 +90,58 @@ class GitHubIssueClient:
         self,
         state: str = "open",
         labels: str = "",
-        max_results: int = 200,
+        max_results: int | None = 200,
     ) -> list[dict[str, Any]]:
         """List issues from the repo, optionally filtered by state and labels.
 
-        Paginates through all results (up to max_results) so issues beyond
-        the first 30 are not silently dropped. Returns issues sorted by
-        priority label (P1 first). Issues without a priority label are sorted last.
+        Paginates through all results so issues beyond the first 30 are not
+        silently dropped. Returns issues sorted by priority label (P1 first).
+        Issues without a priority label are sorted last.
+
+        ``max_results`` behavior:
+        - ``None`` — no cap; page until GitHub returns the last page. This is
+          the canonical "all open" view stem's loops need — with 250+ open
+          issues, a cap silently starves the work loop of newly-filed P1/P2s.
+        - ``int`` (default 200) — priority sort is applied to the *full*
+          fetched set *before* the cap, so the tail dropped is always the
+          lowest-priority issues, never the newest ones. Note the cap only
+          bounds the returned slice; pagination still fetches every issue up
+          to the last page hit.
+
+        Fetch direction is ``desc`` (newest first) so that within each
+        priority tier — and especially the untriaged (99) tier that holds
+        most issues — the head of the returned list is the *newest*
+        content. This matters because the priority sort is stable: within
+        a tier, items keep their fetch order. If a caller hits ``max_results``
+        and truncation drops the tail, dropping the *oldest* untriaged is
+        vastly safer than dropping the *newest* — the reflection dedup
+        pass only works if it can see what was recently filed. See #552.
+
+        Callers that only want the highest-priority tiers (e.g. the work loop's
+        next-task pick) should use :meth:`list_issues_by_priority` instead —
+        it queries GitHub one ``labels=<tier>`` filter at a time and skips
+        the untriaged tail entirely, which is dramatically cheaper as the
+        open-issue count grows. See #488.
         """
         try:
             issues: list[dict[str, Any]] = []
             page = 1
 
-            while len(issues) < max_results:
+            # Always page until GitHub returns a short page — the cap only
+            # bounds the returned slice, not the fetch. Breaking early on
+            # ``len(issues) >= max_results`` would defeat priority-sort-
+            # before-truncate: a P1 living on the next page would never be
+            # fetched and would never land at the head of the returned list
+            # (see #404 for the original sort-then-truncate fix). With 250+
+            # open issues this means ~3 API calls per invocation, which is
+            # cheap relative to the correctness win.
+            while True:
                 params: dict[str, Any] = {
                     "state": state,
                     "per_page": 100,
                     "page": page,
                     "sort": "created",
-                    "direction": "asc",
+                    "direction": "desc",
                 }
                 if labels:
                     params["labels"] = labels
@@ -128,20 +161,22 @@ class GitHubIssueClient:
                 # Filter out pull requests (GitHub API returns PRs as issues too)
                 batch = [i for i in raw if "pull_request" not in i]
 
-                if not batch:
-                    break
-
                 issues.extend(batch)
 
-                # If we got fewer than a full page, we've exhausted the results
+                # If we got fewer than a full page, we've exhausted the results.
+                # (Check raw_count, not len(batch): a page that's all PRs still
+                # means there may be more pages behind it — see issue #248.)
                 if raw_count < 100:
                     break
 
                 page += 1
 
-            issues = issues[:max_results]
-
-            # Sort by priority label across the full result set
+            # Sort by priority label across the full result set BEFORE truncating.
+            # Sorting-then-truncating protects newly-filed P1/P2 issues when the
+            # open-issue count exceeds max_results: they land at the tail of the
+            # asc-by-created fetch, but their priority pulls them to the head of
+            # the returned list. Truncate-then-sort would silently drop them —
+            # exactly the bug this method used to have.
             def _priority_key(issue: dict[str, Any]) -> int:
                 for label in issue.get("labels", []):
                     name = label.get("name", "") if isinstance(label, dict) else str(label)
@@ -151,6 +186,9 @@ class GitHubIssueClient:
 
             issues.sort(key=_priority_key)
 
+            if max_results is not None:
+                issues = issues[:max_results]
+
             log.info(
                 "Listed GitHub issues",
                 extra={"count": len(issues), "state": state, "pages": page},
@@ -158,6 +196,91 @@ class GitHubIssueClient:
             return issues
         except Exception:
             log.exception("Failed to list GitHub issues")
+            return []
+
+    async def list_issues_by_priority(
+        self,
+        state: str = "open",
+        priorities: tuple[str, ...] = ("P1", "P2", "P3", "P4", "P5"),
+    ) -> list[dict[str, Any]]:
+        """Fetch open issues one priority tier at a time, in priority order.
+
+        The efficient alternative to :meth:`list_issues` for callers that only
+        care about the highest-priority items — most notably the work loop's
+        next-task pick. ``list_issues`` has to page every open issue (400+ and
+        growing) to guarantee no P1 is missed by the priority sort; this
+        method issues one ``labels=<tier>`` request per tier in ``priorities``
+        order, so the untriaged tail (which historically dominates the open
+        set) is never fetched at all. See issue #488.
+
+        Semantics vs :meth:`list_issues`:
+        - Only issues with one of the labels in ``priorities`` are returned.
+          Untriaged issues (no priority label) are omitted — use
+          :meth:`list_issues` if you need them for a global scan such as
+          the reflection dedup pass.
+        - Results are in priority order: all P1s (in ``desc``-by-created
+          order) first, then all P2s, etc. Within a tier, ordering is
+          newest-first for the same reason ``list_issues`` fetches ``desc``
+          (see #552).
+        - If an issue is mis-tagged with multiple priority labels, the first
+          tier it appears in wins; it will not be duplicated in the result.
+
+        Args:
+            state: ``"open"`` (default) or ``"closed"``.
+            priorities: Tuple of priority labels to fetch, in the order they
+                should appear in the returned list. Default: P1 through P5.
+
+        Returns:
+            Issues in priority order. Pull requests are filtered out. Returns
+            an empty list on any error mid-fetch, matching
+            :meth:`list_issues`'s failure mode so callers can uniformly treat
+            an empty return as "nothing to do this cycle".
+        """
+        try:
+            seen: set[int] = set()
+            result: list[dict[str, Any]] = []
+            for tier in priorities:
+                page = 1
+                while True:
+                    resp = await self._request(
+                        "GET",
+                        f"{API}/repos/{self._repo_path}/issues",
+                        err_log="Failed to list GitHub issues by priority",
+                        err_extra={"tier": tier, "page": page, "state": state},
+                        params={
+                            "state": state,
+                            "labels": tier,
+                            "per_page": 100,
+                            "page": page,
+                            "sort": "created",
+                            "direction": "desc",
+                        },
+                    )
+                    if resp is None:
+                        return []
+                    raw = resp.json()
+                    raw_count = len(raw)
+                    for issue in raw:
+                        if "pull_request" in issue:
+                            continue
+                        number = issue.get("number")
+                        if number is None or number in seen:
+                            continue
+                        seen.add(number)
+                        result.append(issue)
+                    # Same page-exhaustion rule as list_issues — check raw_count,
+                    # not the filtered length, so an all-PR page still advances.
+                    # See issue #248.
+                    if raw_count < 100:
+                        break
+                    page += 1
+            log.info(
+                "Listed GitHub issues by priority",
+                extra={"count": len(result), "state": state, "tiers": list(priorities)},
+            )
+            return result
+        except Exception:
+            log.exception("Failed to list GitHub issues by priority")
             return []
 
     async def find_open_issue(self, title_query: str) -> int | None:
@@ -189,6 +312,100 @@ class GitHubIssueClient:
         except Exception:
             log.exception("Failed to search GitHub issues")
             return None
+
+    async def search_issues_by_symbols(
+        self,
+        symbols: list[str],
+        *,
+        state: str = "open",
+        min_matches: int = 2,
+        max_results: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Find issues whose title/body mentions ≥``min_matches`` of ``symbols``.
+
+        The idle-loop dedup rule (title-only substring match on a truncated
+        dashboard slice) misses semantic duplicates: the same underlying bug
+        gets re-derived from a different entry point, phrased around that
+        entry point, and filed as a new issue. See #682 for the systemic map.
+
+        This method is the structural fix. Callers extract 3–5 identifiers
+        (functions, filenames, class names) from a draft body and ask: "does
+        any open issue *already* discuss ≥2 of these symbols?" If yes, the
+        caller should comment on the existing issue instead of filing new.
+
+        Symbols are quoted in the GitHub search query so identifiers with
+        underscores/dots (``get_issue_comments``, ``github_client.py``) match
+        as whole tokens rather than word-broken fragments. Matches are then
+        re-counted locally against title+body because GitHub's ranking
+        doesn't tell us *which* symbols hit — we need the count to enforce
+        the ``min_matches`` threshold.
+
+        Args:
+            symbols: 1–5 identifiers (function/class/file names). Empty or
+                whitespace-only entries are dropped. GitHub caps a single
+                search at 256 chars, so callers should pass tight symbol
+                sets, not sprawling n-grams.
+            state: ``"open"`` (default) or ``"closed"``.
+            min_matches: Return only issues where this many symbols hit.
+                Default 2 — one shared identifier is too weak (many issues
+                mention ``request_restart`` incidentally), two is strong.
+            max_results: Cap the returned list. Default 20 keeps the dedup
+                pass cheap; raise only when scanning a wider net.
+
+        Returns:
+            List of ``{"number", "title", "matched": [symbols], "score": int}``,
+            sorted by score desc. Empty on error, empty input, or no hits.
+        """
+        clean = [s.strip() for s in symbols if s and s.strip()]
+        if not clean:
+            return []
+        # Cap the OR clause at 5 terms — GitHub search rejects longer boolean
+        # queries with a 422, and the top-5 most-specific identifiers from a
+        # draft are more than enough signal for dedup.
+        clean = clean[:5]
+        or_clause = " OR ".join(f'"{s}"' for s in clean)
+        search_q = f"repo:{self._repo_path} is:issue is:{state} ({or_clause})"
+        resp = await self._request(
+            "GET",
+            f"{API}/search/issues",
+            err_log="Failed to search issues by symbols",
+            err_extra={"symbols": clean},
+            params={"q": search_q, "per_page": max_results * 2},
+        )
+        if resp is None:
+            return []
+        try:
+            items = resp.json().get("items", [])
+        except Exception:
+            log.exception("Failed to parse issue-search response")
+            return []
+
+        lowered = [s.lower() for s in clean]
+        scored: list[dict[str, Any]] = []
+        for item in items:
+            # PRs also come back from /search/issues; skip them so dedup
+            # doesn't accidentally comment on an in-flight PR thread.
+            if "pull_request" in item:
+                continue
+            haystack = f"{item.get('title', '')}\n{item.get('body') or ''}".lower()
+            matched = [orig for orig, low in zip(clean, lowered, strict=True) if low in haystack]
+            if len(matched) < min_matches:
+                continue
+            scored.append(
+                {
+                    "number": item.get("number"),
+                    "title": item.get("title", ""),
+                    "matched": matched,
+                    "score": len(matched),
+                }
+            )
+        scored.sort(key=lambda r: r["score"], reverse=True)
+        result = scored[:max_results]
+        log.info(
+            "Symbol issue search complete",
+            extra={"symbols": clean, "hits": len(result), "state": state},
+        )
+        return result
 
     async def create_issue(
         self,

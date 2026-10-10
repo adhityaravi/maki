@@ -1,3 +1,12 @@
+# Reference manifest — NOT the canonical cluster source of truth.
+# The actual cluster deployment is created by Terraform; see
+# infra/modules/maki-recall/main.tf. This file is kept as a more
+# readable side-by-side reference and as the spec the Terraform
+# module is expected to mirror. Drift between the two caused #263:
+# the standalone manifest had the #135/#176/#253 fixes; the Terraform
+# module did not, so the cluster ran the pre-fix shape with the
+# pre-fix image and crashlooped under transient dep outages.
+# When you change one, change the other.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

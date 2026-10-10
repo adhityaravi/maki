@@ -16,7 +16,6 @@ members = [
     "maki-common",
     "maki-cortex",
     "maki-ears",
-    "maki-finbert",
     "maki-immune",
     "maki-recall",
     "maki-stem",
@@ -1504,27 +1503,6 @@ dependencies = [
 requires-dist = [
     { name = "discord-py", specifier = ">=2.4" },
     { name = "maki-common", editable = "pkgs/maki-common" },
-]
-
-[[package]]
-name = "maki-finbert"
-version = "0.0.0"
-source = { editable = "pkgs/maki-finbert" }
-dependencies = [
-    { name = "fastapi" },
-    { name = "optimum", extra = ["onnxruntime"] },
-    { name = "pydantic" },
-    { name = "transformers" },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "optimum", extras = ["onnxruntime"], specifier = ">=1.24" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "transformers", specifier = ">=4.47" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
 [[package]]

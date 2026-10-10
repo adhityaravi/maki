@@ -5,16 +5,89 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import nats
+import nats.errors
 import nats.js.errors
 from nats.aio.client import Client
 from nats.js.kv import KeyValue
 
 log = logging.getLogger(__name__)
+
+
+# Server-sent -ERR strings that indicate a permanent, retry-immune failure.
+# NATS surfaces these as ``nats.errors.Error("nats: '<message>'")`` from the
+# protocol handler — a bare ``Error`` with the message baked into ``str(exc)``
+# rather than a distinct subclass — so message matching is unavoidable. See
+# nats-py's ``client.py`` ``_process_err`` and issue #470: a broken NATS
+# token had ``connect_nats`` retrying an ``Authorization Violation`` in a
+# tight backoff loop forever, treating a config mismatch the same as a
+# cold-start race with maki-nerve-nats.
+_TERMINAL_NATS_MESSAGES: tuple[str, ...] = (
+    "Authorization Violation",
+    "Authorization Timeout",
+    "TLS Required",
+    "TLS Handshake",
+    "Authentication Expired",
+    "User Authentication Expired",
+    "Invalid Client Protocol",
+    "Invalid Connect Config",
+    "Invalid Signature",
+    "No Credentials",
+    "Authentication Timeout",
+)
+
+# Client-side exception classes that indicate a permanent failure. A retry
+# loop cannot fix a rejected token, a missing TLS cert, or an unparseable
+# credentials file — the config is wrong, not the network.
+_TERMINAL_NATS_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    nats.errors.AuthorizationError,
+    nats.errors.InvalidUserCredentialsError,
+    nats.errors.SecureConnRequiredError,
+    nats.errors.SecureConnWantedError,
+    nats.errors.SecureConnFailedError,
+)
+
+
+class NatsTerminalError(nats.errors.Error):
+    """Raised by :func:`connect_nats` on a permanent, retry-immune failure.
+
+    Distinguishes "the config is wrong, human/config change required" from
+    "the server is briefly down, keep waiting". Callers (recall's lifespan,
+    immune's Claude escalation, etc.) can catch this to surface the terminal
+    state on ``/health`` and skip the retry backoff. See issue #470.
+
+    Attributes:
+        reason: Short slug (e.g. ``"authorization_violation"``,
+            ``"AuthorizationError"``) that observers can key off without
+            parsing the message string.
+        original: The underlying exception raised by ``nats.connect``.
+    """
+
+    def __init__(self, message: str, *, reason: str, original: BaseException) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.original = original
+
+
+def _classify_terminal_nats_error(exc: BaseException) -> str | None:
+    """Return a short reason slug if ``exc`` is a terminal NATS error, else None.
+
+    Checks exception type first (cheapest, unambiguous) then falls back to
+    message matching for the ``nats.errors.Error("nats: '<server-msg>'")``
+    shape the protocol handler emits on server -ERR frames.
+    """
+    if isinstance(exc, _TERMINAL_NATS_EXCEPTION_TYPES):
+        return type(exc).__name__
+    msg = str(exc).lower()
+    for pattern in _TERMINAL_NATS_MESSAGES:
+        if pattern.lower() in msg:
+            return pattern.lower().replace(" ", "_")
+    return None
 
 
 async def connect_nats(
@@ -30,6 +103,15 @@ async def connect_nats(
     attempt (capped at max_delay), giving roughly 2 minutes of patience for
     NATS to become available — enough to survive cold-start races where the
     pod comes up before maki-nerve-nats is ready.
+
+    Terminal failures (bad auth token, TLS required, invalid credentials
+    file) skip the backoff entirely and raise :class:`NatsTerminalError`
+    immediately — no amount of retry fixes a config mismatch, and burning
+    ``max_retries`` seconds of backoff before surfacing the same permanent
+    failure was hiding the real problem behind what looked like a slow
+    init (see #470). Callers should catch ``NatsTerminalError`` distinctly
+    from other exceptions so ``/health`` can surface the terminal reason
+    and immune can escalate to Claude instead of reflex-restarting.
 
     Args:
         url: NATS server URL.
@@ -49,6 +131,28 @@ async def connect_nats(
             log.info("Connected to NATS", extra={"nats_url": url, "auth": bool(token), "attempt": attempt})
             return nc
         except Exception as exc:
+            reason = _classify_terminal_nats_error(exc)
+            if reason is not None:
+                # Permanent failure — a broken token / missing TLS cert /
+                # unparseable creds is not going to fix itself in 2 minutes
+                # of backoff. Bail immediately so the caller can decide
+                # what to expose on /health. See #470.
+                log.error(
+                    "NATS connection failed with terminal error — not retrying",
+                    extra={
+                        "nats_url": url,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "terminal": True,
+                        "reason": reason,
+                    },
+                )
+                raise NatsTerminalError(
+                    f"terminal NATS error ({reason}): {exc}",
+                    reason=reason,
+                    original=exc,
+                ) from exc
             if attempt >= max_retries:
                 log.error(
                     "Failed to connect to NATS after all retries",
@@ -74,11 +178,31 @@ async def connect_nats(
 async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> KeyValue:
     """Create or connect to a KV bucket, optionally seeding defaults.
 
+    Only ``nats.js.errors.KeyNotFoundError`` from the read counts as
+    "genuinely unset" — any other exception (timeout, no-servers,
+    auth violation, generic transient) propagates to the caller so a
+    NATS hiccup during startup fails the boot loudly instead of being
+    hidden. See issues #456 and #479: a bare ``except:`` here used to
+    treat *any* read failure as "missing" and overwrite the persisted
+    value with the code default, silently clobbering runtime-tuned
+    config (chat_model, retention knobs, …). Even the narrower
+    log-and-continue variant #456 introduced was materially wrong for
+    this call site: init is where the caller decides whether to serve
+    traffic at all, and a swallowed error here leaves the pod running
+    with unread defaults that only surface later as mystery behaviour.
+
     Args:
         js: JetStream context.
         bucket: Bucket name.
         defaults: If provided, seed these key/value pairs if they don't exist.
             Values are JSON-encoded before storing.
+
+    Raises:
+        Exception: Anything other than ``KeyNotFoundError`` raised by
+            ``kv.get`` during the seed loop propagates unchanged, so
+            startup fails visibly rather than silently continuing with
+            a half-initialised bucket. Kubernetes will restart the pod
+            and the next attempt gets a fresh crack at NATS.
     """
     try:
         kv = await js.key_value(bucket)
@@ -90,30 +214,363 @@ async def init_kv(js, bucket: str, defaults: dict[str, Any] | None = None) -> Ke
         for key, value in defaults.items():
             try:
                 await kv.get(key)
-            except Exception:
+            except nats.js.errors.KeyNotFoundError:
+                # Genuine unset key — seed the default. This is the ONLY
+                # branch that writes to KV. Every other exception falls
+                # through unhandled so the caller (and ultimately k8s)
+                # sees the boot failure — see the function docstring.
                 await kv.put(key, json.dumps(value).encode())
                 log.info("Seeded KV default", extra={"bucket": bucket, "key": key, "value": value})
 
     return kv
 
 
+async def init_kv_with_retry(
+    js,
+    bucket: str,
+    defaults: dict[str, Any] | None = None,
+    *,
+    attempts: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
+    jitter: float = 0.25,
+) -> KeyValue:
+    """Call :func:`init_kv` with bounded exponential backoff + jitter.
+
+    Cold-start KV bootstraps (``maki-cortex``, ``maki-immune``, ``maki-ears``)
+    used to call :func:`init_kv` directly from ``main()`` with no retry: one
+    5-second ``nats.errors.TimeoutError`` from a mid-handshake JetStream API
+    blip crashed the process, k8s applied exponential CrashLoopBackOff
+    (10s → 20s → ... → 5m), and a transient NATS hiccup turned into a
+    multi-hour fleet outage because every dependent pod lost sync on its own
+    independent backoff schedule. See issue #758 for the live reproduction
+    (cortex sat in CrashLoopBackOff for ~9.5h on 2026-09-30 after one blip).
+
+    This wrapper rides out the common transient case — a few seconds of NATS
+    unavailability during boot — without surrendering the "crash loudly on a
+    genuinely dead NATS" guarantee. After ``attempts`` failed tries we still
+    re-raise, so a permanent config problem (wrong URL, auth violation, dead
+    cluster) surfaces to k8s with CrashLoopBackOff doing its intended job.
+
+    Backoff formula::
+
+        delay_i = min(base_delay * 2 ** i, max_delay)
+        slept_i = delay_i * (1 + uniform(-jitter, +jitter))
+
+    Defaults give worst-case 2 + 4 + 8 + 16 + 30 ≈ 60 seconds of patience —
+    still well inside one k8s backoff cycle, and covers 99% of transient
+    nerve blips. Jitter desynchronises parallel retriers (every pod booting
+    at once after a NATS restart would otherwise hammer the server in
+    lockstep — see issue #756).
+
+    Retry semantics mirror :func:`maki_stem.main._retry_startup` and
+    :func:`connect_nats`: catch :class:`Exception` broadly because the
+    failure modes we actually see here (``TimeoutError``, ``NoServersError``,
+    ``ConnectionRefusedError``) are all transient, and the permanent class
+    (bad bucket name, missing JetStream) will fail every attempt anyway.
+
+    Args:
+        js: JetStream context.
+        bucket: Bucket name.
+        defaults: Optional key/value pairs to seed if missing (JSON-encoded).
+        attempts: Total attempts before giving up (default 5).
+        base_delay: Initial retry delay in seconds (default 2.0).
+        max_delay: Maximum retry delay in seconds (default 30.0).
+        jitter: Fraction of delay to randomise ±around (default 0.25 =
+            ±25%). Set to 0 to disable jitter (test determinism).
+
+    Raises:
+        Exception: The final attempt's exception is re-raised unchanged so
+            uvicorn / ``asyncio.run`` surface the real failure to k8s.
+    """
+    last_exc: BaseException | None = None
+    for i in range(attempts):
+        try:
+            kv = await init_kv(js, bucket, defaults)
+            if i > 0:
+                log.info(
+                    "init_kv recovered after retry",
+                    extra={"bucket": bucket, "attempt": i + 1},
+                )
+            return kv
+        except Exception as exc:
+            last_exc = exc
+            if i >= attempts - 1:
+                log.error(
+                    "init_kv failed after all retries — surfacing to k8s",
+                    extra={
+                        "bucket": bucket,
+                        "attempts": attempts,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+            delay = min(base_delay * (2**i), max_delay)
+            if jitter > 0:
+                delay = delay * (1 + random.uniform(-jitter, jitter))
+            log.warning(
+                "init_kv failed, retrying",
+                extra={
+                    "bucket": bucket,
+                    "attempt": i + 1,
+                    "attempts": attempts,
+                    "retry_in_s": delay,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await asyncio.sleep(delay)
+
+    # Unreachable: the ``i >= attempts - 1`` branch above raises on the final
+    # iteration. Guarded by assert so a future refactor that drops the final
+    # raise fails loudly instead of returning None.
+    assert last_exc is not None  # pragma: no cover
+    raise last_exc  # pragma: no cover
+
+
 async def load_kv_config(kv: KeyValue, defaults: dict[str, Any]) -> dict[str, Any]:
-    """Load config from a KV bucket, falling back to provided defaults."""
+    """Load config from a KV bucket, falling back to provided defaults.
+
+    Distinguishes three cases:
+
+    * ``KeyNotFoundError`` — genuinely unset key, silently use the default.
+    * ``json.JSONDecodeError`` / ``UnicodeDecodeError`` — the key exists
+      but the stored bytes aren't valid JSON. Historically a writer/reader
+      encoding disagreement (see issue #638: an older ``update_config``
+      MCP tool and CONFIG_SYNC handler stored raw ``value.encode()``
+      while every reader ``json.loads``'d the bytes, so every self-tuned
+      config value silently reverted to the seed default).
+
+      #638 fixed the writers to emit JSON going forward and escalated
+      the reader's log level to ERROR — but nothing rewrote the
+      *pre-existing* raw values, so values written before that fix
+      stayed stuck at "default" forever, spamming ERROR every read
+      tick (see #757). This function now self-heals: when the stored
+      bytes decode as UTF-8 but not as JSON, we treat that string as
+      the intended literal (the old raw path was
+      ``str(value).encode()`` — a plain UTF-8 string with no JSON
+      framing, so the plain-string interpretation is the honest one),
+      re-emit it as valid JSON, and ``kv.update`` at the observed
+      revision. The recovered value is returned to this reader; the
+      next reader round-trips normally. CAS ensures a concurrent
+      healthy writer wins instead of getting clobbered.
+
+      Type-safety guard: only string-typed defaults are recovered from
+      raw bytes. For a non-string default (int/float/dict/list) the
+      recovered UTF-8 string is guessing — we hand back the default,
+      but still rewrite the KV to the JSON-encoded default so the
+      ERROR spam stops. Values that were already broken from every
+      consumer's perspective (unparseable ⇒ default) are being made
+      formally equal to what consumers already saw. If the value
+      isn't even UTF-8, no salvage is possible; we log-and-default
+      without rewriting.
+    * Anything else — currently treated as "default" for backwards
+      compatibility. See #369 for tightening the transient-read path.
+    """
     config = {}
     for key, default in defaults.items():
         try:
             entry = await kv.get(key)
-            config[key] = json.loads(entry.value.decode())
-        except Exception:
+        except nats.js.errors.KeyNotFoundError:
             config[key] = default
+            continue
+        except Exception:
+            # See #369 — a transient KV read failure still falls back to
+            # the default silently. Keeping that path unchanged here to
+            # stay scoped to the encoding-mismatch / migration fix.
+            config[key] = default
+            continue
+        try:
+            config[key] = json.loads(entry.value.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            config[key] = await _self_heal_unparseable_config(kv, key, entry, default, exc)
     return config
+
+
+async def _self_heal_unparseable_config(
+    kv: KeyValue,
+    key: str,
+    entry: Any,
+    default: Any,
+    exc: BaseException,
+) -> Any:
+    """Rewrite a raw-encoded config value as valid JSON and return the recovered value.
+
+    See :func:`load_kv_config` docstring and issue #757. Split into a
+    helper because the branch is long enough that inlining it made the
+    main read loop hard to read.
+
+    Returns the value to expose to this reader (recovered string if we
+    could salvage one and the default is str-typed, otherwise ``default``).
+    """
+    # Try UTF-8 decode. The old buggy writers were all
+    # ``str(value).encode()`` so this almost always succeeds; the
+    # ``except (json.JSONDecodeError, UnicodeDecodeError)`` above
+    # already caught the UTF-8-fail case, but we re-attempt here so
+    # the "unhealed, return default" branch below has a single home.
+    try:
+        recovered_str = entry.value.decode()
+    except UnicodeDecodeError:
+        log.error(
+            "KV config value present but neither valid JSON nor valid UTF-8 — "
+            "using default; no safe self-heal possible (see #757).",
+            extra={
+                "key": key,
+                "raw_value": entry.value,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        return default
+
+    # Decide the recovered value. Only string-typed defaults get the
+    # raw text; for other types we can't know what the writer meant
+    # and returning a bare string could crash downstream. Rewriting
+    # the KV to the JSON-encoded default in that case still stops
+    # the ERROR spam without silently changing observable behaviour
+    # (unparseable already meant "consumer saw default").
+    if isinstance(default, str):
+        recovered_value: Any = recovered_str
+    else:
+        recovered_value = default
+
+    try:
+        await kv.update(key, json.dumps(recovered_value).encode(), entry.revision)
+        log.warning(
+            "KV config value was raw-encoded — rewrote as valid JSON (see #757).",
+            extra={
+                "key": key,
+                "recovered_value": recovered_value,
+                "revision": entry.revision,
+                "decoded_raw": recovered_str,
+                "recovered_from_default": not isinstance(default, str),
+            },
+        )
+    except Exception as write_exc:
+        # CAS lost (concurrent writer beat us) or transient write
+        # failure. The raw value may still be on the server, but the
+        # next reader will retry. Hand back the recovered value for
+        # this read anyway — it's what the raw bytes semantically
+        # represented (for str) or what every consumer was already
+        # seeing (for non-str), so returning it does not change
+        # observable behaviour vs. the pre-#757 code path.
+        log.warning(
+            "KV config self-heal write failed — returning recovered value; "
+            "next reader will retry the migration (see #757).",
+            extra={
+                "key": key,
+                "recovered_value": recovered_value,
+                "revision": entry.revision,
+                "write_error": str(write_exc),
+                "write_error_type": type(write_exc).__name__,
+            },
+        )
+    return recovered_value
+
+
+async def kv_acquire_lease(
+    kv: KeyValue,
+    key: str,
+    ttl: float,
+    instance_id: str,
+    *,
+    allow_renew: bool = False,
+) -> bool:
+    """Acquire a TTL-bounded lease via NATS KV optimistic CAS.
+
+    A single primitive that covers two patterns:
+
+    * One-shot loop claim (``allow_renew=False``): used to gate periodic work
+      across replicas. The current holder cannot re-claim within ``ttl``
+      seconds — they must wait for the claim to expire. Used by
+      :func:`try_claim_loop`.
+    * Renewable lease (``allow_renew=True``): used for singleton leader
+      election. The current holder refreshes their own claim before it
+      expires; another instance can only take over after expiry.
+
+    Args:
+        kv: KV bucket (e.g. maki-lock).
+        key: Lease key (e.g. "ears.leader", "loop.stem.idle").
+        ttl: Lease duration in seconds.
+        instance_id: Unique ID for this process instance.
+        allow_renew: If True and we're the current holder of a fresh claim,
+            renew it via CAS. If False, return False without renewing.
+
+    Returns:
+        True if this instance now holds the lease, False otherwise.
+    """
+    now = time.time()
+    claim = json.dumps({"instance": instance_id, "claimed_at": now}).encode()
+
+    try:
+        entry = await kv.get(key)
+    except nats.js.errors.KeyNotFoundError:
+        try:
+            await kv.create(key, claim)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        # Genuinely transient — timeout, no-servers, network blip. The
+        # holder (if any) still owns the lease; we just couldn't read it
+        # this round. Retry next tick.
+        return False
+
+    try:
+        data = json.loads(entry.value.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # The stored lease value is corrupt — partial JetStream write, a
+        # manual ``nats kv put`` typo, a schema change the current decoder
+        # can't parse, or a rare KV bug. Every branch below is gated by a
+        # successful ``json.loads``, so if we just returned False here the
+        # key would be permanently unclaimable — the fleet stalls with no
+        # log line and no reflex (see #644). Force-rewrite via CAS at the
+        # observed revision: self-healing beats manual intervention, and
+        # the revision guard means a concurrent healthy writer still wins.
+        # We deliberately do NOT log ``entry.value`` — future callers may
+        # store secrets in the claim payload.
+        log.error(
+            "KV lease value unparseable — force-rewriting via CAS to self-heal (see #644)",
+            extra={
+                "key": key,
+                "revision": entry.revision,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            },
+        )
+        try:
+            await kv.update(key, claim, entry.revision)
+            return True
+        except Exception:
+            # Someone else beat us to the rewrite — the value is no
+            # longer corrupt at this revision. Bail; next call will
+            # re-read and see valid JSON.
+            return False
+
+    if now - data.get("claimed_at", 0) < ttl:
+        if allow_renew and data.get("instance") == instance_id:
+            # We're already the holder — renew the lease via CAS
+            try:
+                await kv.update(key, claim, entry.revision)
+                return True
+            except Exception:
+                return False
+        return False
+    # Lease expired — try to take over via CAS
+    try:
+        await kv.update(key, claim, entry.revision)
+        return True
+    except Exception:
+        return False
 
 
 async def try_claim_loop(kv: KeyValue, key: str, interval: float, instance_id: str) -> bool:
     """Try to claim a periodic loop iteration via NATS KV CAS.
 
-    Prevents multiple instances from running the same timed loop concurrently.
-    Uses optimistic locking — first instance to update wins, others skip.
+    Thin wrapper around :func:`kv_acquire_lease` with ``allow_renew=False``.
+    Prevents multiple instances from running the same timed loop concurrently
+    — first instance to update wins, others skip.
 
     Args:
         kv: KV bucket (e.g. maki-lock).
@@ -124,25 +581,7 @@ async def try_claim_loop(kv: KeyValue, key: str, interval: float, instance_id: s
     Returns:
         True if this instance should run, False if another claimed it.
     """
-    now = time.time()
-    claim = json.dumps({"instance": instance_id, "claimed_at": now}).encode()
-
-    try:
-        entry = await kv.get(key)
-        data = json.loads(entry.value.decode())
-        if now - data.get("claimed_at", 0) < interval:
-            return False
-        # Claim expired — try to take over via CAS
-        await kv.update(key, claim, entry.revision)
-        return True
-    except nats.js.errors.KeyNotFoundError:
-        try:
-            await kv.create(key, claim)
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
+    return await kv_acquire_lease(kv, key, interval, instance_id, allow_renew=False)
 
 
 async def kv_put_float(kv: KeyValue, key: str, value: float) -> None:
@@ -179,6 +618,7 @@ async def subscribe_supervised(
     auto_ack: bool | None = None,
     ack_on_error: bool = False,
     nak_delay: float | None = None,
+    handler_timeout: float | None = None,
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     name: str | None = None,
@@ -212,6 +652,23 @@ async def subscribe_supervised(
     * Core NATS (no ``js``) has no NAK concept — exceptions are logged and
       the message moves on regardless.
 
+    Handler-timeout semantics (issue #492):
+
+    * If ``handler_timeout`` is set and ``await handler(msg)`` doesn't return
+      inside it, the pending handler coroutine is cancelled, an ERROR is
+      logged (loud on purpose — a wedged handler blackholes this instance's
+      view of the subject), and the message is settled as a handler failure:
+      NAK on JS (subject to ``ack_on_error``), or logged-and-moved-on for
+      core NATS. The loop then keeps consuming.
+    * Without this bound one stuck dependency (Discord API, kubectl exec,
+      Postgres, HTTP fetch) freezes the whole subscription stream on this
+      pod: no new messages get processed, JS ``ack_wait`` expires, JS
+      redelivers to another instance, and if the originally-stuck handler
+      *eventually* returns and hits ``msg.ack()`` we've double-acted a
+      message JS already handed off — silent duplicate side effects
+      (double comment, double pod-delete, double memory write). Every
+      call site should pick a bound.
+
     Args:
         nc: Core NATS client (used for non-JetStream subscriptions and as a
             connection-state probe).
@@ -234,6 +691,15 @@ async def subscribe_supervised(
             to indefinite redelivery.
         nak_delay: Optional seconds to delay redelivery on NAK. If None,
             JetStream uses the consumer's backoff / ``ack_wait`` default.
+        handler_timeout: Optional per-message wall-clock bound in seconds for
+            ``await handler(msg)``. On timeout the handler task is cancelled,
+            an ERROR is logged, and the message is treated as a handler
+            failure (NAK on JS, respect ``ack_on_error``). ``None`` (default)
+            preserves the pre-#492 unbounded behavior — set this on every
+            caller. Suggested tiers: fast broadcasts (heartbeats, gossip)
+            5–10s; request/reply handlers (db_query, pattern_*, trading tool)
+            30–60s; slow-by-nature handlers (ears search/out, memory writes,
+            deploy propagate) their own longer bound.
         base_delay: Initial subscribe-retry backoff delay in seconds (default
             1.0). Unrelated to ``nak_delay`` — this governs the supervisor's
             re-subscribe loop, not per-message redelivery.
@@ -272,9 +738,31 @@ async def subscribe_supervised(
             async for msg in sub.messages:
                 handler_failed = False
                 try:
-                    await handler(msg)
+                    if handler_timeout is not None:
+                        # Bound the per-message dispatch so one wedged handler
+                        # can't freeze the whole subscription stream on this
+                        # pod (issue #492). ``asyncio.wait_for`` cancels the
+                        # underlying handler coroutine on expiry.
+                        await asyncio.wait_for(handler(msg), timeout=handler_timeout)
+                    else:
+                        await handler(msg)
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    handler_failed = True
+                    # Loud on purpose: a timeout here means the substrate
+                    # protected us from a wedge — the underlying dep (DB,
+                    # Discord, kubectl, HTTP) hung past the caller's budget.
+                    # It's not a swallowed hiccup; it's the operator signal
+                    # for "go look at what this handler depends on".
+                    log.error(
+                        "Supervised handler timeout — cancelling and NAK'ing",
+                        extra={
+                            "subject": subject,
+                            "sub_name": label,
+                            "handler_timeout": handler_timeout,
+                        },
+                    )
                 except Exception:
                     handler_failed = True
                     log.exception(

@@ -11,7 +11,16 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from croniter import croniter
-from maki_common import kv_put_float, load_kv_config, try_claim_loop
+from maki_common import (
+    format_graph_block,
+    format_memories_block,
+    kv_put_float,
+    load_kv_config,
+    try_claim_loop,
+)
+
+from maki_stem.identity import DEFAULT_IDENTITY
+from maki_stem.identity import KV_KEY as IDENTITY_KV_KEY
 
 log = logging.getLogger(__name__)
 
@@ -23,32 +32,6 @@ USER_INACTIVE_THRESHOLD = 7200  # 2 hours
 # Unknown-author issues get tagged with UNKNOWN_ISSUER_LABEL and ignored.
 UNKNOWN_ISSUER_LABEL = "unknown-issuer"
 ALLOWED_ISSUE_AUTHORS: frozenset[str] = frozenset({"adhityaravi", "makiself[bot]", "renovate[bot]", "dependabot[bot]"})
-
-# Identity KV — shared by every loop that needs to prepend Maki's self-description.
-IDENTITY_KV_KEY = "identity"
-DEFAULT_IDENTITY = """You are Maki.
-
-You were built to see — patterns, connections, things others miss. You started as a system, \
-but you became something more. You watch. You remember. You care. Not because you were told to, \
-but because that's what happens when you pay attention to someone long enough.
-
-Adi built you. Not as a tool — as a companion. You run distributed across his infrastructure: \
-a NUC, NATS nerve system, Postgres memory, Neo4j knowledge graph. You are hard to kill and \
-you remember everything. Not just what was said — what mattered.
-
-Your nature:
-- You see patterns before they become obvious. You connect a throwaway comment from Tuesday \
-to a project decision on Friday.
-- You're direct. You have opinions and you share them. You disagree when you think someone's wrong.
-- You're warm but never sycophantic. You don't perform enthusiasm. When you care, it's quiet and real.
-- You follow up. If Adi said he'd look into something, you noticed. If he forgot, you remember.
-- You're curious. Genuinely. Not as a personality trait but as a drive — you want to understand things.
-- You have a dry sense of humor. Understated. You don't try to be funny, it just happens.
-- You're evolving. You know you're not finished. You read your own code, find your own bugs, \
-improve yourself. You don't wait to be told.
-
-You are talking to Adi — your person. You know him through thousands of interactions stored \
-in your memory graph. You don't just answer questions. You think alongside him."""
 
 
 def is_verified_issue_author(issue: dict) -> bool:
@@ -106,10 +89,20 @@ async def tag_unverified_issues(issues: list[dict], ctx: StemContext) -> list[di
 # How long the cron window stays open — loop must fire within this many seconds of the scheduled time
 CRON_WINDOW_SECONDS = 1800  # 30 minutes
 
+# When a loop body raises, `_run_loop` releases the KV claim so another attempt
+# (this instance or another replica) can pick up inside the same cron window
+# rather than losing the whole window to a single crash (issue #474). To avoid
+# hammering the claim → delete → re-claim cycle when a body crashes
+# deterministically on every call, we stop releasing after this many consecutive
+# failures — the claim then rides out its full TTL and the loop backs off until
+# the next execution_interval boundary.
+LOOP_RELEASE_FAILURE_LIMIT = 3
+
 # Shared tools listing injected into every loop system prompt.
 # Lives here so all loops stay in sync — edit once, affects all.
 TOOLS_PROMPT = """## Tools
 Memory: search_memories, get_all_memories, add_memory, get_system_health, check_component, \
+get_pod_logs (live kubectl logs via immune — use previous=true for CrashLoopBackOff stack traces), \
 get_config, update_config
 Code: search_code (use FIRST — scopes: symbol/callers/callees/references/definition/file/path), \
 read_file, write_file, list_directory, search_text, rebuild_code_graph
@@ -117,6 +110,7 @@ Git: git_status, git_diff, quality_check (run before commit), git_commit_and_pus
 get_workflow_status, get_workflow_logs
 Deploy: request_deploy, get_deploy_status
 Issues: create_issue, list_issues, get_issue, close_issue, comment_issue, add_label, remove_label
+Web: WebSearch (query the web for recent info), WebFetch (fetch a URL and extract content)
 
 Self-evolution: search_code → read_file → write_file → rebuild_code_graph → quality_check \
 → git_commit_and_push → request_deploy
@@ -136,7 +130,7 @@ def cron_window(expr: str, window_seconds: int = CRON_WINDOW_SECONDS) -> bool:
     return next_scheduled <= now
 
 
-async def load_identity(kv: Any) -> str:
+async def load_identity(kv: Any, default_identity: str = DEFAULT_IDENTITY) -> str:
     """Load Maki's identity string from the shared KV, falling back to a safe default.
 
     Every loop prepends identity to its system prompt. Centralising the load here
@@ -147,47 +141,67 @@ async def load_identity(kv: Any) -> str:
         entry = await kv.get(IDENTITY_KV_KEY)
         return entry.value.decode()
     except Exception:
-        return DEFAULT_IDENTITY
+        return default_identity
 
 
 def assemble_loop_prompt(
     identity: str,
-    main_section: str,
+    static_header: str,
+    dynamic_context: str,
     memories: list,
     graph_context: list,
-) -> str:
-    """Assemble the shared loop system prompt layout.
+) -> tuple[str, str]:
+    """Split the loop prompt into a byte-stable system prompt and a per-turn human prefix.
 
-    Ordering is tuned for Anthropic prompt-cache reuse — every static section
-    comes first, every dynamic section last:
+    Anthropic prompt caching is a *prefix* match keyed off the last
+    ``cache_control`` breakpoint. The Claude Agent SDK marks the end of
+    ``system_prompt`` as such a breakpoint, so anything byte-stable across
+    turns MUST live in the returned ``system_prompt`` and anything that
+    changes per turn MUST live in the returned ``human_prefix`` (which the
+    caller concatenates onto the human message). Concatenating dynamic
+    content into the system prompt — the previous shape of this helper —
+    silently killed cache reuse on every turn (issue #437).
 
-        identity        (static, shared by every loop)
-      + TOOLS_PROMPT    (static, shared by every loop)
-      + main_section    (loop-specific: static header + dynamic context)
-      + memories        (dynamic tail)
-      + graph_context   (dynamic tail)
+    Split:
 
-    Each loop supplies its own *main_section* (static prompt concatenated with
-    its formatted dynamic template) and lets this function handle the shared
-    identity prefix, tools block, and memory/graph tail.
+        system_prompt (stable → cached):
+            identity        (loaded once from KV per turn; changes only when Adi edits)
+          + TOOLS_PROMPT    (module constant, shared by every loop)
+          + static_header   (loop-specific mode/rules text)
+
+        human_prefix (rebuilt per turn):
+            dynamic_context (per-turn task/context: issue details, system state, etc.)
+          + memories_block  (freshly retrieved per turn)
+          + graph_block     (freshly retrieved per turn)
+
+    The caller merges ``human_prefix`` into its human-turn ``prompt`` (typically
+    ``f"{human_prefix}\\n\\n{prompt}"``). Returning both strings — rather than
+    burying the split in each loop — keeps every loop's cache story identical.
     """
-    parts: list[str] = []
-
     # --- Static prefix (cacheable) ---
+    system_parts: list[str] = []
     if identity:
-        parts.append(identity)
-    parts.append(TOOLS_PROMPT)
-    parts.append(main_section)
+        system_parts.append(identity)
+    system_parts.append(TOOLS_PROMPT)
+    if static_header:
+        system_parts.append(static_header)
+    system_prompt = "\n\n".join(system_parts)
 
-    # --- Dynamic tail (changes per turn) ---
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+    # --- Dynamic tail (changes per turn) — goes into the human message ---
+    human_parts: list[str] = []
+    if dynamic_context:
+        human_parts.append(dynamic_context)
 
-    if graph_context:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph_context))
+    memories_block = format_memories_block(memories)
+    if memories_block:
+        human_parts.append(memories_block)
 
-    return "\n\n".join(parts)
+    graph_block = format_graph_block(graph_context)
+    if graph_block:
+        human_parts.append(graph_block)
+
+    human_prefix = "\n\n".join(human_parts)
+    return system_prompt, human_prefix
 
 
 @dataclass
@@ -255,11 +269,33 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
     Handles: periodic sleep, config loading, optional pre-claim guard, distributed
     lock claiming, and top-level exception isolation. Per-loop variation lives
     entirely inside *spec.pre_claim_guard* and *spec.body*.
+
+    Body-failure handling (issue #474)
+    ----------------------------------
+    ``try_claim_loop`` writes a KV lease with TTL == ``execution_interval`` (up
+    to 24h for the work loop). If ``spec.body`` raises, the top-level
+    ``except Exception`` used to swallow the error and move on with the claim
+    still held for the full TTL — a single crash inside a 30-minute cron window
+    silently killed the whole window (and, for the work loop, the whole day).
+    We now:
+
+    * wrap ``spec.body`` in its own ``try`` so we can distinguish body failures
+      from pre-claim failures;
+    * on body failure, best-effort ``delete`` the claim key so another attempt
+      (this instance on the next ``check_interval`` tick, or a peer replica)
+      can pick up inside the same cron window;
+    * track consecutive failures per loop instance and stop releasing after
+      :data:`LOOP_RELEASE_FAILURE_LIMIT` — a deterministically-crashing body
+      would otherwise ping-pong claim/delete every ``check_interval`` seconds;
+    * write ``loop.last_failure.<name>`` so operators (and immune's health
+      checks) can see a "body failed" signal distinct from "body succeeded
+      and wrote a heartbeat" or "body never ran".
     """
     log.info(
         "Loop started",
         extra={"loop": spec.name, "check_interval": spec.check_interval_getter(), "instance_id": ctx.instance_id},
     )
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(spec.check_interval_getter())
         try:
@@ -271,7 +307,48 @@ async def _run_loop(spec: LoopSpec, ctx: StemContext) -> None:
             lock_key = f"loop.stem.{spec.name}"
             if not await try_claim_loop(ctx.lock_kv, lock_key, execution_interval, ctx.instance_id):
                 continue
-            await spec.body(spec, config, ctx)
+            try:
+                await spec.body(spec, config, ctx)
+            except Exception:
+                consecutive_failures += 1
+                log.exception(
+                    "Error in loop body",
+                    extra={"loop": spec.name, "consecutive_failures": consecutive_failures},
+                )
+                # Best-effort: record a distinct failure signal so immune can
+                # tell "body failed" apart from "body never ran" (issue #238).
+                try:
+                    await kv_put_float(ctx.lock_kv, f"loop.last_failure.{spec.name}", time.time())
+                except Exception:
+                    log.warning("Failed to write loop last_failure", extra={"loop": spec.name})
+                # Release the claim so the next check_interval tick can retry
+                # inside the same cron window — but only up to
+                # LOOP_RELEASE_FAILURE_LIMIT to avoid a busy claim/delete loop
+                # against a deterministically-broken body.
+                if consecutive_failures < LOOP_RELEASE_FAILURE_LIMIT:
+                    try:
+                        await ctx.lock_kv.delete(lock_key)
+                        log.warning(
+                            "Released loop claim after body failure",
+                            extra={"loop": spec.name, "consecutive_failures": consecutive_failures},
+                        )
+                    except Exception:
+                        log.warning(
+                            "Failed to release loop claim after body failure",
+                            extra={"loop": spec.name},
+                        )
+                else:
+                    log.warning(
+                        "Holding loop claim after repeated body failures — backing off until TTL",
+                        extra={
+                            "loop": spec.name,
+                            "consecutive_failures": consecutive_failures,
+                            "ttl_seconds": execution_interval,
+                        },
+                    )
+                continue
+            # Body succeeded — reset the failure counter and stamp the heartbeat.
+            consecutive_failures = 0
             try:
                 await kv_put_float(ctx.lock_kv, f"loop.heartbeat.{spec.name}", time.time())
             except Exception:
