@@ -9,12 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from maki_common.repo import RepoEntry, RepoRegistry, redact_token
+from maki_common.repo import (
+    GIT_LOCAL_TIMEOUT_S,
+    RepoEntry,
+    RepoRegistry,
+    _auth_config_args,
+    _communicate_with_timeout,
+    _git_op_timeout,
+    redact_token,
+    set_origin,
+)
 from maki_common.tools.utils import mcp_result
 
 log = logging.getLogger(__name__)
@@ -23,40 +33,324 @@ MAX_READ_LINES = 500
 MAX_SEARCH_RESULTS = 30
 
 
+# ---------------------------------------------------------------------------
+# git_run — read-only allowlist (#639).
+#
+# The MCP `git_run` tool used to accept ANY git subcommand: an LLM turn could
+# call `git_run(command="push --force origin main")`, `reset --hard`,
+# `remote set-url origin https://attacker/…`, `checkout -f`, `clean -fdx`, or
+# `branch -D main`. The reflection prompt says "don't do that" — a soft
+# guardrail on the model, not the tool. Prompt injection through issue bodies
+# (#316), tool results, or Discord input can bypass it. The tool has to
+# enforce this itself.
+#
+# The docstring already advertised `git_run` as "useful for read-mostly
+# operations". We now match implementation to contract: subcommands the model
+# might legitimately want for inspection are on `_GIT_READ_ONLY_SUBCOMMANDS`,
+# and per-subcommand argument bans strip out the flags that turn a "read"
+# into a mutation (e.g. `branch -D`, `reflog delete`, `diff --output=/tmp/x`).
+# Anything else — including `push`, `reset`, `remote`, `config`, `checkout`,
+# `clean`, `stash`, `rebase`, `merge`, `commit` — is refused with a message
+# pointing at `git_commit_and_push` for legitimate writes.
+# ---------------------------------------------------------------------------
+
+_GIT_READ_ONLY_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "log",
+        "show",
+        "diff",
+        "blame",
+        "status",
+        "branch",
+        "tag",
+        "rev-parse",
+        "rev-list",
+        "describe",
+        "ls-files",
+        "ls-tree",
+        "cat-file",
+        "shortlog",
+        "reflog",
+        "for-each-ref",
+        "name-rev",
+        "grep",
+    }
+)
+
+# Per-subcommand bans: even inside an "allowed" verb, certain flags/subverbs
+# escalate a read into a mutation. Matched against each arg after the
+# subcommand; both bare form (`--delete`) and `key=value` form
+# (`--output=/tmp/x`) hit because we split on `=` before comparing.
+_GIT_READ_ONLY_ARG_BANS: dict[str, frozenset[str]] = {
+    # `git branch` LISTS with no args (or `-a`, `-r`, `--list`, `--contains`,
+    # `-v`, `--merged`, `--no-merged` etc). It DELETES / RENAMES / FORCES /
+    # sets upstream with the flags below — all of which mutate refs.
+    "branch": frozenset(
+        {
+            "-d",
+            "-D",
+            "--delete",
+            "-m",
+            "-M",
+            "--move",
+            "-c",
+            "-C",
+            "--copy",
+            "-f",
+            "--force",
+            "--edit-description",
+            "--set-upstream",
+            "--set-upstream-to",
+            "--unset-upstream",
+            "--track",
+            "--no-track",
+            "--create-reflog",
+        }
+    ),
+    # `git tag` LISTS with `-l` / no args; the flags below create, delete,
+    # sign, or force-move a tag — all writes.
+    "tag": frozenset(
+        {
+            "-d",
+            "-D",
+            "--delete",
+            "-f",
+            "--force",
+            "-a",
+            "--annotate",
+            "-s",
+            "--sign",
+            "-u",
+            "--local-user",
+            "-m",
+            "--message",
+            "-F",
+            "--file",
+            "--cleanup",
+            "-e",
+            "--edit",
+            "--create-reflog",
+        }
+    ),
+    # `git reflog` defaults to `show`; the subverbs below expire / delete /
+    # drop reflog entries — irreversible state loss.
+    "reflog": frozenset({"delete", "expire", "drop"}),
+    # `git diff --output=<file>` writes the diff to <file>, bypassing the
+    # repo-boundary check that our filesystem tools enforce. `--ext-diff`
+    # / `--textconv` shell out to configured external commands. Same for
+    # log/show/blame which honour `--output` for patch generation.
+    "diff": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "log": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "show": frozenset({"--output", "--ext-diff", "--textconv"}),
+    "blame": frozenset({"--textconv"}),
+    # `git grep --open-files-in-pager` / `-O` invokes a pager binary of the
+    # caller's choosing. Not a write per se, but arbitrary command exec.
+    "grep": frozenset({"-O", "--open-files-in-pager"}),
+}
+
+# Flags rejected regardless of subcommand — these either point at a remote
+# side-channel that can execute arbitrary code (`--upload-pack`,
+# `--receive-pack`, `--exec`) or relocate the git dir / worktree
+# (`--git-dir`, `--work-tree`, `--namespace`). Both bare and `flag=value`
+# forms are caught because we compare against `arg.split("=", 1)[0]`.
+_GIT_READ_ONLY_GLOBAL_BANNED_FLAGS: frozenset[str] = frozenset(
+    {
+        "--upload-pack",
+        "--receive-pack",
+        "--exec",
+        "--exec-path",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+    }
+)
+
+
+def _validate_git_read_only(parts: list[str]) -> str | None:
+    """Return an error string if *parts* is not a safe read-only git invocation.
+
+    *parts* is the argv-style token list AFTER an optional leading ``git``
+    has been stripped. Returns ``None`` when the invocation passes; a
+    human-readable error otherwise (safe to hand straight back to the
+    caller as the tool result).
+
+    The check has three layers:
+
+    1. **Global git options are refused.** A leading token starting with
+       ``-`` (e.g. ``-c http.extraheader=…``, ``-C /some/other/repo``,
+       ``--git-dir /tmp/attacker``) would let the caller inject config or
+       redirect the operation before we even see the subcommand.
+    2. **Subcommand must be on the read-only allowlist.** Anything else —
+       ``push``, ``reset``, ``checkout``, ``clean``, ``remote``,
+       ``config``, ``stash``, ``rebase``, ``merge``, ``commit``,
+       ``filter-branch``, ``update-ref``, … — is rejected with a pointer
+       to ``git_commit_and_push`` for legitimate writes.
+    3. **Per-subcommand argument bans.** Even inside an allowed verb, some
+       flags mutate state (``branch -D``, ``reflog delete``,
+       ``tag --delete``) or exfiltrate data outside the repo boundary
+       (``diff --output=/tmp/x``). Global bans (``--upload-pack``,
+       ``--git-dir``) apply everywhere.
+    """
+    if not parts:
+        return "Error: empty command."
+    head = parts[0]
+    if head.startswith("-"):
+        return (
+            f"Error: global git option '{head}' is not permitted before the subcommand "
+            "(no `-c`, `-C`, `--git-dir`, `--work-tree`, …). Pass a plain subcommand."
+        )
+    subcommand = head
+    if subcommand not in _GIT_READ_ONLY_SUBCOMMANDS:
+        allowed = ", ".join(sorted(_GIT_READ_ONLY_SUBCOMMANDS))
+        return (
+            f"Error: git '{subcommand}' is not permitted via git_run — this tool is read-only. "
+            f"Use git_commit_and_push for writes, git_pull for pulls. "
+            f"Allowed read subcommands: {allowed}."
+        )
+    banned = _GIT_READ_ONLY_ARG_BANS.get(subcommand, frozenset())
+    for arg in parts[1:]:
+        # Match both `--foo` and `--foo=bar` forms by stripping the value.
+        key = arg.split("=", 1)[0]
+        if key in _GIT_READ_ONLY_GLOBAL_BANNED_FLAGS:
+            return (
+                f"Error: argument '{arg}' is not permitted (global ban — remote-side "
+                "exec / git-dir redirect flags are blocked on every subcommand)."
+            )
+        if key in banned:
+            return (
+                f"Error: argument '{arg}' is not permitted for git {subcommand} via git_run — "
+                "it would mutate refs / write outside the repo. Use git_commit_and_push for writes."
+            )
+    return None
+
+
 def _safe_path(repo_path: str, relative: str) -> Path | None:
-    """Resolve a relative path within repo_path, rejecting traversal."""
+    """Resolve a relative path within repo_path, rejecting traversal.
+
+    Uses component-wise containment (``Path.is_relative_to``) rather than a
+    string-prefix check — otherwise a sibling directory whose name shares a
+    prefix with the repo (e.g. ``/work/maki`` vs ``/work/maki-evil``) would
+    slip through and every filesystem tool (read, write, git_diff, ...) could
+    escape the repo.
+    """
     base = Path(repo_path).resolve()
-    target = (base / relative).resolve()
-    if not str(target).startswith(str(base)):
+    try:
+        target = (base / relative).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if target != base and not target.is_relative_to(base):
         return None
     return target
 
 
-async def _run_git(repo_path: str, *args: str) -> tuple[int, str, str]:
+def _writable_path(repo_path: str, relative: str) -> Path | None:
+    """Resolve a relative path for **mutating** operations.
+
+    Adds a `.git/` component ban on top of :func:`_safe_path`. `.git/HEAD`,
+    `.git/config`, `.git/hooks/**`, `.git/refs/**` all live *inside* the repo
+    directory, so the base traversal guard alone lets a confused/adversarial
+    agent overwrite them via ``write_file`` / ``edit_file`` — corrupting the
+    index, silently rewriting ``origin`` to an attacker remote before the next
+    ``git_commit_and_push``, or dropping a payload into ``pre-commit`` that
+    fires on the very next commit tool call.
+
+    We already scrub tokens out of ``.git/config`` in :func:`_run_git`
+    (issue #347); the writers next to it must not undo that. Read tools keep
+    using :func:`_safe_path` — inspecting ``.git/`` can't corrupt state.
+
+    The ban is component-wise, so nested ``.git`` dirs (submodules,
+    fixtures) are blocked too. Returns ``None`` when the path escapes the
+    repo *or* targets ``.git``; callers should render a distinct error for
+    the ``.git`` case (see :func:`_git_write_error`).
+    """
+    resolved = _safe_path(repo_path, relative)
+    if resolved is None:
+        return None
+    base = Path(repo_path).resolve()
+    # `relative_to` needs the child-or-equal invariant _safe_path already
+    # enforced above; for `resolved == base` the parts tuple is empty so
+    # the `any(...)` is trivially False, which is what we want.
+    rel_parts = resolved.relative_to(base).parts if resolved != base else ()
+    if any(part == ".git" for part in rel_parts):
+        return None
+    return resolved
+
+
+def _path_touches_git(repo_path: str, relative: str) -> bool:
+    """True iff ``relative`` resolves inside the repo AND targets ``.git/``.
+
+    Used to distinguish "outside repo" from "inside repo but blocked" so we
+    can give the caller a targeted error instead of a misleading traversal
+    message.
+    """
+    inside = _safe_path(repo_path, relative)
+    if inside is None:
+        return False
+    base = Path(repo_path).resolve()
+    rel_parts = inside.relative_to(base).parts if inside != base else ()
+    return any(part == ".git" for part in rel_parts)
+
+
+async def _run_git(
+    repo_path: str,
+    *args: str,
+    token: str | None = None,
+    timeout: float | None = None,
+) -> tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr).
+
+    When *token* is supplied, the GitHub installation token is injected via
+    ``git -c http.extraheader=...`` so it authenticates this single
+    invocation without ever landing in ``<repo>/.git/config`` (issue #347).
+    Local-only operations (status, diff, add, commit, rev-parse) don't
+    need a token; remote operations (push, pull, fetch) do.
 
     stdout/stderr are pre-redacted of any GitHub token — git's own error
     messages echo the full remote URL (including `x-access-token:TOKEN@`),
     and that text flows into both structured logs and MCP results.
+
+    A per-invocation deadline (``timeout``) bounds the wait for the
+    subprocess — auto-picked via :func:`maki_common.repo._git_op_timeout`
+    when omitted. On expiry the git process is terminated (SIGTERM →
+    SIGKILL) and :class:`TimeoutError` propagates so the caller can
+    surface it as a tool error instead of pinning the MCP request loop
+    forever. See #499.
     """
+    cmd_args: list[str] = []
+    if token:
+        cmd_args.extend(_auth_config_args(token))
+    cmd_args.extend(["-C", repo_path, *args])
+    effective_timeout = timeout if timeout is not None else _git_op_timeout(args)
     proc = await asyncio.create_subprocess_exec(
         "git",
-        "-C",
-        repo_path,
-        *args,
+        *cmd_args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, effective_timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
-async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
+async def _run_cmd(
+    repo_path: str,
+    *args: str,
+    timeout: float = GIT_LOCAL_TIMEOUT_S,
+) -> tuple[int, str, str]:
     """Run an arbitrary command in the repo directory and return (returncode, stdout, stderr).
 
     Output is pre-redacted defensively — most callers run linters, but anything
     that shells out near a git context can pick up a token from environment or
     error chaining.
+
+    Per-invocation subprocess timeout guards against a stuck child (a
+    ripgrep/ruff/pytest livelock, a runaway subprocess of the runner
+    itself) wedging the MCP tool loop indefinitely — same failure mode
+    :func:`_run_git` was hardened for in #499. Defaults to
+    :data:`GIT_LOCAL_TIMEOUT_S` (120s), generous enough for lint / test
+    subprocesses run in-band; pass an explicit larger value if a specific
+    caller needs it.
     """
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -64,7 +358,7 @@ async def _run_cmd(repo_path: str, *args: str) -> tuple[int, str, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(proc, timeout, " ".join(args))
     return proc.returncode, redact_token(stdout.decode()), redact_token(stderr.decode())
 
 
@@ -165,44 +459,90 @@ def make_code_tools(
                     return mcp_result(f"Error: path '{path_filter}' is outside the repository.")
                 search_path = str(resolved)
 
+            # No extension whitelist — the old include-list hid *entire trees*.
+            # `infra/` is 100% `.tf` + Terragrunt `.hcl`, so every infra grep
+            # returned "No matches" (issues #77, #276, #293, #383, #384, #612).
+            # `Dockerfile`, `.gitignore`, `.env.example`, `.sql`, `.rs`, `.rb`
+            # were all invisible for the same reason. Rely on `-I` to skip
+            # binaries and `--exclude-dir` to skip vendored/build trees.
             proc = await asyncio.create_subprocess_exec(
                 "grep",
-                "-rn",
-                "--include=*.py",
-                "--include=*.yaml",
-                "--include=*.yml",
-                "--include=*.toml",
-                "--include=*.json",
-                "--include=*.md",
-                "--include=*.txt",
-                "--include=*.cfg",
-                "--include=*.ini",
-                "--include=*.sh",
-                "--include=*.go",
-                "--include=*.js",
-                "--include=*.ts",
+                "-rHnI",
+                "--exclude-dir=.git",
+                "--exclude-dir=node_modules",
+                "--exclude-dir=__pycache__",
+                "--exclude-dir=.venv",
+                "--exclude-dir=venv",
+                "--exclude-dir=.tox",
+                "--exclude-dir=dist",
+                "--exclude-dir=build",
+                "--exclude-dir=.mypy_cache",
+                "--exclude-dir=.ruff_cache",
+                "--exclude-dir=.pytest_cache",
+                "--exclude-dir=.terraform",
                 "-C",
                 "2",
-                "-m",
-                str(MAX_SEARCH_RESULTS),
+                # NOTE: `-m N` was here previously and it's PER-FILE, not total.
+                # Combined with `-r`, a common token like `import` dumped
+                # thousands of lines and starved the tool's context (#612).
+                # We cap the total in Python after the fact — see below.
                 query,
                 search_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
-            output = stdout.decode(errors="replace")
+            # Bounded wait so a pathological pattern (catastrophic backtracking
+            # in the regex, a symlink loop grep can't detect, a giant binary
+            # blob it insists on scanning) can't wedge the MCP tool loop
+            # forever — same class of failure as #499's git-timeout gap.
+            stdout, stderr = await _communicate_with_timeout(proc, GIT_LOCAL_TIMEOUT_S, f"grep {query!r}")
 
+            # grep exit codes: 0=matches, 1=no matches, 2=error. The old code
+            # only inspected stdout, so a malformed regex like `(foo` silently
+            # returned "No matches" — Claude thought the codebase was clean
+            # when the query never ran (#612 comment). Surface rc=2 as a real
+            # error with grep's stderr attached.
+            if proc.returncode == 2:
+                err_msg = stderr.decode(errors="replace").strip() or "grep failed"
+                return mcp_result(f"Error: grep failed: {err_msg}")
+
+            output = stdout.decode(errors="replace")
             if not output.strip():
                 return mcp_result(f"No matches found for '{query}'.")
+
+            # Cap TOTAL matches at MAX_SEARCH_RESULTS by walking the output
+            # line-by-line and stopping once we've seen enough match lines
+            # (context lines and `--` group separators don't count).
+            # grep -Hn output: `path:LINE:content` for matches,
+            # `path-LINE-content` for context. We detect matches with a
+            # regex that anchors on `:\d+:` after the path prefix. Non-greedy
+            # so a colon inside the path doesn't shift the anchor.
+            match_line_re = re.compile(r"^[^\n]+?:\d+:")
+            kept: list[str] = []
+            matches = 0
+            truncated = False
+            for line in output.splitlines():
+                if match_line_re.match(line):
+                    if matches >= MAX_SEARCH_RESULTS:
+                        truncated = True
+                        break
+                    matches += 1
+                kept.append(line)
+            result = "\n".join(kept)
 
             # Make paths relative to repo
             base = str(entry.path)
             if base and not base.endswith("/"):
                 base += "/"
-            output = output.replace(base, "")
+            result = result.replace(base, "")
 
-            return mcp_result(output)
+            if truncated:
+                result += (
+                    f"\n\n... truncated at {MAX_SEARCH_RESULTS} matches — "
+                    "narrow the query or pass a `path` to see more."
+                )
+
+            return mcp_result(result)
         except Exception as e:
             return mcp_result(f"Error searching: {e}")
 
@@ -212,7 +552,12 @@ def make_code_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        rc, stdout, stderr = await _run_git(entry.path, "status", "--short")
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, "status", "--short")
+        except TimeoutError as exc:
+            # Timed-out git — surface as a tool error instead of letting the
+            # exception escape into the MCP dispatcher. See #499.
+            return mcp_result(f"Error: {exc}")
         if rc != 0:
             return mcp_result(f"Error: {stderr}")
         return mcp_result(stdout if stdout.strip() else "Working tree clean.")
@@ -231,7 +576,10 @@ def make_code_tools(
                 return mcp_result(f"Error: path '{path}' is outside the repository.")
             cmd.append("--")
             cmd.append(path)
-        rc, stdout, stderr = await _run_git(entry.path, *cmd)
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, *cmd)
+        except TimeoutError as exc:
+            return mcp_result(f"Error: {exc}")
         if rc != 0:
             return mcp_result(f"Error: {stderr}")
         return mcp_result(stdout if stdout.strip() else "No changes.")
@@ -257,7 +605,11 @@ def make_code_tools(
         (
             "search_text",
             "Search for text patterns in a repository (grep-style). "
-            "Returns matching lines with context. Optionally filter by path. "
+            f"Returns matching lines with 2 lines of context, capped at {MAX_SEARCH_RESULTS} total matches. "
+            "Searches every text file (binaries auto-skipped) — no extension whitelist, "
+            "so `.tf`/`.hcl`/`Dockerfile`/`.sql`/`.rs`/dotfiles are all searchable. "
+            "Vendored dirs (.git, node_modules, __pycache__, .venv, dist, build, .terraform, "
+            "caches) are excluded. Optionally filter by path. "
             "Optional `repo` arg selects a non-default repo.",
             {"query": str, "path": str, "repo": str},
             search_text,
@@ -305,8 +657,10 @@ def make_code_edit_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        resolved = _safe_path(entry.path, path)
+        resolved = _writable_path(entry.path, path)
         if not resolved:
+            if _path_touches_git(entry.path, path):
+                return mcp_result(f"Error: writes to .git/ are not permitted (path '{path}').")
             return mcp_result(f"Error: path '{path}' is outside the repository.")
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
@@ -334,8 +688,10 @@ def make_code_edit_tools(
         entry, err = await _resolve(registry, args)
         if entry is None:
             return mcp_result(err or "")
-        resolved = _safe_path(entry.path, path)
+        resolved = _writable_path(entry.path, path)
         if not resolved:
+            if _path_touches_git(entry.path, path):
+                return mcp_result(f"Error: edits to .git/ are not permitted (path '{path}').")
             return mcp_result(f"Error: path '{path}' is outside the repository.")
         if not resolved.is_file():
             return mcp_result(f"Error: '{path}' does not exist or is not a file.")
@@ -374,11 +730,16 @@ def make_code_edit_tools(
             return mcp_result(err or "")
 
         try:
-            # Stage files
+            # Stage files. `_writable_path` guards `.git/` — git's own `add`
+            # already refuses `.git`, but the check here fails fast with a
+            # clear message *before* we shell out, and also blocks nested
+            # `.git` component targets (a repo-in-repo footgun).
             file_list = [f.strip() for f in files.split(",") if f.strip()]
             for f in file_list:
-                resolved = _safe_path(entry.path, f)
+                resolved = _writable_path(entry.path, f)
                 if not resolved:
+                    if _path_touches_git(entry.path, f):
+                        return mcp_result(f"Error: staging paths inside .git/ is not permitted (file '{f}').")
                     return mcp_result(f"Error: file '{f}' is outside the repository.")
                 rc, _, stderr = await _run_git(entry.path, "add", f)
                 if rc != 0:
@@ -396,14 +757,18 @@ def make_code_edit_tools(
             if rc != 0:
                 return mcp_result(f"Commit failed: {stderr}")
 
-            # Set remote URL with fresh token for push
+            # Mint a fresh installation token for the push. The token is
+            # injected per-invocation via `git -c http.extraheader=...`
+            # (issue #347) — never written to `.git/config`. We also rewrite
+            # origin to the token-free URL to scrub any legacy embedded-token
+            # URL written by older versions of this module.
+            push_token: str | None = None
             if entry.auth and entry.owner and entry.name:
-                token = await entry.auth.get_token()
-                remote_url = f"https://x-access-token:{token}@github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", remote_url)
+                push_token = await entry.auth.get_token()
+                await set_origin(entry.path, entry.resolved_clone_url())
 
             # Push
-            rc, stdout, stderr = await _run_git(entry.path, "push", "origin", "main")
+            rc, stdout, stderr = await _run_git(entry.path, "push", "origin", "main", token=push_token)
             if rc != 0:
                 return mcp_result(f"Push failed: {stderr}")
 
@@ -432,10 +797,14 @@ def make_code_edit_tools(
         if entry is None:
             return mcp_result(err or "")
         try:
+            # Mint a fresh installation token for the pull. Injected
+            # per-invocation via `git -c http.extraheader=...` (issue #347)
+            # — never written to `.git/config`. We also rewrite origin to
+            # the token-free URL to scrub any legacy embedded-token URL.
+            pull_token: str | None = None
             if entry.auth and entry.owner and entry.name:
-                token = await entry.auth.get_token()
-                remote_url = f"https://x-access-token:{token}@github.com/{entry.owner}/{entry.name}.git"
-                await _run_git(entry.path, "remote", "set-url", "origin", remote_url)
+                pull_token = await entry.auth.get_token()
+                await set_origin(entry.path, entry.resolved_clone_url())
 
             # Clear stuck rebase state before pulling — rebase --abort silently
             # fails in some states, so nuke the directory directly.
@@ -447,11 +816,11 @@ def make_code_edit_tools(
                     shutil.rmtree(p)
                     log.warning("Cleared stuck rebase dir", extra={"path": str(p)})
 
-            rc, stdout, stderr = await _run_git(entry.path, "pull", "--rebase", "origin", "main")
+            rc, stdout, stderr = await _run_git(entry.path, "pull", "--rebase", "origin", "main", token=pull_token)
             if rc != 0:
                 if "rebase" in stderr.lower():
                     log.warning("Rebase failed, retrying with merge")
-                    rc, stdout, stderr = await _run_git(entry.path, "pull", "origin", "main")
+                    rc, stdout, stderr = await _run_git(entry.path, "pull", "origin", "main", token=pull_token)
                 if rc != 0:
                     return mcp_result(f"Pull failed: {stderr}")
             return mcp_result(stdout if stdout.strip() else "Already up to date.")
@@ -459,11 +828,20 @@ def make_code_edit_tools(
             return mcp_result(f"Error: {e}")
 
     async def git_run(args: dict[str, Any]) -> dict[str, Any]:
-        """Run an arbitrary git command in the repo workspace.
+        """Run a **read-only** git command in the repo workspace.
 
-        Useful for read-mostly operations (`log`, `show`, `branch -a`, `rev-parse`)
-        and ad-hoc git that doesn't have a dedicated tool. The command is parsed
-        with shlex; `git` is prepended automatically.
+        The tool enforces a subcommand allowlist (log, show, diff, blame,
+        status, branch, tag, rev-parse, rev-list, describe, ls-files,
+        ls-tree, cat-file, shortlog, reflog, for-each-ref, name-rev, grep)
+        plus per-subcommand argument bans that block the flags that turn a
+        "read" into a state-changing write (`branch -D`, `tag --delete`,
+        `reflog delete`, `diff --output=…`, etc.). Global git options
+        before the subcommand (`-c`, `-C`, `--git-dir`, …) and remote-side
+        exec flags (`--upload-pack`, `--receive-pack`, `--exec`) are
+        rejected outright.
+
+        For writes, use ``git_commit_and_push`` (which mints and scopes an
+        installation token per push) or ``git_pull``. See issue #639.
         """
         command = args.get("command", "")
         log.info("Tool: git_run", extra={"command": command, "repo": args.get("repo")})
@@ -483,7 +861,22 @@ def make_code_edit_tools(
             parts = parts[1:]
         if not parts:
             return mcp_result("Error: command is just 'git' with no subcommand.")
-        rc, stdout, stderr = await _run_git(entry.path, *parts)
+        # Read-only enforcement (#639). Any write path — push, reset,
+        # remote set-url, config, checkout -f, clean, branch -D — is
+        # refused here so a prompt-injected LLM turn can't reach it.
+        rejection = _validate_git_read_only(parts)
+        if rejection is not None:
+            log.warning(
+                "git_run rejected (read-only guard)",
+                extra={"command": command, "repo": args.get("repo"), "reason": rejection},
+            )
+            return mcp_result(rejection)
+        try:
+            rc, stdout, stderr = await _run_git(entry.path, *parts)
+        except TimeoutError as exc:
+            # Timed-out git — surface as a tool error instead of letting the
+            # exception escape into the MCP dispatcher. See #499.
+            return mcp_result(f"Error: {exc}")
         output = stdout if stdout.strip() else stderr
         if rc != 0:
             return mcp_result(f"git {command} failed (exit {rc}):\n{output}")
@@ -506,9 +899,18 @@ def make_code_edit_tools(
         results = []
         all_passed = True
 
+        # Generous per-tool subprocess timeout — ruff / ty on the current
+        # tree run in seconds, but keep headroom for a warmed-uv cache miss
+        # or a first-time install pulling wheels. The important thing is
+        # having *some* upper bound so a wedged uv/network can't pin the
+        # MCP loop forever (same failure mode as #499 for git).
+        _QUALITY_TIMEOUT_S = 600.0
+
         # Run ruff lint check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ruff", "check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ruff", "check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ruff check (lint): passed")
             else:
@@ -518,10 +920,15 @@ def make_code_edit_tools(
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ruff check (lint): TIMED OUT — {exc}")
+            all_passed = False
 
         # Run ruff format check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ruff", "format", "--check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ruff", "format", "--check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ruff format: passed")
             else:
@@ -531,10 +938,15 @@ def make_code_edit_tools(
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
             all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ruff format: TIMED OUT — {exc}")
+            all_passed = False
 
         # Run ty type check
         try:
-            rc, stdout, stderr = await _run_cmd(entry.path, "uvx", "ty", "check", path_filter)
+            rc, stdout, stderr = await _run_cmd(
+                entry.path, "uvx", "ty", "check", path_filter, timeout=_QUALITY_TIMEOUT_S
+            )
             if rc == 0:
                 results.append("✅ ty check (types): passed")
             else:
@@ -543,6 +955,9 @@ def make_code_edit_tools(
                 results.append(f"❌ ty check (types): FAILED\n{output}")
         except FileNotFoundError:
             results.append("⚠️ uvx not found — install uv: https://docs.astral.sh/uv/")
+            all_passed = False
+        except TimeoutError as exc:
+            results.append(f"❌ ty check (types): TIMED OUT — {exc}")
             all_passed = False
 
         summary = "ALL CHECKS PASSED ✅" if all_passed else "CHECKS FAILED ❌ — fix issues before pushing"
@@ -582,8 +997,13 @@ def make_code_edit_tools(
         ),
         (
             "git_run",
-            "Run an arbitrary git command in the repo workspace (e.g. 'log -n 5 --oneline', "
-            "'branch -a', 'show HEAD'). The leading 'git' is added automatically. "
+            "Run a READ-ONLY git command in the repo workspace (e.g. 'log -n 5 --oneline', "
+            "'branch -a', 'show HEAD', 'diff HEAD~1', 'rev-parse HEAD'). The leading 'git' "
+            "is added automatically. Enforces an allowlist: log, show, diff, blame, status, "
+            "branch, tag, rev-parse, rev-list, describe, ls-files, ls-tree, cat-file, "
+            "shortlog, reflog, for-each-ref, name-rev, grep — with per-subcommand bans on "
+            "flags that mutate state (branch -D, tag --delete, reflog delete, diff --output, "
+            "…). For writes, use git_commit_and_push (commit+push) or git_pull. "
             "Optional `repo` arg selects a non-default repo.",
             {"command": str, "repo": str},
             git_run,

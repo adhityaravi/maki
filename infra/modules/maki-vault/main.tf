@@ -88,11 +88,18 @@ resource "kubernetes_config_map" "migrations" {
     name      = "maki-vault-migrations"
     namespace = var.namespace
   }
-  data = {
-    "run.sh"                 = file("${path.module}/run.sh")
-    "001_error_patterns.sql" = file("${path.module}/001_error_patterns.sql")
-    "002_trade_tables.sql"   = file("${path.module}/002_trade_tables.sql")
-  }
+  # Auto-register every numbered SQL file in the module so new migrations
+  # (e.g. 003_, 004_, ...) don't silently drift out of the pod mount (#625).
+  # run.sh is idempotent per `schema_migrations`, so re-apply is a no-op.
+  data = merge(
+    {
+      "run.sh" = file("${path.module}/run.sh")
+    },
+    {
+      for f in fileset(path.module, "[0-9]*.sql") :
+      f => file("${path.module}/${f}")
+    },
+  )
 }
 
 # --- Headless service ---

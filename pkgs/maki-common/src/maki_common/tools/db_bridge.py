@@ -4,7 +4,9 @@ Same pattern as discord_search.py / trading_bridge.py: cortex calls the tool,
 the request is forwarded via NATS to stem (which holds the asyncpg pool), and
 the formatted result flows back.
 
-Safety: stem validates SELECT-only + injects LIMIT 50.
+Safety: stem validates SELECT/WITH-only, executes the query inside a Postgres
+``READ ONLY`` transaction (so DML smuggled inside a CTE is rejected by the
+server), and injects LIMIT 50 if missing. See issue #288.
 """
 
 from __future__ import annotations
@@ -50,7 +52,10 @@ def make_db_query_tools(nc: Any) -> list[tuple[str, str, dict, Any]]:
             "query_db",
             (
                 "Run a read-only SQL query against maki-vault (PostgreSQL). "
-                "Only SELECT and WITH (CTE) queries are allowed. "
+                "Only SELECT and WITH (CTE) queries are allowed and the query "
+                "executes inside a READ ONLY transaction — any DML smuggled "
+                "inside a CTE (INSERT/UPDATE/DELETE ... RETURNING) will be "
+                "rejected by Postgres. "
                 "Results are capped at 50 rows. "
                 "Use this to inspect trade history, asset config, or any other "
                 "data stored in the database.\n\n"

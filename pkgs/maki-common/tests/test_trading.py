@@ -19,12 +19,15 @@ import math
 
 from maki_common.trading import (
     DEFAULT_SEED_EUR,
+    AddCash,
     Direction,
+    Trade,
     add_cash,
     append_trade,
     compute_position,
     load_book,
     load_seed,
+    parse_manual_command,
     parse_trade_command,
     safe_symbol,
 )
@@ -131,6 +134,57 @@ def test_parse_rejects_non_numeric_price() -> None:
 
 def test_parse_empty_command() -> None:
     _expect_value_error(parse_trade_command, "")
+
+
+# ── parse_manual_command (ADDCASH + dispatch to BUY/SELL) ───────────────────
+
+
+def test_parse_manual_addcash_basic() -> None:
+    cmd = parse_manual_command("!trade ADDCASH 200")
+    assert isinstance(cmd, AddCash)
+    assert cmd.amount_eur == 200.0
+    assert cmd.note is None
+
+
+def test_parse_manual_addcash_with_note_and_comma_decimal() -> None:
+    cmd = parse_manual_command("!trade addcash 12,50 bonus payout")
+    assert isinstance(cmd, AddCash)
+    assert _approx(cmd.amount_eur, 12.50)
+    assert cmd.note == "bonus payout"
+
+
+def test_parse_manual_addcash_rejects_missing_amount() -> None:
+    msg = _expect_value_error(parse_manual_command, "!trade ADDCASH")
+    assert "ADDCASH" in msg and "amount" in msg
+
+
+def test_parse_manual_addcash_rejects_non_positive() -> None:
+    _expect_value_error(parse_manual_command, "!trade ADDCASH -5")
+    _expect_value_error(parse_manual_command, "!trade ADDCASH 0")
+
+
+def test_parse_manual_addcash_rejects_non_numeric() -> None:
+    msg = _expect_value_error(parse_manual_command, "!trade ADDCASH lots")
+    assert "amount" in msg
+
+
+def test_parse_manual_dispatches_to_trade_on_buy() -> None:
+    cmd = parse_manual_command("!trade BUY BTC 100 @65234.12")
+    assert isinstance(cmd, Trade)
+    assert cmd.direction is Direction.BUY
+    assert cmd.symbol == "BTC"
+    assert cmd.amount_eur == 100.0
+    assert cmd.price == 65234.12
+
+
+def test_parse_manual_empty_rejected() -> None:
+    _expect_value_error(parse_manual_command, "")
+    _expect_value_error(parse_manual_command, "   ")
+
+
+def test_parse_manual_unknown_verb_rejected() -> None:
+    msg = _expect_value_error(parse_manual_command, "!trade YOLO BTC 100")
+    assert "unknown verb" in msg
 
 
 # ── append_trade / load_book ────────────────────────────────────────────────

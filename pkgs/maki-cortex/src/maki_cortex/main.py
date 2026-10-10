@@ -13,23 +13,41 @@ import logging
 import os
 import time
 import uuid
+from html import escape as _xml_escape
+from typing import Any
 
-from maki_common import configure_logging, connect_nats, init_kv, subscribe_supervised
+from maki_common import (
+    DEFAULT_CLAUDE_MODEL,
+    configure_logging,
+    connect_nats,
+    default_health_endpoints,
+    format_graph_block,
+    format_memories_block,
+    format_system_state_lines,
+    init_kv_with_retry,
+    spawn_background,
+    subscribe_supervised,
+)
 from maki_common.claude import TokenUsage, invoke_claude, stream_claude
 from maki_common.health import tcp_health_server
-from maki_common.repo import redact_token
+from maki_common.repo import SyncError, build_github_auth, clean_remote_url, hard_sync, init_repo
+from maki_common.settings import (
+    NATS_TOKEN,
+    NATS_URL,
+    RECALL_URL,
+    REPO_NAME,
+    REPO_OWNER,
+    REPO_PATH,
+)
 from maki_common.subjects import CORTEX_HEALTH, CORTEX_TOKEN_USAGE, CORTEX_TURN_REQUEST, CORTEX_TURN_RESPONSE
 
 configure_logging()
 log = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 SITE_NAME = os.environ.get("SITE_NAME", "unknown")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_TURNS = int(os.environ.get("CORTEX_MAX_TURNS", "50"))
-RECALL_URL = os.environ.get("RECALL_URL", "http://maki-recall:8000")
 
 # Hard turn-duration watchdog. If a turn doesn't return within this window we
 # cancel it from inside the cortex so the tracked turn state is cleared, slot
@@ -44,24 +62,50 @@ CORTEX_MAX_TURN_SECONDS = int(os.environ.get("CORTEX_MAX_TURN_SECONDS", "1200"))
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
 GITHUB_PRIVATE_KEY_PATH = os.environ.get("GITHUB_PRIVATE_KEY_PATH")
 GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID")
-REPO_OWNER = os.environ.get("REPO_OWNER", "adhityaravi")
-REPO_NAME = os.environ.get("REPO_NAME", "maki")
-REPO_PATH = os.environ.get("REPO_PATH", "/repo/maki")
+# Token-free clone URL — auth is injected per-invocation via
+# ``git -c http.extraheader=...`` inside ``maki_common.repo`` (issue #347).
+CLONE_URL = clean_remote_url(REPO_OWNER, REPO_NAME)
 
+# Bare-name registry (matches the tool-facing convention used elsewhere in
+# cortex/stem). Ports + env-var overrides come from the shared table in
+# ``maki_common.endpoints`` — see #137 for the drift this consolidates. Self
+# entry is overridden to hit the local process directly so ``check_component``
+# gets a fresh single-shot reading rather than a Service round-robin hop.
 HEALTH_ENDPOINTS = {
-    "recall": RECALL_URL,
-    "synapse": os.environ.get("SYNAPSE_URL", "http://maki-synapse:8080"),
-    "stem": os.environ.get("STEM_URL", "http://maki-stem:8000"),
+    **default_health_endpoints(),
     "cortex": f"http://localhost:{HEALTH_PORT}",
 }
 
 # Unique per startup — lets stem detect cortex restarts
 SESSION_ID = uuid.uuid4().hex[:12]
 
+# Stable per-pod identity — stamped onto every CORTEX_TURN_RESPONSE chunk so
+# stem can build a turn_id → instance_id map and selectively cancel only the
+# turns owned by a restarted cortex instance instead of every in-flight turn
+# on the fleet (issue #394). Same source as the heartbeat's instance_id so
+# both signals agree; falls back to "unknown" outside k8s.
+INSTANCE_ID = os.environ.get("HOSTNAME", "unknown")
+
+
+def _turn_response(payload: dict) -> bytes:
+    """Encode a CORTEX_TURN_RESPONSE payload with this instance's id stamped in.
+
+    Every publish site MUST use this helper — stem's per-instance cancellation
+    (issue #394) depends on ``instance_id`` being present on every chunk. A
+    single call site that forgot to add it would silently degrade to the old
+    "cancel everything on any cortex restart" behaviour for turns owned by
+    this pod.
+    """
+    return json.dumps({**payload, "instance_id": INSTANCE_ID}).encode()
+
+
 _semaphore = asyncio.Semaphore(1)
 
 # Hoisted from main() so handle_turn_request can use it for auto-pull
 _github_private_key: str | None = None
+# GitHubAuth instance built once at startup — reused by the per-turn hard-sync
+# so we don't reconstruct it (and re-import GitHubAuth) on every turn.
+_github_auth: Any | None = None
 
 
 class _TurnState:
@@ -136,30 +180,28 @@ _critical_listener_tasks: dict[str, asyncio.Task] = {}
 CORTEX_LIVENESS_TURN_MULTIPLIER = float(os.environ.get("CORTEX_LIVENESS_TURN_MULTIPLIER", "2.0"))
 
 
-def _health_check() -> tuple[bool, str | None]:
-    """Return (ok, reason) for the readiness/liveness probe.
+def _liveness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/live`` liveness probe.
 
-    On top of the usual NATS / subscription / heartbeat checks, fail the
-    probe when the active turn has been running far longer than the soft
-    watchdog allows. The soft watchdog (asyncio.wait_for inside
-    handle_turn_request) only fires at suspension points; if the event
-    loop is wedged below the application layer the only recovery is to
-    let kubelet SIGKILL the pod. See issue #185.
+    Liveness answers a single question: "would a restart fix this?" It fails
+    only for conditions that require kubelet to SIGKILL and reschedule the
+    pod — a crashed heartbeat, a dead critical listener, or an event loop
+    wedged below the application layer (see issue #185). It deliberately
+    does *not* fail on NATS disconnection or missing startup state, because
+    those either fix themselves (reconnect) or belong to the readiness
+    probe's "don't route traffic to me" side of the split (issue #373).
     """
-    if _nc_ref is None or not _nc_ref.is_connected:
-        return False, "NATS not connected"
-    if _heartbeat_task is None:
-        return False, "Heartbeat task not started"
-    if _heartbeat_task.done():
+    # A heartbeat task that started and then died is a restart-worthy fault.
+    # A heartbeat that hasn't started yet is startup ordering — readiness'
+    # concern, not liveness'.
+    if _heartbeat_task is not None and _heartbeat_task.done():
         if _heartbeat_task.cancelled():
             return False, "Heartbeat task cancelled"
         exc = _heartbeat_task.exception()
         return False, f"Heartbeat task crashed: {exc!r}"
+
     # Critical listeners are wrapped in ``subscribe_supervised`` and should
-    # run forever. If any has exited, the readiness probe must fail so kubelet
-    # restarts the pod (issue #175).
-    if not _critical_listener_tasks:
-        return False, "Turn-request listener not started"
+    # run forever. If any has exited, kubelet must restart the pod (#175).
     for label, task in _critical_listener_tasks.items():
         if task.done():
             if task.cancelled():
@@ -186,6 +228,29 @@ def _health_check() -> tuple[bool, str | None]:
             )
 
     return True, None
+
+
+def _readiness_check() -> tuple[bool, str | None]:
+    """Return (ok, reason) for the ``/health`` readiness probe.
+
+    Readiness answers "should I receive turn traffic right now?" It fails
+    on anything liveness fails on (a broken pod isn't ready either) plus
+    startup-ordering and connectivity conditions that don't warrant a
+    restart: NATS reconnecting, listeners not yet subscribed. See #373.
+    """
+    if _nc_ref is None or not _nc_ref.is_connected:
+        return False, "NATS not connected"
+    if _heartbeat_task is None:
+        return False, "Heartbeat task not started"
+    if not _critical_listener_tasks:
+        return False, "Turn-request listener not started"
+    return _liveness_check()
+
+
+# Retained under the legacy name for any external caller that imported
+# ``_health_check`` directly. Semantically identical to readiness — the
+# stricter of the two, matching the pre-split behaviour.
+_health_check = _readiness_check
 
 
 _BACKGROUND_MODES = frozenset({"idle_reflection", "work", "care", "trading_analyst"})
@@ -242,6 +307,47 @@ async def _publish_token_usage(nc, turn_id: str, usage: TokenUsage) -> None:
         log.exception("Failed to publish token usage", extra={"turn_id": turn_id})
 
 
+async def _publish_response(
+    nc,
+    turn_id: str,
+    response: str,
+    *,
+    done: bool,
+    cancelled: bool = False,
+    reason: str | None = None,
+    error: str | None = None,
+    log_fail_msg: str = "Failed to publish turn response",
+) -> None:
+    """Publish a CORTEX_TURN_RESPONSE envelope with uniform error handling.
+
+    One source of truth for the response envelope shape and failure behaviour.
+    Every path (success, stream chunk, stream end, timeout, preemption, silent
+    error, user-visible error) funnels through here so a publish failure inside
+    an outer error handler can no longer re-raise and take down the handler.
+    See issue #171.
+
+    ``_turn_response`` still handles stamping ``instance_id`` on every payload
+    (issue #394) — this helper builds the base envelope and delegates encoding
+    to it so per-instance cancellation keeps working from every publish site.
+
+    ``error`` is an optional short categorical tag (e.g. exception type name)
+    published alongside ``cancelled=True`` so downstream consumers (metrics,
+    immune) can bucket cancellation causes without parsing free-form logs.
+    See issue #526.
+    """
+    payload = {"turn_id": turn_id, "response": response, "done": done}
+    if cancelled:
+        payload["cancelled"] = True
+    if reason:
+        payload["reason"] = reason
+    if error:
+        payload["error"] = error
+    try:
+        await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(payload))
+    except Exception:
+        log.exception(log_fail_msg, extra={"turn_id": turn_id})
+
+
 def build_system_prompt(turn: dict) -> str:
     """Assemble system prompt from turn payload.
 
@@ -268,24 +374,19 @@ def build_system_prompt(turn: dict) -> str:
     system_state = turn.get("system_state")
     system_state_summary = turn.get("system_state_summary")
     if system_state and isinstance(system_state, dict):
-        state_lines = []
-        for name, info in system_state.items():
-            if isinstance(info, dict):
-                details = ", ".join(f"{k}={v}" for k, v in info.items())
-                state_lines.append(f"- {name}: {details}")
+        state_lines = format_system_state_lines(system_state)
         if state_lines:
             parts.append("## Your system state\n" + "\n".join(state_lines))
     elif system_state_summary:
         parts.append(f"## System: {system_state_summary}")
 
-    memories = turn.get("memories", [])
-    if memories:
-        mem_lines = [f"- {m['text']} (relevance: {m.get('relevance', '?')})" for m in memories]
-        parts.append("## Relevant memories\n" + "\n".join(mem_lines))
+    memories_block = format_memories_block(turn.get("memories", []))
+    if memories_block:
+        parts.append(memories_block)
 
-    graph = turn.get("graph_context", [])
-    if graph:
-        parts.append("## Relationships\n" + "\n".join(f"- {r}" for r in graph))
+    graph_block = format_graph_block(turn.get("graph_context", []))
+    if graph_block:
+        parts.append(graph_block)
 
     session_summary = turn.get("session_summary", "")
     if session_summary:
@@ -300,14 +401,25 @@ def build_conversation_prompt(turn: dict) -> str:
     Kept separate from the system prompt so that injected or replayed
     ``user:``/``assistant:`` lines in context cannot be mistaken for live
     turns by the model.
+
+    For that boundary to actually hold, every user-controlled ``role`` and
+    ``content`` value MUST be XML-escaped before interpolation — otherwise
+    a message containing ``</turn>`` or ``</conversation_history>`` can
+    close the wrapper early and forge fresh system/turn blocks that Claude
+    reads as trusted context. See issue #529.
     """
     conversation = turn.get("conversation", [])
     if not conversation:
         return ""
     conv_lines = []
     for msg in conversation:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
+        # ``quote=True`` on role so a ``"`` in the value can't break out of
+        # the attribute; ``quote=False`` on content because it's element text
+        # (no attribute quotes to escape) and we want to preserve any literal
+        # ``"``/``'`` the user typed. Both still escape ``<``/``>``/``&``,
+        # which is what actually closes the boundary.
+        role = _xml_escape(str(msg.get("role", "unknown")), quote=True)
+        content = _xml_escape(str(msg.get("content", "")), quote=False)
         conv_lines.append(f'<turn role="{role}">{content}</turn>')
     return "<conversation_history>\n" + "\n".join(conv_lines) + "\n</conversation_history>"
 
@@ -323,59 +435,92 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
     prompt = turn.get("prompt") or ""
     use_stream = turn.get("stream", True)
     max_turns = turn.get("max_turns", MAX_TURNS)
-    git_pull = turn.get("git_pull", True)
+    # Default OFF — callers must opt in. See issue #390.
+    #
+    # Only turns that will actually edit code need a fresh checkout (work loop
+    # is the only current opt-in). Chat and idle reflection do NOT touch the
+    # working tree, so paying the fetch+reset+clean cost on every message was
+    # pure latency — and worse, the abort-on-failure semantics below convert
+    # any transient git blip into a `cancelled=True` response with no answer,
+    # forcing Adi to retype "hey".
+    git_pull = turn.get("git_pull", False)
 
-    # Auto-pull latest code if requested by the loop
+    # Auto-pull latest code if requested by the loop.
+    #
+    # Abort-on-failure semantics: if ANY step of the hard sync fails (token
+    # mint, remote set-url, fetch, reset, clean) we publish a `done=True,
+    # cancelled=True, reason="cortex_auto_sync_failed"` signal and return.
+    # We do NOT proceed against whatever was last fetched.
+    #
+    # The previous inline pipeline (`fetch` → `reset --hard` → `clean`) only
+    # logged a warning on the failing step and kept going, which meant a
+    # transient fetch failure still ran `reset --hard origin/main` against a
+    # stale `origin/main`. Work turns then edited stale files, idle/care turns
+    # reflected on stale code, and the only signal was one buried WARNING.
+    # The "Auto-sync before turn" log line was unconditional too — it lied
+    # whenever sync silently failed. See issue #290.
     if git_pull and os.path.exists(REPO_PATH):
         try:
-            if _github_private_key and GITHUB_APP_ID and GITHUB_INSTALLATION_ID:
-                from maki_common.tools.github import GitHubAuth
-
-                _auth = GitHubAuth(GITHUB_APP_ID, _github_private_key, GITHUB_INSTALLATION_ID)
-                _token = await _auth.get_token()
-                _url = f"https://x-access-token:{_token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-                proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "-C",
-                    REPO_PATH,
-                    "remote",
-                    "set-url",
-                    "origin",
-                    _url,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+            await hard_sync(REPO_PATH, github_auth=_github_auth, clone_url=CLONE_URL)
+        except SyncError as exc:
+            # stderr is pre-redacted inside hard_sync — safe to log and publish.
+            log.error(
+                "Auto-sync failed — aborting turn to avoid running against stale code",
+                extra={
+                    "turn_id": turn_id,
+                    "mode": mode,
+                    "step": exc.step,
+                    "returncode": exc.returncode,
+                    "stderr": (exc.stderr or "")[:500],
+                },
+            )
+            done_msg = {
+                "turn_id": turn_id,
+                "response": "",
+                "done": True,
+                "cancelled": True,
+                "reason": "cortex_auto_sync_failed",
+                "error": f"git {exc.step} failed (rc={exc.returncode})",
+            }
+            try:
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
+            except Exception:
+                log.exception(
+                    "Failed to publish auto-sync-failure done signal",
+                    extra={"turn_id": turn_id},
                 )
-                await proc.communicate()
-            # Hard reset to origin/main — no rebase, no merge conflicts.
-            # Any local-only state is stale (work turns commit+push everything).
-            for git_cmd in (
-                ["git", "-C", REPO_PATH, "fetch", "origin", "main"],
-                ["git", "-C", REPO_PATH, "reset", "--hard", "origin/main"],
-                ["git", "-C", REPO_PATH, "clean", "-fd"],
-            ):
-                proc = await asyncio.create_subprocess_exec(
-                    *git_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _stdout, _stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    # Redact: git error messages echo the full remote URL,
-                    # which contains the installation token.
-                    log.warning(
-                        "Auto-sync git command failed",
-                        extra={
-                            "cmd": git_cmd[3:],
-                            "stderr": redact_token(_stderr.decode(errors="replace")),
-                        },
-                    )
-            log.info("Auto-sync before turn", extra={"turn_id": turn_id})
-            # Invalidate code graph cache — files on disk changed
-            from maki_common.tools.codegraph_tools import invalidate_graph_cache
-
-            invalidate_graph_cache(REPO_PATH)
+            return
         except Exception:
-            log.warning("Auto-pull failed, proceeding with current code", exc_info=True)
+            # Anything not caught as SyncError (programming error in the
+            # caller path, asyncio cancellation propagation, etc.) is also a
+            # reason to abort — running with stale code is worse than failing
+            # loudly.
+            log.error(
+                "Auto-sync raised unexpectedly — aborting turn",
+                exc_info=True,
+                extra={"turn_id": turn_id, "mode": mode},
+            )
+            done_msg = {
+                "turn_id": turn_id,
+                "response": "",
+                "done": True,
+                "cancelled": True,
+                "reason": "cortex_auto_sync_failed",
+            }
+            try:
+                await nc.publish(CORTEX_TURN_RESPONSE, _turn_response(done_msg))
+            except Exception:
+                log.exception(
+                    "Failed to publish auto-sync-failure done signal",
+                    extra={"turn_id": turn_id},
+                )
+            return
+
+        log.info("Auto-sync before turn", extra={"turn_id": turn_id})
+        # Invalidate code graph cache — files on disk changed
+        from maki_common.tools.codegraph_tools import invalidate_graph_cache
+
+        invalidate_graph_cache(REPO_PATH)
 
     static_context = build_system_prompt(turn)
     conv_context = build_conversation_prompt(turn)
@@ -424,8 +569,7 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 "response_len": len(response_text or ""),
             },
         )
-        response = {"turn_id": turn_id, "response": response_text, "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+        await _publish_response(nc, turn_id, response_text, done=True)
         log.info("Turn response published", extra={"turn_id": turn_id, "mode": mode})
         await _publish_token_usage(nc, turn_id, usage)
     else:
@@ -452,13 +596,11 @@ async def _process_turn(turn: dict, turn_id: str, mode: str, nc, mcp_server) -> 
                 usage_out=usage_out,
                 system_prompt=static_context or None,
             ):
-                response = {"turn_id": turn_id, "response": chunk, "done": False}
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(response).encode())
+                await _publish_response(nc, turn_id, chunk, done=False)
                 log.info("Stream chunk published", extra={"turn_id": turn_id, "chunk_len": len(chunk)})
 
         # Signal done
-        done_msg = {"turn_id": turn_id, "response": "", "done": True}
-        await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+        await _publish_response(nc, turn_id, "", done=True)
         log.info(
             "Turn stream complete",
             extra={
@@ -552,25 +694,26 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "timeout_s": CORTEX_MAX_TURN_SECONDS,
                 },
             )
-            try:
-                done_msg = {
-                    "turn_id": turn_id,
-                    "response": "",
-                    "done": True,
-                    "cancelled": True,
-                    "reason": "cortex_turn_timeout",
-                }
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-            except Exception:
-                log.exception("Failed to publish timeout done signal", extra={"turn_id": turn_id})
+            await _publish_response(
+                nc,
+                turn_id,
+                "",
+                done=True,
+                cancelled=True,
+                reason="cortex_turn_timeout",
+                log_fail_msg="Failed to publish timeout done signal",
+            )
 
         except asyncio.CancelledError:
             log.info("Turn cancelled by preemption", extra={"turn_id": turn_id, "mode": mode})
-            done_msg = {"turn_id": turn_id, "response": "", "done": True, "cancelled": True}
-            try:
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
-            except Exception:
-                log.exception("Failed to publish preemption done signal", extra={"turn_id": turn_id})
+            await _publish_response(
+                nc,
+                turn_id,
+                "",
+                done=True,
+                cancelled=True,
+                log_fail_msg="Failed to publish preemption done signal",
+            )
             # Re-raise so the cancelling caller sees the cancellation propagate.
             raise
 
@@ -583,17 +726,41 @@ async def handle_turn_request(msg, nc, mcp_server):
                     "Silent error — not forwarding to Discord",
                     extra={"turn_id": turn_id, "error": str(exc)[:200]},
                 )
-                # Still send done signal so ears cleans up, but with empty response
-                done_msg = {"turn_id": turn_id, "response": "", "done": True}
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(done_msg).encode())
+                # Still send done signal so ears cleans up, but with empty response.
+                # Mark ``cancelled=True`` so loop submitters (work/idle/care) can
+                # distinguish "cortex actually completed the work" from "cortex
+                # bailed out due to rate limit / capacity / quota". Without this
+                # flag, the work loop would treat an empty response as success,
+                # auto-close the issue with a blank comment, and wipe the
+                # per-issue failure backoff. See issue #422.
+                #
+                # Publish the exception TYPE (not str(exc) — the pattern text
+                # is what qualified it as silent, and downstream consumers
+                # only need a stable categorical tag). See issue #526.
+                await _publish_response(
+                    nc,
+                    turn_id,
+                    "",
+                    done=True,
+                    cancelled=True,
+                    reason="cortex_silent_error",
+                    error=type(exc).__name__,
+                )
             else:
-                # Genuine unexpected error — send a brief message
-                error_response = {
-                    "turn_id": turn_id,
-                    "response": "Something went wrong on my end. I'll try again next turn.",
-                    "done": True,
-                }
-                await nc.publish(CORTEX_TURN_RESPONSE, json.dumps(error_response).encode())
+                # Genuine unexpected error — send a brief message. Mark
+                # ``cancelled=True`` so loop submitters don't mistake the
+                # user-facing status text for actual task output (see #422).
+                # Discord/ears still delivers the visible message; callers that
+                # care about task completion (loops) check ``cancelled``.
+                await _publish_response(
+                    nc,
+                    turn_id,
+                    "Something went wrong on my end. I'll try again next turn.",
+                    done=True,
+                    cancelled=True,
+                    reason="cortex_error",
+                    error=type(exc).__name__,
+                )
         finally:
             _turn_state.clear()
 
@@ -608,7 +775,7 @@ async def heartbeat_loop(nc):
                     "timestamp": time.time(),
                     "model": MODEL,
                     "session_id": SESSION_ID,
-                    "instance_id": os.environ.get("HOSTNAME", "unknown"),
+                    "instance_id": INSTANCE_ID,
                     "active_turn": _turn_state.turn_id,
                     "turn_mode": _turn_state.mode,
                     "turn_started": _turn_state.started,
@@ -627,20 +794,31 @@ async def main():
     )
 
     # Health server up front so kubelet probes can connect from the moment
-    # the pod starts. The check returns 503 until NATS, the turn subscription
-    # and the heartbeat task are all live, which keeps readiness false during
-    # startup (no traffic routed) without killing the pod via liveness.
-    await tcp_health_server(port=HEALTH_PORT, check=_health_check)
+    # the pod starts. ``/health`` (readiness) returns 503 until NATS, the
+    # turn subscription and the heartbeat task are all live, keeping traffic
+    # off during startup. ``/live`` (liveness) is the narrower "would a
+    # restart fix this?" check — it stays green during NATS reconnects so
+    # kubelet doesn't SIGKILL a pod that's just waiting for the nerve to
+    # come back. Split enabled by issue #373.
+    await tcp_health_server(
+        port=HEALTH_PORT,
+        checks={"/live": _liveness_check, "/health": _readiness_check},
+    )
     log.info("Health server started", extra={"port": HEALTH_PORT})
 
     global _nc_ref, _heartbeat_task
     nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _nc_ref = nc
     js = nc.jetstream()
-    config_kv = await init_kv(js, "maki-cortex-config")
+    # init_kv_with_retry: a single ``nats.errors.TimeoutError`` from a
+    # mid-handshake JetStream API blip used to crash cortex and wedge it in
+    # CrashLoopBackOff for ≥5 min on every transient nerve hiccup (#758).
+    # ~60s of bounded retry rides out 99% of blips without masking a dead
+    # NATS — the final attempt still raises so k8s surfaces the real failure.
+    config_kv = await init_kv_with_retry(js, "maki-cortex-config")
 
     # Load GitHub App private key if configured
-    global _github_private_key
+    global _github_private_key, _github_auth
     github_private_key = None
     if GITHUB_PRIVATE_KEY_PATH and os.path.exists(GITHUB_PRIVATE_KEY_PATH):
         with open(GITHUB_PRIVATE_KEY_PATH) as f:
@@ -648,41 +826,22 @@ async def main():
         _github_private_key = github_private_key
         log.info("GitHub App private key loaded", extra={"path": GITHUB_PRIVATE_KEY_PATH})
 
-    # Clone or pull the repo for self-evolution tools
-    if github_private_key and os.path.exists(REPO_PATH):
-        log.info("Repo already present", extra={"path": REPO_PATH})
-    elif github_private_key:
-        import subprocess
+    # Build the GitHubAuth instance once so both the startup clone/pull and the
+    # per-turn hard-sync reuse it — no inline reconstruction on every turn, no
+    # authed URL hand-assembly. The token itself is minted lazily (per git
+    # invocation) inside ``maki_common.repo`` (issue #347).
+    _github_auth = build_github_auth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
 
-        from maki_common.tools.github import GitHubAuth
-
-        _auth = GitHubAuth(GITHUB_APP_ID, github_private_key, GITHUB_INSTALLATION_ID)
-        token = await _auth.get_token()
-        repo_url = f"https://x-access-token:{token}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
-        log.info("Cloning repo", extra={"path": REPO_PATH})
-        os.makedirs(os.path.dirname(REPO_PATH), exist_ok=True)
-        result = subprocess.run(
-            ["git", "clone", repo_url, REPO_PATH],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            # Redact: git's own clone error includes the auth URL, which carries
-            # a live installation token. Logs are forever; tokens shouldn't be.
-            log.error("Git clone failed", extra={"stderr": redact_token(result.stderr)})
-        else:
-            log.info("Repo cloned", extra={"path": REPO_PATH})
-
-    # Set committer identity so git commit doesn't error in a bare container.
-    # The actual author is forced to makiself[bot] via --author in git_commit_and_push.
-    if os.path.exists(REPO_PATH):
-        import subprocess as _sp
-
-        _sp.run(["git", "-C", REPO_PATH, "config", "user.name", "makiself[bot]"], capture_output=True)
-        _sp.run(
-            ["git", "-C", REPO_PATH, "config", "user.email", "makiself[bot]@users.noreply.github.com"],
-            capture_output=True,
-        )
+    # Clone (fresh) or pull (existing) the repo for self-evolution tools. This
+    # goes through ``maki_common.repo.init_repo`` — the same helper immune uses
+    # — so cortex no longer reinvents clone/pull with a sync ``subprocess.run``
+    # inside ``async def main()``, and the "repo already present" case actually
+    # syncs to origin/main at startup instead of waiting for the first turn.
+    # ``init_repo`` also configures git user.name/user.email on a fresh clone.
+    if _github_auth or os.path.exists(REPO_PATH):
+        ok = await init_repo(REPO_PATH, clone_url=CLONE_URL, github_auth=_github_auth)
+        if not ok:
+            log.warning("Repo init at startup failed — self-evolution tools may be degraded")
 
     from maki_common.tools import create_cortex_tools
 
@@ -700,7 +859,7 @@ async def main():
     )
     log.info("MCP tools registered")
 
-    _heartbeat_task = asyncio.create_task(heartbeat_loop(nc))
+    _heartbeat_task = spawn_background(heartbeat_loop(nc), name="cortex.heartbeat_loop")
     log.info("Heartbeat loop started")
 
     async def _handle_turn_message(msg) -> None:
@@ -717,8 +876,10 @@ async def main():
         try:
             turn = json.loads(msg.data.decode())
             mode = turn.get("mode", "")
+            turn_id = turn.get("turn_id", "unknown")
         except Exception:
             mode = ""
+            turn_id = "unknown"
 
         is_background = mode in _BACKGROUND_MODES
 
@@ -736,7 +897,9 @@ async def main():
 
         # No need to track the spawned task here — _turn_state.task gets
         # populated under _turn_lock the moment the handler enters its body.
-        asyncio.create_task(handle_turn_request(msg, nc, mcp_server))
+        # ``spawn_background`` anchors against GC and logs uncaught exceptions
+        # so a raised handler doesn't vanish silently (issue #123).
+        spawn_background(handle_turn_request(msg, nc, mcp_server), name=f"cortex.turn.{turn_id}")
 
     # Critical: the turn-request listener is the entire point of cortex. Wrap
     # it in ``subscribe_supervised`` so a NATS reconnect or stream drain
@@ -749,6 +912,11 @@ async def main():
             CORTEX_TURN_REQUEST,
             _handle_turn_message,
             queue="maki-cortex",
+            # Dispatch-only: the heavy turn work is spawned as a background
+            # task. Ten seconds catches a wedge in the preempt/lock path
+            # without pretending this handler runs the actual LLM turn
+            # (#492).
+            handler_timeout=10.0,
             name="cortex.turn_request",
         ),
         name="cortex.turn_request_listener",

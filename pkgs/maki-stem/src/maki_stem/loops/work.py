@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import time
-import uuid
 from datetime import UTC, datetime
 
 from maki_common import kv_get_float, spawn_background, strip_tags
-from maki_common.subjects import CORTEX_STUCK, CORTEX_TURN_REQUEST
+
+from maki_stem.turn import TurnPublishError, new_turn_id, submit_turn_single
 
 from .base import (
     UNKNOWN_ISSUER_LABEL,
@@ -48,24 +47,28 @@ WORK_CRON = "0 3 * * *"
 
 # Prompt caching note
 # -------------------
-# The Claude Code CLI (which the Agent SDK uses) wraps the system prompt with
-# Anthropic prompt-caching breakpoints. Caching is a *prefix* match, so every
-# byte before the first variable character must stay byte-identical across
-# turns for the cache to hit. We therefore split the work prompt into a static
-# header (mode description, instructions, rules — identical across every work
-# turn) and a dynamic task block (issue #, title, description, comments) that
-# changes per turn. The final system prompt is assembled by
-# :func:`assemble_loop_prompt` as:
+# The Claude Code CLI (which the Agent SDK uses) marks the tail of the system
+# prompt with an Anthropic prompt-cache breakpoint. Caching is a *prefix* match
+# keyed off that breakpoint, so every byte of ``system_prompt`` must be
+# byte-identical across turns for the cache to hit. We therefore split the
+# work prompt into a static header (mode description, instructions, rules —
+# identical across every work turn) that flows into ``system_prompt``, and a
+# dynamic task block (issue #, title, description, comments, memories, graph)
+# that flows into the *human* turn via :func:`assemble_loop_prompt`:
 #
-#     identity            (static, shared by every loop)
-#   + TOOLS_PROMPT        (static, shared by every loop)
-#   + _WORK_STATIC_PROMPT (static across all work turns)
-#   + _WORK_TASK_TEMPLATE (dynamic — filled from the issue)
-#   + memories / graph    (dynamic)
+#     system_prompt (cached):
+#         identity            (static, shared by every loop)
+#       + TOOLS_PROMPT        (static, shared by every loop)
+#       + _WORK_STATIC_PROMPT (static across all work turns)
 #
-# Everything up to and including _WORK_STATIC_PROMPT is a stable ~2 KTok
-# prefix that the API can serve from cache at 90% discount on subsequent
-# tool-use turns inside a single streaming conversation.
+#     human_prefix (per-turn):
+#         _WORK_TASK_TEMPLATE (dynamic — filled from the issue)
+#       + memories / graph    (dynamic — freshly retrieved per turn)
+#
+# Everything in ``system_prompt`` is a stable ~2 KTok prefix that the API can
+# serve from cache at 90% discount on subsequent work turns. Prior to #437
+# the memories/graph/task blocks were concatenated into ``system_prompt``,
+# which silently invalidated the cache on every turn.
 _WORK_STATIC_PROMPT = """## Work Mode
 
 You have a GitHub issue to execute. Complete it fully — code changes, commit, \
@@ -118,17 +121,20 @@ Priority: {issue_priority}
 Comments: {issue_comments}"""
 
 
-def _build_work_system_prompt(
+def _build_work_prompts(
     identity: str,
     memories: list,
     graph_context: list,
     work_context: dict,
-) -> str:
-    """Assemble the complete system prompt for a work turn.
+) -> tuple[str, str]:
+    """Assemble the (system_prompt, human_prefix) tuple for a work turn.
 
-    Delegates the shared layout (identity + tools + memories + graph) to
-    :func:`assemble_loop_prompt` and only formats the work-specific main
-    section here.
+    Delegates the shared layout (identity + tools static header vs.
+    dynamic-context/memories/graph tail) to :func:`assemble_loop_prompt` and
+    only formats the work-specific dynamic task block here. The caller
+    concatenates ``human_prefix`` onto the human-turn ``prompt`` — keeping
+    the system prompt byte-stable across work turns so Anthropic prompt
+    caching actually hits (see the "Prompt caching note" above and #437).
     """
     raw_comments = work_context.get("issue_comments", [])
     if raw_comments:
@@ -147,9 +153,7 @@ def _build_work_system_prompt(
         issue_priority=work_context.get("issue_priority", "?"),
         issue_comments=issue_comments_str,
     )
-    main_section = f"{_WORK_STATIC_PROMPT}\n\n{dynamic}"
-
-    return assemble_loop_prompt(identity, main_section, memories, graph_context)
+    return assemble_loop_prompt(identity, _WORK_STATIC_PROMPT, dynamic, memories, graph_context)
 
 
 def _issue_has_skip_label(issue: dict) -> bool:
@@ -325,7 +329,12 @@ async def _work_pre_claim_guard(config: dict, ctx: StemContext) -> bool:
 
 async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     """Execute one night work cycle: pick an issue and hand it to cortex."""
-    issues = await ctx.github.list_issues(state="open")
+    # Fetch by priority label (one API call per tier) instead of paging every
+    # open issue. The work loop only ever acts on the highest-priority head of
+    # the list, so pulling untriaged issues just to sort-and-discard them is
+    # pure API cost. list_issues_by_priority returns tiers in order (P1s first,
+    # ...), which is exactly what _select_next_issue walks. See issue #488.
+    issues = await ctx.github.list_issues_by_priority(state="open")
     if not issues:
         return
 
@@ -384,7 +393,7 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
     # Fetch issue comments so cortex has full history before starting (#39)
     issue_comments = await ctx.github.get_issue_comments(issue_number)
 
-    turn_id = f"work-{uuid.uuid4().hex[:8]}"
+    turn_id = new_turn_id("work")
     work_context = {
         "issue_number": issue_number,
         "issue_title": issue_title,
@@ -392,6 +401,11 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "issue_priority": issue_priority,
         "issue_comments": issue_comments,
     }
+    system_prompt, human_prefix = _build_work_prompts(identity, memories, graph_context, work_context)
+    # Dynamic per-turn context (task block, memories, graph) rides on the
+    # human message so ``system_prompt`` stays byte-stable across work turns —
+    # required for Anthropic prompt-cache hits. See #437.
+    human_prompt = f"{human_prefix}\n\nExecute this task." if human_prefix else "Execute this task."
     work_payload = {
         "turn_id": turn_id,
         "mode": "work",
@@ -399,71 +413,53 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
         "conversation": [],
         "memories": memories,
         "graph_context": graph_context,
-        "prompt": "Execute this task.",
+        "prompt": human_prompt,
         "stream": False,
         "max_turns": int(os.environ.get("CORTEX_WORK_MAX_TURNS", "100")),
         "git_pull": True,
         "work_context": work_context,
-        "system_prompt": _build_work_system_prompt(identity, memories, graph_context, work_context),
+        "system_prompt": system_prompt,
         **({"model": spec.model} if spec.model else {}),
     }
 
+    # Failure-counting boundary (issue #284)
+    # ---------------------------------------
+    # Only failures inside the cortex-turn boundary itself — i.e. cortex
+    # actually attempted the work and either errored or hung — should
+    # increment the per-issue failure counter. Infra failures (NATS publish,
+    # pending-session setup, post-completion GitHub refresh) mean the issue
+    # was never really attempted; counting them would silently quarantine the
+    # top-priority issue behind a `human` label after three NATS hiccups,
+    # which is exactly when the system most needs to keep running.
+    #
+    # ``submit_turn_single`` handles publish + wait + CORTEX_STUCK signalling
+    # uniformly (issue #125). It distinguishes the two failure modes we care
+    # about via exception type:
+    #   - TurnPublishError → NATS never accepted the request (infra).
+    #   - TimeoutError     → published fine but cortex hung (counts as issue).
+    #   - other Exception  → published fine but the wait errored (counts).
     try:
-        async with ctx.pending.session(turn_id) as queue:
-            await ctx.nc.publish(CORTEX_TURN_REQUEST, json.dumps(work_payload).encode())
-            log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
-
-            response_data = await asyncio.wait_for(queue.get(), timeout=WORK_TURN_TIMEOUT)
-            result_text = response_data.get("response", "")
-            clean_result = strip_tags(result_text or "")
-            log.info(
-                "Work turn complete",
-                extra={"turn_id": turn_id, "issue": issue_number},
-            )
-
-            spawn_background(
-                ctx.feed_memories(
-                    f"[Night work] Task: {issue_title} (priority P{issue_priority})",
-                    clean_result or "Task completed",
-                ),
-                name="work.feed_memories",
-            )
-
-            # Re-fetch issue to check if cortex added the "human" label (e.g. opened a PR
-            # for infra changes and left it open for Adi to review). If so, skip auto-close.
-            refreshed = await ctx.github.get_issue(issue_number)
-            if refreshed and _issue_has_skip_label(refreshed):
-                log.info(
-                    "Issue has human/draft label after work — skipping auto-close",
-                    extra={"issue": issue_number},
-                )
-            else:
-                ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-                close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
-                spawn_background(
-                    ctx.github.close_issue(issue_number, comment=close_comment),
-                    name="work.close_issue",
-                )
-
-            # Successful run — clear the failure record so any prior cooldown
-            # is lifted (in case the previous failure was transient).
-            await _clear_attempts(ctx.lock_kv, issue_number)
-
-    except TimeoutError:
-        log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
-        # Publish stuck signal for immune
-        await ctx.nc.publish(
-            CORTEX_STUCK,
-            json.dumps(
-                {
-                    "turn_id": turn_id,
-                    "mode": "work",
-                    "timeout_seconds": WORK_TURN_TIMEOUT,
-                    "user_waiting": False,
-                }
-            ).encode(),
+        log.info("Work turn publishing", extra={"turn_id": turn_id, "issue": issue_number})
+        response_data = await submit_turn_single(
+            ctx,
+            turn_id=turn_id,
+            payload=work_payload,
+            timeout=WORK_TURN_TIMEOUT,
+            mode="work",
+            user_waiting=False,
         )
-
+        log.info("Work turn published", extra={"turn_id": turn_id, "issue": issue_number})
+    except TurnPublishError:
+        # --- Phase 1 (INFRA): publish failed; cortex never started. ---
+        log.exception(
+            "Work turn publish failed — infra issue, not counting against issue",
+            extra={"turn_id": turn_id, "issue": issue_number},
+        )
+        return
+    except TimeoutError:
+        # --- Phase 2 (ISSUE): cortex received but did not respond in time. ---
+        # CORTEX_STUCK was already emitted inside ``submit_turn_single``.
+        log.error("Work turn timed out", extra={"turn_id": turn_id, "issue": issue_number})
         new_count = await _record_work_failure(ctx, issue_number, "timeout")
         spawn_background(
             ctx.github.comment_issue(
@@ -476,12 +472,21 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ),
             name="work.timeout_comment",
         )
-
+        return
     except Exception:
-        log.exception("Work turn failed", extra={"turn_id": turn_id, "issue": issue_number})
-
+        # --- Phase 2 (ISSUE): pending-session setup succeeded but wait errored. ---
+        # Historically this branch also covered the outer ``pending.session``
+        # setup/exit failure as an infra event, but in practice such failures
+        # come from the pending-queue plumbing itself and are extremely rare;
+        # treating them as an issue-side failure keeps the exception matrix
+        # trivially readable and still respects the cooldown/human-escalation
+        # behaviour (a single truly transient blip only bumps the counter by
+        # one and is cleared on the next successful run).
+        log.exception(
+            "Work turn failed while awaiting cortex response",
+            extra={"turn_id": turn_id, "issue": issue_number},
+        )
         new_count = await _record_work_failure(ctx, issue_number, "exception")
-        # Comment on issue about failure (issue stays open for retry, but in cooldown)
         spawn_background(
             ctx.github.comment_issue(
                 issue_number,
@@ -493,6 +498,101 @@ async def _work_body(spec: LoopSpec, config: dict, ctx: StemContext) -> None:
             ),
             name="work.failure_comment",
         )
+        return
+
+    # Defensive contract check (issue #422)
+    # -------------------------------------
+    # ``done=True`` alone is not a completion signal — cortex publishes it on
+    # every terminal path, including silent rate-limit / capacity bailouts and
+    # generic errors where zero real work happened. Treat any of the following
+    # as a failure and route to the same backoff path as an exception:
+    #
+    #   - ``cancelled=True`` (cortex explicitly bailed — timeout, preemption,
+    #     silent error, generic error, cortex restart).
+    #   - Empty response body (cortex published a done chunk with nothing in it
+    #     — historically the silent-error branch did this without a cancelled
+    #     flag; belt-and-suspenders in case any future path repeats that).
+    #
+    # Without this guard, a 529/overloaded burst against cortex's model would
+    # cause the work loop to auto-close the issue with a blank "Task
+    # completed." comment, pollute memories with a phantom completion, and
+    # wipe the per-issue failure backoff via ``_clear_attempts``.
+    result_text = response_data.get("response", "")
+    cancelled = bool(response_data.get("cancelled"))
+    if cancelled or not result_text.strip():
+        reason = response_data.get("reason") or ("cancelled" if cancelled else "empty_response")
+        log.warning(
+            "Work turn returned no usable result — treating as failure",
+            extra={
+                "turn_id": turn_id,
+                "issue": issue_number,
+                "cancelled": cancelled,
+                "reason": reason,
+                "response_len": len(result_text),
+            },
+        )
+        new_count = await _record_work_failure(ctx, issue_number, reason)
+        spawn_background(
+            ctx.github.comment_issue(
+                issue_number,
+                (
+                    f"⚠️ **Work bailed out** ({reason}, failure {new_count}). "
+                    f"Backing off — next eligible retry in "
+                    f"~{_backoff_seconds(new_count) // 3600}h."
+                ),
+            ),
+            name="work.cancelled_comment",
+        )
+        return
+
+    clean_result = strip_tags(result_text)
+    log.info(
+        "Work turn complete",
+        extra={"turn_id": turn_id, "issue": issue_number},
+    )
+
+    spawn_background(
+        ctx.feed_memories(
+            f"[Night work] Task: {issue_title} (priority P{issue_priority})",
+            clean_result or "Task completed",
+        ),
+        name="work.feed_memories",
+    )
+
+    # --- Phase 3: post-processing (INFRA) ---
+    # Re-fetch issue to check if cortex added the "human" label (e.g.
+    # opened a PR for infra changes and left it open for Adi to
+    # review). If the refresh itself flakes, skip auto-close rather
+    # than counting it against the issue — cortex already ran.
+    try:
+        refreshed = await ctx.github.get_issue(issue_number)
+    except Exception:
+        log.warning(
+            "Failed to refresh issue after work — skipping auto-close",
+            extra={"issue": issue_number},
+            exc_info=True,
+        )
+        refreshed = None
+
+    if refreshed is None:
+        # Couldn't determine current state; leave the issue alone.
+        pass
+    elif _issue_has_skip_label(refreshed):
+        log.info(
+            "Issue has human/draft label after work — skipping auto-close",
+            extra={"issue": issue_number},
+        )
+    else:
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        close_comment = f"✅ **Task completed.**\n\n{clean_result}\n\nTime: {ts}"
+        spawn_background(
+            ctx.github.close_issue(issue_number, comment=close_comment),
+            name="work.close_issue",
+        )
+
+    # Successful run — clear the failure record so any prior cooldown
+    # is lifted (in case the previous failure was transient).
+    await _clear_attempts(ctx.lock_kv, issue_number)
 
 
 WORK_LOOP_SPEC = LoopSpec(

@@ -1,16 +1,27 @@
 """maki-common: Shared utilities for Maki services."""
 
 from maki_common.config import apply_config_updates, parse_config_tags, parse_tagged, strip_tags
+from maki_common.db import build_pg_dsn
+from maki_common.endpoints import DEFAULT_PORTS, default_health_endpoints
 from maki_common.futures import PendingFutures, PendingQueues
 from maki_common.logging import configure_logging, get_logger
+from maki_common.models import DEFAULT_CLAUDE_MODEL
 from maki_common.nats import (
+    NatsTerminalError,
     connect_nats,
     init_kv,
+    init_kv_with_retry,
+    kv_acquire_lease,
     kv_get_float,
     kv_put_float,
     load_kv_config,
     subscribe_supervised,
     try_claim_loop,
+)
+from maki_common.prompts import (
+    format_graph_block,
+    format_memories_block,
+    format_system_state_lines,
 )
 from maki_common.tasks import active_background_task_count, spawn_background
 
@@ -20,13 +31,23 @@ __all__ = [
     "__version__",
     "active_background_task_count",
     "apply_config_updates",
+    "build_pg_dsn",
     "configure_logging",
     "connect_nats",
+    "DEFAULT_CLAUDE_MODEL",
+    "DEFAULT_PORTS",
+    "default_health_endpoints",
+    "format_graph_block",
+    "format_memories_block",
+    "format_system_state_lines",
     "get_logger",
     "init_kv",
+    "init_kv_with_retry",
+    "kv_acquire_lease",
     "kv_get_float",
     "kv_put_float",
     "load_kv_config",
+    "NatsTerminalError",
     "try_claim_loop",
     "parse_config_tags",
     "parse_tagged",

@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
-from maki_common.repo import RepoEntry, RepoRegistry, redact_token
+from maki_common.repo import (
+    GIT_LOCAL_TIMEOUT_S,
+    GIT_NETWORK_TIMEOUT_S,
+    RepoEntry,
+    RepoRegistry,
+    SyncError,
+    _git_op_timeout,
+    clean_remote_url,
+    hard_sync,
+    init_repo,
+    redact_token,
+    set_origin,
+)
 
 
 def test_redact_token_strips_url_form() -> None:
@@ -52,6 +67,66 @@ def test_redact_token_handles_empty_and_none_like() -> None:
     assert redact_token("") == ""
 
 
+def test_redact_token_strips_basic_auth_header() -> None:
+    """Issue #347: tokens now ride in Authorization: Basic <b64> headers.
+
+    The header value is base64-encoded so the bare-token regex won't catch
+    it; the dedicated Basic-auth pattern must.
+    """
+    import base64
+
+    encoded = base64.b64encode(b"x-access-token:ghs_aaaaaaaaaaaaaaaaaaaa").decode()
+    msg = f"some diagnostic: Authorization: Basic {encoded} (do not log this)"
+    redacted = redact_token(msg)
+    assert encoded not in redacted
+    assert "Authorization: Basic ***" in redacted
+
+
+def test_hard_sync_never_writes_token_into_remote_url() -> None:
+    """Regression for issue #347.
+
+    Older versions ran `git remote set-url origin https://x-access-token:TOKEN@...`
+    which persisted the installation token on disk in `.git/config` for the
+    full ~1h token TTL — readable by any process with filesystem access. The
+    fix injects auth per-invocation via `-c http.extraheader=...` instead.
+
+    This test pins the new invariant: the value passed to `set-url` must
+    NEVER contain the token. Catches any future refactor that re-introduces
+    the embedded-token URL pattern.
+    """
+    secret_token = "ghs_supersecret_NEVER_ON_DISK_xxxxxxxxxx"
+
+    class _LeakingAuth:
+        async def get_token(self) -> str:
+            return secret_token
+
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # remote set-url
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(
+            hard_sync(
+                "/repo/maki",
+                github_auth=_LeakingAuth(),
+                owner="adhityaravi",
+                name="maki",
+            )
+        )
+
+    # The secret must NEVER appear in any positional arg passed to git.
+    # `set-url` writes its argument to `.git/config`; if the token shows up
+    # here, it's on disk.
+    for argv in calls:
+        for arg in argv:
+            assert secret_token not in arg, (
+                f"Issue #347 regression: installation token leaked into git argv {argv!r}; "
+                "tokens must be injected via `_run_git(..., token=...)` only."
+            )
+
+
 # ---------------------------------------------------------------------------
 # RepoRegistry — multi-repo workspace resolution.
 #
@@ -68,7 +143,10 @@ def _make_git_dir(tmp_path: Path, name: str) -> Path:
 
 def test_registry_resolves_default_when_repo_arg_missing(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    # `sync_ttl_seconds=inf` disables the sync-on-resolve path (issue #450) so
+    # this test — which is only exercising registration lookup, not freshness
+    # — doesn't try to `git fetch` against a fake `.git` dir.
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     entry = asyncio.run(reg.resolve(None))
@@ -83,7 +161,7 @@ def test_registry_resolves_default_when_repo_arg_missing(tmp_path: Path) -> None
 
 def test_registry_resolves_known_short_and_full_keys(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     by_name = asyncio.run(reg.resolve("maki"))
@@ -93,14 +171,14 @@ def test_registry_resolves_known_short_and_full_keys(tmp_path: Path) -> None:
 
 def test_registry_returns_none_for_unknown_short_name(tmp_path: Path) -> None:
     repo = _make_git_dir(tmp_path, "maki")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(RepoEntry(path=str(repo), owner="adhityaravi", name="maki"), default=True)
 
     assert asyncio.run(reg.resolve("charmarr")) is None
 
 
 def test_registry_returns_none_when_no_default_and_no_arg() -> None:
-    reg = RepoRegistry(workspace_root="/tmp")
+    reg = RepoRegistry(workspace_root="/tmp", sync_ttl_seconds=float("inf"))
     assert asyncio.run(reg.resolve(None)) is None
     assert reg.default() is None
 
@@ -108,7 +186,7 @@ def test_registry_returns_none_when_no_default_and_no_arg() -> None:
 def test_registry_auto_registers_owner_slash_name_for_existing_clone(tmp_path: Path) -> None:
     """If the workspace already has a `.git` dir, no clone is attempted."""
     repo = _make_git_dir(tmp_path, "charmarr")
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     # No default, but owner/name still resolves because the path already exists.
     entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
     assert entry is not None
@@ -124,7 +202,7 @@ def test_registry_inherits_default_auth_for_auto_registered(tmp_path: Path) -> N
     _make_git_dir(tmp_path, "maki")
     _make_git_dir(tmp_path, "charmarr")
     sentinel_auth = object()
-    reg = RepoRegistry(workspace_root=str(tmp_path))
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=float("inf"))
     reg.register(
         RepoEntry(
             path=str(tmp_path / "maki"),
@@ -141,10 +219,195 @@ def test_registry_inherits_default_auth_for_auto_registered(tmp_path: Path) -> N
 
 
 def test_registry_rejects_malformed_owner_slash_name() -> None:
-    reg = RepoRegistry(workspace_root="/tmp")
+    reg = RepoRegistry(workspace_root="/tmp", sync_ttl_seconds=float("inf"))
     assert asyncio.run(reg.resolve("/")) is None
     assert asyncio.run(reg.resolve("owner/")) is None
     assert asyncio.run(reg.resolve("/name")) is None
+
+
+# ---------------------------------------------------------------------------
+# Sync-on-resolve — issue #450. Before this change, `RepoRegistry.resolve`
+# only ever cloned an auxiliary `owner/name` repo once. Every subsequent
+# tool call saw the day-0 disk snapshot, however many days later. These
+# tests pin the new contract:
+#
+#   1. First resolve of an existing (already-cloned) auxiliary repo triggers
+#      `hard_sync` — the original bug's fix.
+#   2. A burst of tool calls within `sync_ttl_seconds` folds down to ONE
+#      fetch (TTL cache). Without this, chatty codegraph tool calls would
+#      hammer GitHub.
+#   3. Once TTL elapses, the next resolve fetches again.
+#   4. Fresh clones don't double-sync — they're already at HEAD.
+#   5. Sync failure returns None. We refuse to serve possibly-stale data;
+#      that's exactly the silent-stale failure mode issue #290 forbade.
+# ---------------------------------------------------------------------------
+
+
+def test_registry_syncs_existing_clone_on_first_resolve(tmp_path: Path) -> None:
+    """Issue #450: auxiliary repos with a `.git` dir must still get fetched.
+
+    Previously the guard `if not os.path.exists(.git)` short-circuited every
+    resolve after the initial clone. This test asserts `hard_sync` now runs
+    on the first resolve after (re)startup even when the clone is present.
+    """
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append((repo_path, kwargs))
+
+    with mock.patch("maki_common.repo.hard_sync", fake_hard_sync):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is not None
+    assert entry.name == "charmarr"
+    assert len(calls) == 1
+    assert calls[0][0] == str(tmp_path / "charmarr")
+    # The clone URL must be passed so hard_sync can rewrite `origin` to the
+    # token-free form (issue #347).
+    assert calls[0][1]["clone_url"] == "https://github.com/adhityaravi/charmarr.git"
+
+
+def test_registry_folds_burst_of_resolves_within_ttl_to_one_sync(tmp_path: Path) -> None:
+    """A chatty burst of tool calls must NOT trigger N network fetches."""
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append(repo_path)
+
+    fake_now = [1000.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.time.monotonic", fake_monotonic),
+    ):
+        # First resolve: last_synced_at=0.0, so 1000-0 >= 60 → sync.
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        # Advance 30s (still inside 60s TTL) — must NOT sync again.
+        fake_now[0] += 30.0
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert calls == [str(tmp_path / "charmarr")]
+
+
+def test_registry_re_syncs_after_ttl_expiry(tmp_path: Path) -> None:
+    """The TTL bounds burst cost, but the repo still eventually gets fresh."""
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        calls.append(repo_path)
+
+    fake_now = [1000.0]
+
+    def fake_monotonic() -> float:
+        return fake_now[0]
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.time.monotonic", fake_monotonic),
+    ):
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+        assert len(calls) == 1
+        # Advance well past the TTL — next resolve must fetch again.
+        fake_now[0] += 120.0
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert len(calls) == 2
+
+
+def test_registry_sync_failure_returns_none_not_stale_entry(tmp_path: Path) -> None:
+    """Loud failure over silent staleness (issue #290 contract).
+
+    If `hard_sync` fails we cannot know whether the disk is fresh. Rather
+    than serve a possibly-week-old snapshot and let the caller reason about
+    stale code, `resolve` returns None. Same shape as clone-failure today.
+    """
+    _make_git_dir(tmp_path, "charmarr")
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    async def failing_hard_sync(repo_path: str, **kwargs) -> None:
+        raise SyncError("fetch", 1, "fatal: could not resolve host github.com")
+
+    with mock.patch("maki_common.repo.hard_sync", failing_hard_sync):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is None
+
+
+def test_registry_fresh_clone_does_not_double_sync(tmp_path: Path) -> None:
+    """A brand-new clone is at origin/HEAD already — no fetch needed."""
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+
+    hard_sync_calls: list[str] = []
+    init_repo_calls: list[str] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        hard_sync_calls.append(repo_path)
+
+    async def fake_init_repo(repo_path: str, *args, **kwargs) -> bool:
+        init_repo_calls.append(repo_path)
+        # Simulate the clone by creating the `.git` dir the guard checks for.
+        os.makedirs(os.path.join(repo_path, ".git"), exist_ok=True)
+        return True
+
+    with (
+        mock.patch("maki_common.repo.hard_sync", fake_hard_sync),
+        mock.patch("maki_common.repo.init_repo", fake_init_repo),
+    ):
+        entry = asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert entry is not None
+    assert len(init_repo_calls) == 1
+    # Critical: hard_sync must NOT have run after the clone — the freshly
+    # cloned tree is already at origin/HEAD, and re-fetching would waste a
+    # network round-trip on every first-clone.
+    assert hard_sync_calls == []
+    # And the entry's timestamp is set so the next same-turn resolve
+    # (within the TTL) is a no-op.
+    assert entry.last_synced_at > 0.0
+
+
+def test_registry_sync_uses_entry_auth(tmp_path: Path) -> None:
+    """Auth from the registered entry must flow through to `hard_sync`."""
+    _make_git_dir(tmp_path, "charmarr")
+    sentinel_auth = object()
+    reg = RepoRegistry(workspace_root=str(tmp_path), sync_ttl_seconds=60.0)
+    reg.register(
+        RepoEntry(
+            path=str(tmp_path / "charmarr"),
+            owner="adhityaravi",
+            name="charmarr",
+            auth=sentinel_auth,
+        )
+    )
+
+    seen_auth: list[object] = []
+
+    async def fake_hard_sync(repo_path: str, **kwargs) -> None:
+        seen_auth.append(kwargs.get("github_auth"))
+
+    with mock.patch("maki_common.repo.hard_sync", fake_hard_sync):
+        asyncio.run(reg.resolve("adhityaravi/charmarr"))
+
+    assert seen_auth == [sentinel_auth]
+
+
+def test_registry_repo_entry_last_synced_at_defaults_to_zero() -> None:
+    """New entries default to `never synced` so the first resolve fetches."""
+    entry = RepoEntry(path="/repo/x", owner="o", name="x")
+    assert entry.last_synced_at == 0.0
 
 
 def test_repo_entry_default_clone_url_uses_owner_name() -> None:
@@ -160,3 +423,444 @@ def test_repo_entry_explicit_clone_url_overrides() -> None:
         clone_url="https://example.invalid/x.git",
     )
     assert entry.resolved_clone_url() == "https://example.invalid/x.git"
+
+
+# ---------------------------------------------------------------------------
+# hard_sync — the abort-on-first-failure replacement for cortex's inline
+# fetch/reset/clean pipeline. The original bug (#290) was that a failed
+# `git fetch` only logged a warning and the loop kept going to
+# `git reset --hard origin/main`, silently running the turn against stale
+# code. These tests pin down the new "raise SyncError, do nothing more"
+# contract by stubbing out `_run_git` and asserting both the call order and
+# the failure semantics.
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_git(*results: tuple[int, str, str]):
+    """Return an async stub for `_run_git` that yields `results` in order.
+
+    Also records every call so tests can assert that hard_sync stops at the
+    first non-zero step (no `reset --hard` after a failed `fetch`).
+
+    The stub accepts a `token=` kwarg (issue #347 — installation tokens are
+    now injected per-invocation via `_run_git(..., token=...)`) and exposes
+    the per-call token under ``stub.token_calls`` so tests can verify that
+    fetch/pull/push run with auth and local-only steps (reset, clean) do not.
+    """
+    calls: list[tuple[str, ...]] = []
+    token_calls: list[str | None] = []
+    iterator = iter(results)
+
+    async def stub(repo_path: str, *args: str, token: str | None = None) -> tuple[int, str, str]:
+        calls.append(args)
+        token_calls.append(token)
+        try:
+            return next(iterator)
+        except StopIteration:  # pragma: no cover — defensive
+            raise AssertionError(f"_run_git called more times than stubbed: {args}") from None
+
+    stub.token_calls = token_calls  # type: ignore[attr-defined]
+    return stub, calls
+
+
+def test_hard_sync_success_runs_fetch_reset_clean_in_order() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(hard_sync("/repo/maki"))
+    assert calls == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+        ("clean", "-fd"),
+    ]
+
+
+def test_hard_sync_aborts_on_fetch_failure_does_not_reset() -> None:
+    """The whole point: a failed fetch must NOT proceed to reset/clean."""
+    stub, calls = _fake_run_git(
+        (1, "", "fatal: unable to access remote: connection refused"),
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "fetch"
+            assert exc.returncode == 1
+            assert "connection refused" in exc.stderr
+        else:  # pragma: no cover — should have raised
+            raise AssertionError("hard_sync should have raised SyncError on fetch failure")
+    # Critical assertion for issue #290: no reset --hard ran after the failed fetch.
+    assert calls == [("fetch", "origin", "main")]
+
+
+def test_hard_sync_aborts_on_reset_failure_does_not_clean() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # fetch OK
+        (128, "", "fatal: reset failed"),  # reset fails
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "reset"
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on reset failure")
+    assert calls == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+    ]
+
+
+def test_hard_sync_aborts_on_clean_failure() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),
+        (0, "", ""),
+        (1, "", "could not unlink working tree file"),
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "clean"
+            assert "unlink" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on clean failure")
+    assert len(calls) == 3
+
+
+class _FakeAuth:
+    def __init__(self, token: str = "ghs_test_token_xxxxxxxxxxxxxxxxxxxx") -> None:
+        self._token = token
+
+    async def get_token(self) -> str:
+        return self._token
+
+
+def test_hard_sync_with_auth_sets_remote_url_first_then_fetch() -> None:
+    stub, calls = _fake_run_git(
+        (0, "", ""),  # remote set-url
+        (0, "", ""),  # fetch
+        (0, "", ""),  # reset
+        (0, "", ""),  # clean
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        asyncio.run(
+            hard_sync(
+                "/repo/maki",
+                github_auth=_FakeAuth(),
+                owner="adhityaravi",
+                name="maki",
+            )
+        )
+    assert calls[0][:3] == ("remote", "set-url", "origin")
+    # Issue #347: the URL written to .git/config must be token-free. The
+    # installation token is injected per-invocation on the fetch step below
+    # via `git -c http.extraheader=...` instead.
+    assert "x-access-token:" not in calls[0][3]
+    assert "ghs_" not in calls[0][3]
+    assert calls[0][3] == "https://github.com/adhityaravi/maki.git"
+    assert calls[1:] == [
+        ("fetch", "origin", "main"),
+        ("reset", "--hard", "origin/main"),
+        ("clean", "-fd"),
+    ]
+    # And the token flows only to the network-facing step. set-url, reset,
+    # clean are all local and must run without auth.
+    assert stub.token_calls[0] is None  # type: ignore[attr-defined]
+    assert stub.token_calls[1] == "ghs_test_token_xxxxxxxxxxxxxxxxxxxx"  # type: ignore[attr-defined]
+    assert stub.token_calls[2] is None  # type: ignore[attr-defined]
+    assert stub.token_calls[3] is None  # type: ignore[attr-defined]
+
+
+def test_hard_sync_aborts_on_set_url_failure_does_not_fetch() -> None:
+    """A silent set-url failure was a sub-bug of #290 — make it loud."""
+    stub, calls = _fake_run_git(
+        (1, "", "fatal: bad remote"),  # set-url fails
+    )
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_FakeAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "remote set-url"
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should have raised on set-url failure")
+    # Critical: no fetch ran after the failed set-url.
+    assert calls == [("remote", "set-url", "origin", calls[0][3])]
+
+
+def test_hard_sync_with_auth_requires_url_or_owner_name() -> None:
+    try:
+        asyncio.run(hard_sync("/repo/maki", github_auth=_FakeAuth()))
+    except ValueError as exc:
+        assert "clone_url" in str(exc) or "owner" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("hard_sync should require owner/name or clone_url with github_auth")
+
+
+# ---------------------------------------------------------------------------
+# clean_remote_url / set_origin — the URL-construction primitive and its
+# set-url wrapper. Single source of truth for the remote URL form; every
+# clone/set-url call in hard_sync, init_repo, git_commit_and_push, git_pull
+# and RepoEntry.resolved_clone_url flows through these. See issue #153.
+# ---------------------------------------------------------------------------
+
+
+def test_clean_remote_url_returns_token_free_https_form() -> None:
+    """Issue #347 invariant: the URL must be token-free."""
+    url = clean_remote_url("adhityaravi", "maki")
+    assert url == "https://github.com/adhityaravi/maki.git"
+    assert "x-access-token" not in url
+    assert "@" not in url
+
+
+def test_clean_remote_url_composes_arbitrary_owner_and_name() -> None:
+    """Regression guard: change here shouldn't silently break other repos."""
+    assert clean_remote_url("some-org", "cool_repo") == "https://github.com/some-org/cool_repo.git"
+
+
+def test_repo_entry_resolved_clone_url_uses_helper() -> None:
+    """RepoEntry now delegates to clean_remote_url — pin the composition."""
+    entry = RepoEntry(path="/repo/x", owner="o", name="x")
+    assert entry.resolved_clone_url() == clean_remote_url("o", "x")
+
+
+def test_set_origin_runs_git_remote_set_url_with_given_url() -> None:
+    stub, calls = _fake_run_git((0, "", ""))
+    with mock.patch("maki_common.repo._run_git", stub):
+        rc, stderr = asyncio.run(set_origin("/repo/maki", "https://github.com/o/n.git"))
+    assert rc == 0
+    assert stderr == ""
+    assert calls == [("remote", "set-url", "origin", "https://github.com/o/n.git")]
+    # set-url is local; must never carry an auth token.
+    assert stub.token_calls == [None]  # type: ignore[attr-defined]
+
+
+def test_set_origin_returns_returncode_and_stderr_on_failure() -> None:
+    """Callers pick their own error semantics — helper just surfaces (rc, stderr)."""
+    stub, _ = _fake_run_git((128, "", "fatal: bad remote"))
+    with mock.patch("maki_common.repo._run_git", stub):
+        rc, stderr = asyncio.run(set_origin("/repo/maki", "https://github.com/o/n.git"))
+    assert rc == 128
+    assert "fatal: bad remote" in stderr
+
+
+def test_hard_sync_token_mint_failure_surfaces_as_sync_error() -> None:
+    class _BrokenAuth:
+        async def get_token(self) -> str:
+            raise RuntimeError("installation revoked")
+
+    stub, calls = _fake_run_git()  # no git calls expected
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_BrokenAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "token"
+            assert "installation revoked" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap token-mint failure in SyncError")
+
+
+# ---------------------------------------------------------------------------
+# Subprocess timeout guard — issue #499. Without ``asyncio.wait_for`` around
+# ``proc.communicate()``, a hung ``git`` (DNS stall, SSH interactive prompt,
+# ``.git/index.lock`` contention) pins ``hard_sync`` / ``init_repo`` /
+# ``RepoRegistry.resolve`` indefinitely. These tests pin the new contract:
+# the deadline is enforced, timeouts surface as ``SyncError`` (for
+# ``hard_sync``) or ``False`` (for ``init_repo``) so callers keep their
+# single-signal error handling.
+# ---------------------------------------------------------------------------
+
+
+def test_git_op_timeout_picks_network_deadline_for_fetch() -> None:
+    assert _git_op_timeout(("fetch", "origin", "main")) == GIT_NETWORK_TIMEOUT_S
+
+
+def test_git_op_timeout_picks_network_deadline_for_pull_push_clone_lsremote() -> None:
+    """Every network subcommand should route to the longer deadline."""
+    for net_cmd in ("fetch", "pull", "push", "clone", "ls-remote"):
+        assert _git_op_timeout((net_cmd,)) == GIT_NETWORK_TIMEOUT_S, net_cmd
+
+
+def test_git_op_timeout_picks_local_deadline_for_reset_and_clean() -> None:
+    assert _git_op_timeout(("reset", "--hard", "origin/main")) == GIT_LOCAL_TIMEOUT_S
+    assert _git_op_timeout(("clean", "-fd")) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_git_op_timeout_skips_leading_option_flags() -> None:
+    """`-c http.extraheader=...` and `-C repo` come before the subcommand."""
+    # The auth prefix from `_auth_config_args`:  `-c`  `http.extraheader=...`
+    assert _git_op_timeout(("-c", "http.extraheader=Authorization: Basic xxx", "fetch")) == GIT_NETWORK_TIMEOUT_S
+    # `-C` also takes a value; skip both and land on the subcommand.
+    assert _git_op_timeout(("-C", "/some/repo", "status", "--short")) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_git_op_timeout_defaults_to_local_when_no_subcommand() -> None:
+    """Pathological: only flags, no subcommand. Fall back to the safer default."""
+    assert _git_op_timeout(("--version",)) == GIT_LOCAL_TIMEOUT_S
+    assert _git_op_timeout(()) == GIT_LOCAL_TIMEOUT_S
+
+
+def test_run_git_raises_timeout_when_subprocess_hangs() -> None:
+    """A hung git process must not pin the awaiting coroutine forever.
+
+    Uses `sleep 30` as a stand-in for a hung git; the fix wraps
+    `proc.communicate()` in `asyncio.wait_for` and kills the process on
+    timeout. Without the fix this test hangs for 30s then fails on the
+    outer pytest deadline — with the fix it raises TimeoutError in <1s.
+    """
+    import maki_common.repo as repo_mod
+
+    async def _run() -> None:
+        # Monkey-patch create_subprocess_exec to spawn `sleep 30` instead of
+        # git — so we're testing the wait-for/kill logic without needing a
+        # real hung git.
+        original = asyncio.create_subprocess_exec
+
+        async def fake_exec(*_args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+            return await original("sleep", "30", **kwargs)
+
+        with mock.patch("maki_common.repo.asyncio.create_subprocess_exec", fake_exec):
+            try:
+                await repo_mod._run_git("/tmp", "status", timeout=0.5)
+            except TimeoutError as exc:
+                assert "exceeded" in str(exc) or "status" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("_run_git should raise TimeoutError on subprocess hang")
+
+    asyncio.run(_run())
+
+
+def test_run_git_no_cwd_raises_timeout_when_subprocess_hangs() -> None:
+    """Mirror of the _run_git timeout test for the clone-shape helper."""
+    import maki_common.repo as repo_mod
+
+    async def _run() -> None:
+        original = asyncio.create_subprocess_exec
+
+        async def fake_exec(*_args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+            return await original("sleep", "30", **kwargs)
+
+        with mock.patch("maki_common.repo.asyncio.create_subprocess_exec", fake_exec):
+            try:
+                await repo_mod._run_git_no_cwd("clone", "https://example.invalid/x.git", "/tmp/x", timeout=0.5)
+            except TimeoutError as exc:
+                assert "exceeded" in str(exc) or "clone" in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError("_run_git_no_cwd should raise TimeoutError on subprocess hang")
+
+    asyncio.run(_run())
+
+
+def test_hard_sync_wraps_fetch_timeout_in_sync_error() -> None:
+    """A hung `git fetch` must surface as `SyncError('fetch', None, ...)`.
+
+    Callers (cortex `_process_turn`, `RepoRegistry.resolve`) only catch
+    `SyncError` — an unhandled `TimeoutError` bubbling out of `_run_git`
+    would either wedge the turn task or take down a supervisor. The
+    conversion preserves the single-exception contract.
+    """
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git fetch origin main exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "fetch"
+            assert exc.returncode is None
+            assert "exceeded" in exc.stderr
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap TimeoutError as SyncError")
+
+
+def test_hard_sync_wraps_reset_timeout_in_sync_error() -> None:
+    """Same treatment for the local-op steps — reset/clean can also hang."""
+    calls: list[tuple[str, ...]] = []
+
+    async def stub(repo_path: str, *args: str, **_kwargs: Any) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[0] == "fetch":
+            return (0, "", "")
+        raise TimeoutError(f"git {' '.join(args)} exceeded 120.0s")
+
+    with mock.patch("maki_common.repo._run_git", stub):
+        try:
+            asyncio.run(hard_sync("/repo/maki"))
+        except SyncError as exc:
+            assert exc.step == "reset"
+            assert exc.returncode is None
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap reset TimeoutError as SyncError")
+
+
+def test_hard_sync_wraps_set_url_timeout_in_sync_error() -> None:
+    """set_origin (a wrapper around _run_git) can also hang — cover the auth branch."""
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git remote set-url origin ... exceeded 120.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        try:
+            asyncio.run(
+                hard_sync(
+                    "/repo/maki",
+                    github_auth=_FakeAuth(),
+                    owner="adhityaravi",
+                    name="maki",
+                )
+            )
+        except SyncError as exc:
+            assert exc.step == "remote set-url"
+            assert exc.returncode is None
+        else:  # pragma: no cover
+            raise AssertionError("hard_sync should wrap set-url TimeoutError as SyncError")
+
+
+def test_init_repo_returns_false_on_clone_timeout(tmp_path: Path) -> None:
+    """A hung `git clone` in init_repo must not pin pod startup.
+
+    `init_repo` is called at cortex/immune boot and under
+    `RepoRegistry._clone_lock` for every unknown auto-cloned repo — one
+    hung clone would wedge the pod's entire tool-call pipeline. The fix
+    returns `False` (same signal callers already handle for a failed
+    clone) instead of hanging forever.
+    """
+    clone_target = tmp_path / "fresh"
+
+    async def hanging_run_git_no_cwd(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git clone ... exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git_no_cwd", hanging_run_git_no_cwd):
+        ok = asyncio.run(init_repo(str(clone_target), "https://github.com/o/n.git"))
+    assert ok is False
+
+
+def test_init_repo_returns_false_on_pull_timeout(tmp_path: Path) -> None:
+    """Existing-clone branch: `git pull` timeout also returns False (not raise)."""
+    clone_target = tmp_path / "existing"
+    (clone_target / ".git").mkdir(parents=True)
+
+    async def hanging_run_git(*_args: Any, **_kwargs: Any) -> tuple[int, str, str]:
+        raise TimeoutError("git pull --rebase origin main exceeded 300.0s")
+
+    with mock.patch("maki_common.repo._run_git", hanging_run_git):
+        ok = asyncio.run(init_repo(str(clone_target), "https://github.com/o/n.git"))
+    assert ok is False

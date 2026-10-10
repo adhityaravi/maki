@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from maki_common.github_client import API, GitHubIssueClient
+from maki_common.tools.github import GitHubAuth
 
 
 def _run(coro):
@@ -33,7 +34,7 @@ def _make_client(handler) -> GitHubIssueClient:
         async def headers(self) -> dict[str, str]:
             return {"Authorization": "Bearer test-token"}
 
-    client._auth = _StubAuth()
+    client._auth = cast(GitHubAuth, _StubAuth())
     return client
 
 
@@ -279,6 +280,336 @@ def test_list_issues_empty_on_http_error():
 
     client = _make_client(handler)
     assert _run(client.list_issues()) == []
+
+
+def test_list_issues_sorts_by_priority_before_truncating():
+    """Regression for #404: newest P1/P2 issues must survive the cap.
+
+    Regardless of fetch direction, the priority sort must lift P1/P2 issues
+    to the head of the returned list *before* any cap-driven truncation, so
+    they always survive. The pages here are yielded in fixed order (P4s
+    first, P1/P2 last) to simulate a fetch where high-priority items live
+    on the trailing page — the head of the returned slice must still be
+    the P1/P2, not P4 filler.
+    """
+    # Page 1: 100 low-priority issues (P4).
+    page1 = [{"number": i, "labels": [{"name": "P4"}]} for i in range(100)]
+    # Page 2: 100 more low-priority (P4).
+    page2 = [{"number": 100 + i, "labels": [{"name": "P4"}]} for i in range(100)]
+    # Page 3: the tail — a P1 and P2 that must not be lost.
+    page3 = [
+        {"number": 200, "labels": [{"name": "P1"}]},
+        {"number": 201, "labels": [{"name": "P2"}]},
+    ]
+    pages = iter([page1, page2, page3])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(pages))
+
+    client = _make_client(handler)
+    # Cap of 50 — the returned list must still surface the P1 and P2 at the
+    # head, not silently drop them along with the rest of the trailing tail.
+    issues = _run(client.list_issues(max_results=50))
+    assert len(issues) == 50
+    numbers = [i["number"] for i in issues]
+    assert 200 in numbers, "newest P1 dropped by pre-sort truncation"
+    assert 201 in numbers, "newest P2 dropped by pre-sort truncation"
+    # Priority ordering must hold: P1 before P2 before the P4 filler.
+    priorities = [i["labels"][0]["name"] for i in issues]
+    assert priorities[0] == "P1"
+    assert priorities[1] == "P2"
+    assert all(p == "P4" for p in priorities[2:])
+
+
+def test_list_issues_fetches_newest_first_so_truncation_drops_oldest():
+    """Regression for #552: cap-hit truncation must drop OLDEST, not newest.
+
+    Silent oldest-first truncation caused reflection dedup blindness — every
+    cycle re-filed the same bug because it could not see the previous cycle's
+    output past the cap. Fetch must request ``direction=desc`` so that within
+    the untriaged tier (which is stable-sorted) the newest survive the cap.
+    """
+    seen_directions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_directions.append(request.url.params.get("direction", ""))
+        # Short page so pagination stops after one call.
+        return httpx.Response(200, json=[{"number": 1, "labels": []}])
+
+    client = _make_client(handler)
+    _run(client.list_issues())
+    assert seen_directions and all(d == "desc" for d in seen_directions), (
+        f"list_issues must fetch newest-first; got directions={seen_directions}"
+    )
+
+
+def test_list_issues_truncation_keeps_newest_untriaged():
+    """Regression for #552: after truncation, newest untriaged must survive.
+
+    The API is asked in ``direction=desc`` order, so with the priority sort
+    being stable within a tier, capping the returned slice should drop the
+    oldest untriaged issues rather than the newest — the reverse of the
+    pre-#552 default behavior.
+    """
+    # GitHub API returns issues in the direction we ask for; the handler
+    # honors that so this test exercises the true end-to-end ordering.
+    all_issues = [{"number": i, "labels": []} for i in range(150)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        direction = request.url.params.get("direction", "asc")
+        page = int(request.url.params.get("page", "1"))
+        ordered = list(reversed(all_issues)) if direction == "desc" else all_issues
+        start = (page - 1) * 100
+        return httpx.Response(200, json=ordered[start : start + 100])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues(max_results=50))
+    numbers = [i["number"] for i in issues]
+    assert len(numbers) == 50
+    # Newest (#149) must be present; oldest (#0) must be dropped.
+    assert 149 in numbers, "newest untriaged dropped — direction=asc regression"
+    assert 0 not in numbers, "oldest untriaged surfaced — cap ordering wrong"
+
+
+def test_list_issues_no_cap_when_max_results_none():
+    """max_results=None pages until GitHub returns a short page (last page)."""
+    page1 = [{"number": i, "labels": []} for i in range(100)]
+    page2 = [{"number": 100 + i, "labels": []} for i in range(100)]
+    page3 = [{"number": 200 + i, "labels": []} for i in range(50)]  # short → last
+    pages = iter([page1, page2, page3])
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(int(request.url.params.get("page", "1")))
+        return httpx.Response(200, json=next(pages))
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues(max_results=None))
+    assert len(issues) == 250
+    assert calls == [1, 2, 3]  # stopped on short page, no over-fetch
+
+
+def test_list_issues_by_priority_queries_each_tier_and_orders_results():
+    """Issue #488: fetch per priority tier, results ordered P1 → P2 → ... → P5."""
+    tier_pages: dict[str, list[list[dict[str, Any]]]] = {
+        "P1": [[{"number": 10, "labels": [{"name": "P1"}]}]],
+        "P2": [
+            [
+                {"number": 20, "labels": [{"name": "P2"}]},
+                {"number": 21, "labels": [{"name": "P2"}]},
+            ]
+        ],
+        "P3": [[]],
+        "P4": [[{"number": 40, "labels": [{"name": "P4"}]}]],
+        "P5": [[]],
+    }
+    seen_labels: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/acme/widgets/issues"
+        label = request.url.params.get("labels", "")
+        seen_labels.append(label)
+        page = int(request.url.params.get("page", "1"))
+        pages = tier_pages.get(label, [[]])
+        idx = page - 1
+        body = pages[idx] if idx < len(pages) else []
+        return httpx.Response(200, json=body)
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    # P1 first, then both P2s (in fetch order), then P4. No P3/P5 issues exist.
+    assert numbers == [10, 20, 21, 40]
+    # All five tiers were queried, in the documented order.
+    assert seen_labels == ["P1", "P2", "P3", "P4", "P5"]
+
+
+def test_list_issues_by_priority_paginates_within_tier():
+    """A tier with >100 open issues must page through until short-page."""
+    p1_page1 = [{"number": i, "labels": [{"name": "P1"}]} for i in range(100)]
+    p1_page2 = [{"number": 100 + i, "labels": [{"name": "P1"}]} for i in range(30)]  # short → last
+    p1_pages = iter([p1_page1, p1_page2])
+    p1_page_counts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        label = request.url.params.get("labels", "")
+        if label == "P1":
+            p1_page_counts.append(int(request.url.params.get("page", "1")))
+            return httpx.Response(200, json=next(p1_pages))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    assert len(issues) == 130
+    assert p1_page_counts == [1, 2]  # stopped on short page
+
+
+def test_list_issues_by_priority_filters_pull_requests():
+    """PRs come back from the issues endpoint too — must be filtered."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("labels") == "P1":
+            return httpx.Response(
+                200,
+                json=[
+                    {"number": 1, "labels": [{"name": "P1"}]},
+                    {"number": 2, "labels": [{"name": "P1"}], "pull_request": {}},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    assert numbers == [1]  # PR (#2) dropped
+
+
+def test_list_issues_by_priority_dedupes_across_tiers():
+    """An issue tagged with two priority labels must appear only once — under
+    the first tier it was seen in (higher priority wins)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        label = request.url.params.get("labels", "")
+        if label == "P1":
+            # Issue #7 tagged with BOTH P1 and P2 (mis-tag).
+            return httpx.Response(200, json=[{"number": 7, "labels": [{"name": "P1"}, {"name": "P2"}]}])
+        if label == "P2":
+            # Same issue returned again under the P2 filter.
+            return httpx.Response(200, json=[{"number": 7, "labels": [{"name": "P1"}, {"name": "P2"}]}])
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    issues = _run(client.list_issues_by_priority())
+    numbers = [i["number"] for i in issues]
+    assert numbers == [7]  # deduped; P1 tier wins
+
+
+def test_list_issues_by_priority_respects_custom_priorities_arg():
+    """Callers can restrict which tiers to query (e.g. ('P1', 'P2') only)."""
+    seen_labels: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_labels.append(request.url.params.get("labels", ""))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    _run(client.list_issues_by_priority(priorities=("P1", "P2")))
+    assert seen_labels == ["P1", "P2"]
+
+
+def test_list_issues_by_priority_empty_on_http_error():
+    """Any tier failing mid-fetch returns [] — same failure mode as list_issues."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _make_client(handler)
+    assert _run(client.list_issues_by_priority()) == []
+
+
+def test_list_issues_by_priority_fetches_desc_within_tier():
+    """Within a tier, order must be newest-first (matches list_issues, #552)."""
+    seen_directions: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_directions.append(request.url.params.get("direction", ""))
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    _run(client.list_issues_by_priority())
+    assert seen_directions and all(d == "desc" for d in seen_directions), (
+        f"list_issues_by_priority must fetch newest-first; got {seen_directions}"
+    )
+
+
+def test_search_issues_by_symbols_scores_and_sorts():
+    """≥min_matches enforced; scoring is by matched-symbol count desc."""
+    items = [
+        # Two symbols matched — should pass threshold.
+        {"number": 1, "title": "get_issue_comments truncates", "body": "affects github_client.py"},
+        # One symbol matched — below default threshold, must be dropped.
+        {"number": 2, "title": "Rework retries", "body": "touches github_client.py only"},
+        # Three symbols matched — should sort to the head.
+        {"number": 3, "title": "get_issue_comments per_page cap", "body": "in github_client.py"},
+        # A PR — must be filtered even if it matches.
+        {"number": 4, "title": "get_issue_comments PR", "body": "github_client.py per_page", "pull_request": {}},
+        # Zero symbols matched — dropped.
+        {"number": 5, "title": "Unrelated", "body": "nothing here"},
+    ]
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/search/issues"
+        captured.append(request.url.params.get("q", ""))
+        return httpx.Response(200, json={"items": items})
+
+    client = _make_client(handler)
+    results = _run(
+        client.search_issues_by_symbols(
+            ["get_issue_comments", "github_client.py", "per_page"],
+        )
+    )
+    # Quoted OR clause, correct repo scope.
+    assert captured and "repo:acme/widgets" in captured[0]
+    assert '"get_issue_comments"' in captured[0]
+    assert " OR " in captured[0]
+    # #3 (3 hits) beats #1 (2 hits); #2/#4/#5 dropped.
+    assert [r["number"] for r in results] == [3, 1]
+    assert results[0]["score"] == 3
+    assert set(results[0]["matched"]) == {"get_issue_comments", "github_client.py", "per_page"}
+    assert results[1]["score"] == 2
+
+
+def test_search_issues_by_symbols_empty_input_returns_empty():
+    """Whitespace-only or empty symbol list short-circuits — no request fired."""
+    fired: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fired.append(request)
+        return httpx.Response(200, json={"items": []})
+
+    client = _make_client(handler)
+    assert _run(client.search_issues_by_symbols([])) == []
+    assert _run(client.search_issues_by_symbols(["", "  "])) == []
+    assert fired == []
+
+
+def test_search_issues_by_symbols_caps_or_clause_at_five():
+    """GitHub rejects boolean queries with too many terms — cap at 5."""
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.url.params.get("q", ""))
+        return httpx.Response(200, json={"items": []})
+
+    client = _make_client(handler)
+    _run(client.search_issues_by_symbols(["a", "b", "c", "d", "e", "f", "g"]))
+    # 5 quoted terms → 4 " OR " joins in the OR clause.
+    assert captured and captured[0].count(" OR ") == 4
+
+
+def test_search_issues_by_symbols_returns_empty_on_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _make_client(handler)
+    assert _run(client.search_issues_by_symbols(["x", "y"])) == []
+
+
+def test_search_issues_by_symbols_min_matches_override():
+    """min_matches=1 lets single-symbol hits through."""
+    items = [
+        {"number": 10, "title": "single hit", "body": "just alpha here"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": items})
+
+    client = _make_client(handler)
+    default_result = _run(client.search_issues_by_symbols(["alpha", "beta"]))
+    assert default_result == []  # default min_matches=2 drops single-hit
+    loose_result = _run(client.search_issues_by_symbols(["alpha", "beta"], min_matches=1))
+    assert [r["number"] for r in loose_result] == [10]
 
 
 def test_find_open_issue_matches_title():

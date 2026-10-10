@@ -8,11 +8,21 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 
 import discord
-from maki_common import PendingQueues, configure_logging, connect_nats, init_kv, subscribe_supervised
+from maki_common import (
+    PendingQueues,
+    configure_logging,
+    connect_nats,
+    init_kv_with_retry,
+    kv_acquire_lease,
+    spawn_background,
+    subscribe_supervised,
+)
+from maki_common.settings import NATS_TOKEN, NATS_URL
 from maki_common.subjects import (
     EARS_IMMUNE_OUT,
     EARS_IN,
@@ -23,6 +33,7 @@ from maki_common.subjects import (
     IMMUNE_COMMAND,
 )
 
+from maki_ears.dedup import claim_or_skip
 from maki_ears.trading import (
     TradeProposalView,
     handle_trade_command,
@@ -32,12 +43,10 @@ from maki_ears.trading import (
 configure_logging()
 log = logging.getLogger(__name__)
 
-NATS_URL = os.environ.get("NATS_URL", "nats://maki-nerve-nats:4222")
-NATS_TOKEN = os.environ.get("NATS_TOKEN")
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GENERAL_CHANNEL_NAME = os.environ.get("GENERAL_CHANNEL_NAME", "maki-general")
 OWNER_ID = int(os.environ.get("OWNER_ID", "690270213370806313"))
-VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-general")
+VITALS_CHANNEL_NAME = os.environ.get("VITALS_CHANNEL_NAME", "maki-alerts")
 IMMUNE_CHANNEL_NAME = os.environ.get("IMMUNE_CHANNEL_NAME", "maki-immune")
 TRADING_CHANNEL_NAME = os.environ.get("TRADING_CHANNEL_NAME", "maki-trading")
 
@@ -63,6 +72,28 @@ _immune_channel_ids: set[int] = set()
 _trading_channel_ids: set[int] = set()
 
 _bot = None
+_shutdown_event: asyncio.Event | None = None
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
+    """Install SIGTERM/SIGINT handlers that set the shutdown event.
+
+    Without this, SIGTERM from Kubernetes goes straight to a forced kill:
+    the NATS connection drops mid-publish, in-flight Discord sends die, and
+    the dedup KV never sees a clean disconnect. Setting an asyncio.Event lets
+    the main loop break, close the bot, and close NATS cleanly.
+    """
+
+    def _handle(signame: str) -> None:
+        log.info("Shutdown signal received", extra={"signal": signame})
+        event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle, sig.name)
+        except NotImplementedError:
+            # Windows / restricted envs — ctrl-c still raises KeyboardInterrupt.
+            pass
 
 
 def _discover_channel(guild, channel_name: str, channel_ids: set[int], label: str):
@@ -188,18 +219,28 @@ class MakiDiscordClient(discord.Client):
             return
 
     async def on_message(self, message: discord.Message):
-        if message.author == self.user:
+        # Ignore ourselves and any other bot (webhooks, GitHub, dashboards, etc.).
+        # Without the bot guard, two bots in a shared channel can trigger a reply
+        # storm; the previous "Get your own, perv!" reply was also a harassment
+        # and spam vector because it fired for every non-owner Maki could see.
+        if message.author == self.user or message.author.bot:
             return
 
-        if message.author.id != OWNER_ID:
-            await message.channel.send("Get your own, perv!")
-            return
-
+        # Channel filter FIRST — anything outside our allow-list is a silent
+        # no-op regardless of who sent it. This bounds Maki's blast radius to
+        # channels it was explicitly invited to observe.
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_general = message.channel.id in _general_channel_ids
         is_immune = message.channel.id in _immune_channel_ids
 
         if not is_dm and not is_general and not is_immune:
+            return
+
+        # Only the owner drives Maki — non-owner messages in observed channels
+        # (including DMs from strangers in mutual servers) are silently dropped.
+        # No auto-reply: Discord's anti-abuse heuristics flag chatty bots, and
+        # an insult reply is a spam / harassment vector on its own.
+        if message.author.id != OWNER_ID:
             return
 
         content = message.content.strip()
@@ -231,13 +272,20 @@ class MakiDiscordClient(discord.Client):
             await _handle_loop_command(message, content)
             return
 
-        # Dedup: if another ears instance already published this message, skip
-        msg_key = f"msg.{message.id}"
+        # Dedup: if another ears instance already published this message, skip.
+        # On transient KV errors, fail-open (process anyway) rather than silently
+        # drop the user's message — see #416. Dedup is defence-in-depth for
+        # blue/green; with a single replica today, a false-negative dupe is far
+        # worse than a rare double-process.
         try:
-            await _dedup_kv.create(msg_key, b"1")
+            if not await claim_or_skip(_dedup_kv, str(message.id), "message"):
+                return
         except Exception:
-            log.info("Dedup: message already claimed by another instance", extra={"message_id": str(message.id)})
-            return
+            log.warning(
+                "Dedup KV failed — fail-open, processing message anyway",
+                extra={"message_id": str(message.id)},
+                exc_info=True,
+            )
 
         payload = {
             "message_id": str(message.id),
@@ -299,13 +347,19 @@ class MakiDiscordClient(discord.Client):
 
 async def _handle_immune_command(message: discord.Message, content: str):
     """Handle messages in #maki-immune — forward to immune as direct commands."""
-    # Dedup: if another ears instance already published this command, skip
-    msg_key = f"msg.{message.id}"
+    # Dedup: if another ears instance already published this command, skip.
+    # Fail-open on transient KV errors so a NATS blip doesn't silently swallow
+    # an immune command (which is precisely when Adi is most likely to be
+    # investigating something that just broke). See #416.
     try:
-        await _dedup_kv.create(msg_key, b"1")
+        if not await claim_or_skip(_dedup_kv, str(message.id), "immune command"):
+            return
     except Exception:
-        log.info("Dedup: immune command already claimed", extra={"message_id": str(message.id)})
-        return
+        log.warning(
+            "Dedup KV failed — fail-open, processing immune command anyway",
+            extra={"message_id": str(message.id)},
+            exc_info=True,
+        )
 
     payload = {
         "message_id": str(message.id),
@@ -347,12 +401,16 @@ async def _handle_immune_command(message: discord.Message, content: str):
 
 async def _handle_loop_command(message: discord.Message, content: str) -> None:
     """Handle ``!loop <name>`` — forward to stem via EARS_IN, immediate ack, no typing."""
-    msg_key = f"msg.{message.id}"
+    # Fail-open on transient KV errors — see #416.
     try:
-        await _dedup_kv.create(msg_key, b"1")
+        if not await claim_or_skip(_dedup_kv, str(message.id), "loop command"):
+            return
     except Exception:
-        log.info("Dedup: loop command already claimed", extra={"message_id": str(message.id)})
-        return
+        log.warning(
+            "Dedup KV failed — fail-open, processing loop command anyway",
+            extra={"message_id": str(message.id)},
+            exc_info=True,
+        )
 
     tokens = content.strip().split()
     if len(tokens) < 2:
@@ -409,7 +467,7 @@ async def _handle_search_request(msg) -> None:
 
 async def _dispatch_search(msg) -> None:
     """Spawn-and-return: per-message task so a slow Discord call never blocks the supervisor."""
-    asyncio.create_task(_handle_search_request(msg))
+    spawn_background(_handle_search_request(msg), name="ears.search_request")
 
 
 async def _search_listener() -> None:
@@ -425,6 +483,10 @@ async def _search_listener() -> None:
             _nc,
             EARS_SEARCH,
             _dispatch_search,
+            # Search hits Discord history + memory graph via HTTP; give it
+            # generous headroom but bound it so one hung request can't
+            # blackhole every subsequent search on this instance (issue #492).
+            handler_timeout=120.0,
             name="ears.search",
         )
     finally:
@@ -457,7 +519,13 @@ async def _handle_ears_out(msg) -> None:
                 symbol = data.get("symbol", "")
                 entry_price = float(data.get("entry_price") or 0.0)
                 view = TradeProposalView(proposal_id, symbol, direction, entry_price)
+                channel_kind = "trading" if _trading_channel_ids else "general"
                 target_ids = _trading_channel_ids or _general_channel_ids
+                if not target_ids:
+                    log.warning(
+                        "No trading/general channel available, trade proposal dropped",
+                        extra={"proposal_id": proposal_id, "channel": channel_kind},
+                    )
                 for channel_id in target_ids:
                     channel = _bot.get_channel(channel_id)
                     if channel:
@@ -492,6 +560,11 @@ async def _handle_ears_out(msg) -> None:
                 extra={"channel": channel_kind, "turn_id": turn_id},
             )
             target_ids = _general_channel_ids
+        if not target_ids:
+            log.warning(
+                "No channel available, loop output dropped",
+                extra={"channel": channel_kind, "turn_id": turn_id},
+            )
         for channel_id in target_ids:
             channel = _bot.get_channel(channel_id)
             if channel:
@@ -518,6 +591,10 @@ async def _out_listener():
         _nc,
         EARS_OUT,
         _handle_ears_out,
+        # Sends into Discord (view rendering + channel.send). Bound past the
+        # Discord API's own client-side timeout so a hung upstream call can't
+        # freeze every subsequent chat/loop output on this instance (#492).
+        handler_timeout=60.0,
         name="ears.out",
     )
 
@@ -546,12 +623,16 @@ async def _immune_response_listener():
         _nc,
         EARS_IMMUNE_OUT,
         _handle_immune_response,
+        # Push to an in-process pending-queue — should be sub-millisecond.
+        # A 10s bound catches wedges without pretending this is slow work
+        # (#492).
+        handler_timeout=10.0,
         name="ears.immune_out",
     )
 
 
 async def _handle_vitals(msg) -> None:
-    """Process one vitals digest and post to #maki-general.
+    """Process one vitals digest and post to #maki-alerts.
 
     ``subscribe_supervised`` handles the ack on our behalf (auto_ack defaults
     to True for JetStream subs) — ACK on success, NAK on uncaught handler
@@ -593,12 +674,17 @@ async def _vitals_listener():
         js=_js,
         durable=f"ears-vitals-{INSTANCE_ID}",
         deliver_policy="new",
+        # Posts a digest into Discord — a hung API call would otherwise
+        # freeze the vitals stream on this instance and let JS ack_wait
+        # expire, redelivering to another pod and risking a double-post
+        # if this handler eventually returns (#492).
+        handler_timeout=60.0,
         name="ears.vitals",
     )
 
 
 async def _handle_alert(msg) -> None:
-    """Process one immune alert and post to #maki-general."""
+    """Process one immune alert and post to #maki-alerts."""
     try:
         data = json.loads(msg.data.decode())
         alert = data.get("alert", "")
@@ -634,6 +720,10 @@ async def _alert_listener():
         js=_js,
         durable=f"ears-alert-{INSTANCE_ID}",
         deliver_policy="new",
+        # Posts an alert into Discord — same reasoning as vitals: don't let
+        # one hung API call blackhole subsequent alerts on this instance and
+        # risk a duplicate post via JS ack_wait redelivery (#492).
+        handler_timeout=60.0,
         name="ears.alert",
     )
 
@@ -651,32 +741,8 @@ async def _send_response(channel, text: str):
 
 
 async def _try_acquire_leadership() -> bool:
-    """Try to become the ears leader via NATS KV CAS."""
-    import json as _json
-    import time as _time
-
-    now = _time.time()
-    claim = _json.dumps({"instance": INSTANCE_ID, "claimed_at": now}).encode()
-
-    try:
-        entry = await _lock_kv.get(LEADER_KEY)
-        data = _json.loads(entry.value.decode())
-        # If current leader's claim is fresh, we're not the leader
-        if now - data.get("claimed_at", 0) < LEADER_TTL:
-            if data.get("instance") == INSTANCE_ID:
-                # We're already the leader — renew
-                await _lock_kv.update(LEADER_KEY, claim, entry.revision)
-                return True
-            return False
-        # Claim expired — try to take over
-        await _lock_kv.update(LEADER_KEY, claim, entry.revision)
-        return True
-    except Exception:
-        try:
-            await _lock_kv.create(LEADER_KEY, claim)
-            return True
-        except Exception:
-            return False
+    """Try to become the ears leader via the shared KV-lease primitive."""
+    return await kv_acquire_lease(_lock_kv, LEADER_KEY, LEADER_TTL, INSTANCE_ID, allow_renew=True)
 
 
 def _create_bot():
@@ -684,7 +750,18 @@ def _create_bot():
     global _bot
     intents = discord.Intents.default()
     intents.message_content = True
-    _bot = MakiDiscordClient(intents=intents)
+    # Default-deny @everyone/@here/role mentions on every send. Model-generated
+    # reply text can echo user input, so without this a literal ``@everyone`` in
+    # any response body would actually ping the guild. ``users=True`` keeps
+    # ``<@userid>`` mentions working for direct replies to Adi; per-message
+    # overrides remain available when Maki genuinely wants to ping a role.
+    allowed_mentions = discord.AllowedMentions(
+        everyone=False,
+        roles=False,
+        users=True,
+        replied_user=True,
+    )
+    _bot = MakiDiscordClient(intents=intents, allowed_mentions=allowed_mentions)
     return _bot
 
 
@@ -703,16 +780,26 @@ async def _leader_renewal_loop():
 
 
 async def main():
-    global _nc, _js, _dedup_kv, _lock_kv, _bot
+    global _nc, _js, _dedup_kv, _lock_kv, _bot, _shutdown_event
 
     log.info("maki-ears starting", extra={"nats_url": NATS_URL, "instance_id": INSTANCE_ID})
+
+    _shutdown_event = asyncio.Event()
+    _install_signal_handlers(asyncio.get_running_loop(), _shutdown_event)
 
     _nc = await connect_nats(NATS_URL, token=NATS_TOKEN)
     _js = _nc.jetstream()
 
-    _lock_kv = await init_kv(_js, LOCK_BUCKET)
+    # init_kv_with_retry: cold-start KV bootstrap used to crash ears on a
+    # single JetStream API blip, taking Discord offline for a 5-min k8s
+    # backoff cycle every time nerve hiccuped (#758). ~60s of bounded
+    # retry rides out transient blips; genuinely dead NATS still surfaces.
+    _lock_kv = await init_kv_with_retry(_js, LOCK_BUCKET)
 
-    # Dedup bucket with 5-minute TTL — prevents duplicate Discord event processing
+    # Dedup bucket with 5-minute TTL — prevents duplicate Discord event processing.
+    # Inline rather than going through init_kv_with_retry because the TTL arg is
+    # bucket-specific; one transient hiccup here still crashes the pod, which is
+    # fine — dedup only matters once Discord events start flowing (post-startup).
     try:
         _dedup_kv = await _js.key_value(DEDUP_BUCKET)
     except Exception:
@@ -720,48 +807,96 @@ async def main():
 
     # NATS listeners run always — harmless when not leader
     # (response listeners silently drop unmatched messages,
-    #  outbound listeners have no channels to post to without Discord)
-    asyncio.create_task(_out_listener())
-    asyncio.create_task(_immune_response_listener())
-    asyncio.create_task(_vitals_listener())
-    asyncio.create_task(_alert_listener())
+    #  outbound listeners have no channels to post to without Discord).
+    # ``spawn_background`` anchors these against GC and logs any uncaught
+    # exception — a bare ``create_task`` would let a listener silently vanish
+    # if the caller's weak-ref lapses (issue #123).
+    spawn_background(_out_listener(), name="ears.out_listener")
+    spawn_background(_immune_response_listener(), name="ears.immune_response_listener")
+    spawn_background(_vitals_listener(), name="ears.vitals_listener")
+    spawn_background(_alert_listener(), name="ears.alert_listener")
 
-    # Leader election loop — only the leader connects to Discord
-    while True:
-        if await _try_acquire_leadership():
-            log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
+    try:
+        # Leader election loop — only the leader connects to Discord.
+        # Breaks on _shutdown_event so SIGTERM triggers the cleanup below.
+        while not _shutdown_event.is_set():
+            if await _try_acquire_leadership():
+                log.info("Acquired leadership — connecting to Discord", extra={"instance_id": INSTANCE_ID})
 
-            # Fresh client each time — discord.py closes the aiohttp session on
-            # bot.close(), making the old instance unusable.
-            _bot = _create_bot()
-            _general_channel_ids.clear()
-            _vitals_channel_ids.clear()
-            _immune_channel_ids.clear()
-            _trading_channel_ids.clear()
+                # Fresh client each time — discord.py closes the aiohttp session on
+                # bot.close(), making the old instance unusable.
+                _bot = _create_bot()
+                _general_channel_ids.clear()
+                _vitals_channel_ids.clear()
+                _immune_channel_ids.clear()
+                _trading_channel_ids.clear()
 
-            renewal_task = asyncio.create_task(_leader_renewal_loop())
-            search_task = asyncio.create_task(_search_listener())
+                # ``spawn_background`` for renewal_task gives us exception logging;
+                # the returned Task is still assigned for the ``.cancel()`` call in
+                # the ``finally`` block below (issue #123). search_task keeps a bare
+                # create_task because its handle is both retained here and awaited
+                # via cancel — no risk of GC or silent exception loss.
+                renewal_task = spawn_background(_leader_renewal_loop(), name="ears.leader_renewal")
+                search_task = asyncio.create_task(_search_listener())
 
+                # Race the bot's lifetime against the shutdown signal so SIGTERM
+                # can unblock the otherwise indefinite _bot.start() call.
+                bot_task = asyncio.create_task(_bot.start(DISCORD_TOKEN))
+                shutdown_wait = asyncio.create_task(_shutdown_event.wait())
+
+                try:
+                    done, _ = await asyncio.wait(
+                        {bot_task, shutdown_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if bot_task in done:
+                        exc = bot_task.exception()
+                        if exc is not None:
+                            log.error("Discord bot disconnected", exc_info=exc)
+                    else:
+                        # Shutdown fired first — close the bot to unblock start().
+                        log.info("Shutdown requested, closing Discord bot")
+                        try:
+                            await _bot.close()
+                        except Exception:
+                            log.exception("Error closing Discord bot")
+                        try:
+                            await bot_task
+                        except Exception:
+                            log.exception("Discord bot shutdown error")
+                finally:
+                    if not shutdown_wait.done():
+                        shutdown_wait.cancel()
+                    # Cancel both tasks tied to this bot session. Leaving the
+                    # renewal loop alive across reconnects lets an orphaned task
+                    # close the *next* bot when its CAS happens to fail — the
+                    # global _bot rebinding makes the leak silently destructive.
+                    # See #177.
+                    renewal_task.cancel()
+                    search_task.cancel()
+                    log.info("Discord bot stopped, returning to standby")
+            else:
+                log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
+
+            # Interruptible sleep — shutdown breaks out immediately.
             try:
-                await _bot.start(DISCORD_TOKEN)
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=LEADER_TTL)
+            except TimeoutError:
+                pass
+    finally:
+        log.info("maki-ears shutting down")
+        if _bot is not None:
+            try:
+                if not _bot.is_closed():
+                    await _bot.close()
             except Exception:
-                log.exception("Discord bot disconnected")
-            finally:
-                # Cancel both tasks tied to this bot session. Leaving the
-                # renewal loop alive across reconnects lets an orphaned task
-                # close the *next* bot when its CAS happens to fail — the
-                # global _bot rebinding makes the leak silently destructive.
-                # See #177.
-                renewal_task.cancel()
-                search_task.cancel()
-                log.info("Discord bot stopped, returning to standby")
-        else:
-            log.info("Another instance is leader, standing by", extra={"instance_id": INSTANCE_ID})
-
-        await asyncio.sleep(LEADER_TTL)
-
-    await _nc.close()
-    log.info("NATS connection closed")
+                log.exception("Error closing Discord bot during shutdown")
+        if _nc is not None:
+            try:
+                await _nc.close()
+                log.info("NATS connection closed")
+            except Exception:
+                log.exception("Error closing NATS connection")
 
 
 def cli():

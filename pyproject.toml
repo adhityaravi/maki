@@ -25,7 +25,6 @@ root = [
     "pkgs/maki-ears/src",
     "pkgs/maki-recall/src",
     "pkgs/maki-synapse/src",
-    "pkgs/maki-finbert/src",
 ]
 python-version = "3.12"
 
@@ -66,6 +65,10 @@ allowed-unresolved-imports = [
     "kubernetes.**",
     "mem0",
     "mem0.**",
+    "neo4j",
+    "neo4j.**",
+    "psycopg",
+    "psycopg.**",
     "discord",
     "discord.**",
     "asyncpg",
@@ -76,6 +79,10 @@ allowed-unresolved-imports = [
     "optimum.**",
     "transformers",
     "transformers.**",
+    # pytest is a test-only dep and not installed in the CI ``uvx ty check``
+    # environment; used by test files' ``importorskip`` guards.
+    "pytest",
+    "pytest.**",
 ]
 
 [tool.pytest.ini_options]

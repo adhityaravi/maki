@@ -245,6 +245,76 @@ def make_github_issues_tools(
         except Exception as e:
             return mcp_result(f"Error: {e}")
 
+    async def search_issues_by_symbol(args: dict[str, Any]) -> dict[str, Any]:
+        """Find open issues whose title/body mentions ≥2 of the given symbols.
+
+        Structural dedup for the idle loop (see #682). Title-only substring
+        checks miss semantic duplicates — the same bug re-derived from a
+        different entry point ends up with a different title. Passing 3–5
+        identifiers (function names, filenames, class names) from a draft
+        catches those cases because the identifiers themselves are stable
+        across different phrasings.
+        """
+        repo = _resolve_repo(args)
+        raw_symbols = args.get("symbols", "")
+        state = args.get("state", "open").strip() or "open"
+        try:
+            min_matches = int(args.get("min_matches", "2") or "2")
+        except (TypeError, ValueError):
+            min_matches = 2
+        symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+        log.info(
+            "Tool: search_issues_by_symbol",
+            extra={"repo": repo, "symbols": symbols, "state": state},
+        )
+        if not symbols:
+            return mcp_result("Error: 'symbols' must be a non-empty comma-separated list.")
+        # Cap at 5 terms — mirrors the GitHubIssueClient cap so the tool and
+        # the client-side helper have identical semantics.
+        symbols = symbols[:5]
+        or_clause = " OR ".join(f'"{s}"' for s in symbols)
+        search_q = f"repo:{repo} is:issue is:{state} ({or_clause})"
+        try:
+            resp = await client.get(
+                f"{API}/search/issues",
+                headers=await auth.headers(),
+                params={"q": search_q, "per_page": 40},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+        except httpx.HTTPStatusError as e:
+            return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
+        except Exception as e:
+            return mcp_result(f"Error: {e}")
+
+        lowered = [s.lower() for s in symbols]
+        scored: list[dict[str, Any]] = []
+        for item in items:
+            if "pull_request" in item:  # /search/issues also returns PRs
+                continue
+            haystack = f"{item.get('title', '')}\n{item.get('body') or ''}".lower()
+            matched = [s for s, low in zip(symbols, lowered, strict=True) if low in haystack]
+            if len(matched) < min_matches:
+                continue
+            scored.append({"number": item.get("number"), "title": item.get("title", ""), "matched": matched})
+        scored.sort(key=lambda r: len(r["matched"]), reverse=True)
+        scored = scored[:20]
+
+        if not scored:
+            return mcp_result(
+                f"No {state} issues in {repo} match ≥{min_matches} of {symbols}. "
+                f"Safe to file new — no existing issue covers this symbol set."
+            )
+        lines = [
+            f"Found {len(scored)} candidate duplicate(s) — "
+            f"prefer commenting on the highest-scoring match over filing new:"
+        ]
+        for r in scored:
+            lines.append(
+                f"#{r['number']} ({len(r['matched'])}/{len(symbols)} matched: {', '.join(r['matched'])}) — {r['title']}"
+            )
+        return mcp_result("\n".join(lines))
+
     async def get_issue(args: dict[str, Any]) -> dict[str, Any]:
         """Get details and comments for a specific issue."""
         repo = _resolve_repo(args)
@@ -570,18 +640,34 @@ def make_github_issues_tools(
         if not number:
             return mcp_result("Error: 'number' is required.")
         try:
-            if comment:
-                await client.post(
-                    f"{API}/repos/{repo}/issues/{number}/comments",
-                    headers=await auth.headers(),
-                    json={"body": comment},
-                )
+            # PATCH first — only post the closing comment on success. Otherwise a
+            # transient GitHub 5xx/4xx leaves the "closing because X" rationale
+            # public on a still-open PR, and the caller (which sees Error: ...)
+            # retries and duplicates the comment. See issues #367 and #509.
             resp = await client.patch(
                 f"{API}/repos/{repo}/pulls/{number}",
                 headers=await auth.headers(),
                 json={"state": "closed"},
             )
             resp.raise_for_status()
+            if comment:
+                comment_resp = await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+                # Don't fail the whole close if the comment POST fails — the PR
+                # is already closed. Log and continue.
+                if comment_resp.is_error:
+                    log.warning(
+                        "close_pr: PR closed but comment POST failed",
+                        extra={
+                            "repo": repo,
+                            "number": number,
+                            "status": comment_resp.status_code,
+                            "body": comment_resp.text[:500],
+                        },
+                    )
             return mcp_result(f"Closed PR #{number} in {repo} without merging.")
         except httpx.HTTPStatusError as e:
             return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
@@ -619,19 +705,34 @@ def make_github_issues_tools(
         if not number:
             return mcp_result("Error: 'number' is required.")
         try:
-            # Add closing comment if provided
-            if comment:
-                await client.post(
-                    f"{API}/repos/{repo}/issues/{number}/comments",
-                    headers=await auth.headers(),
-                    json={"body": comment},
-                )
+            # PATCH first — only post the closing comment on success. Otherwise a
+            # transient GitHub 5xx/4xx leaves the "closing because X" rationale
+            # public on a still-open issue, and the caller (which sees Error: ...)
+            # retries and duplicates the comment. See issues #367 and #509.
             resp = await client.patch(
                 f"{API}/repos/{repo}/issues/{number}",
                 headers=await auth.headers(),
                 json={"state": "closed"},
             )
             resp.raise_for_status()
+            if comment:
+                comment_resp = await client.post(
+                    f"{API}/repos/{repo}/issues/{number}/comments",
+                    headers=await auth.headers(),
+                    json={"body": comment},
+                )
+                # Don't fail the whole close if the comment POST fails — the issue
+                # is already closed. Log and continue.
+                if comment_resp.is_error:
+                    log.warning(
+                        "close_issue: issue closed but comment POST failed",
+                        extra={
+                            "repo": repo,
+                            "number": number,
+                            "status": comment_resp.status_code,
+                            "body": comment_resp.text[:500],
+                        },
+                    )
             return mcp_result(f"Closed #{number} in {repo}.")
         except httpx.HTTPStatusError as e:
             return mcp_result(f"Error: {e.response.status_code} — {e.response.text[:500]}")
@@ -714,6 +815,18 @@ def make_github_issues_tools(
             "Get details and comments for a specific issue by number.",
             {"repo": str, "number": str},
             get_issue,
+        ),
+        (
+            "search_issues_by_symbol",
+            "Find open issues whose title/body mentions ≥2 of the given identifiers. "
+            "Structural dedup for the idle loop — pass 3–5 symbols (function names, "
+            "filenames, class names) extracted from a draft body; matches identify "
+            "existing issues covering the same underlying bug even when titles differ. "
+            "Params: symbols (comma-separated), state ('open'/'closed', default 'open'), "
+            "min_matches (default 2). Prefer commenting on the highest-scoring match "
+            "over filing new.",
+            {"repo": str, "symbols": str, "state": str, "min_matches": str},
+            search_issues_by_symbol,
         ),
         (
             "create_issue",
