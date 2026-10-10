@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -33,7 +33,7 @@ class PendingFutures:
 
     def create(self, key: str) -> asyncio.Future:
         """Create and register a future for the given key."""
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self._futures[key] = future
         return future
 
@@ -57,7 +57,7 @@ class PendingFutures:
         return key in self._futures
 
     @asynccontextmanager
-    async def session(self, key: str) -> AsyncIterator[asyncio.Future]:
+    async def session(self, key: str) -> AsyncGenerator[asyncio.Future]:
         """Create a future for ``key`` and guarantee removal on exit.
 
         Eliminates the create/try/finally/remove boilerplate. The future is
@@ -156,7 +156,7 @@ class PendingQueues:
         return key in self._queues
 
     @asynccontextmanager
-    async def session(self, key: str) -> AsyncIterator[asyncio.Queue]:
+    async def session(self, key: str) -> AsyncGenerator[asyncio.Queue]:
         """Create a queue for ``key`` and guarantee removal on exit.
 
         Eliminates the create/try/finally/remove boilerplate. The queue is

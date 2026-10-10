@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import signal
+import time
 import uuid
 
 import discord
@@ -364,7 +365,7 @@ async def _handle_immune_command(message: discord.Message, content: str):
         "message_id": str(message.id),
         "command": content,
         "username": message.author.name,
-        "timestamp": asyncio.get_event_loop().time(),
+        "timestamp": time.time(),
     }
 
     try:
