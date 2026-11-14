@@ -60,7 +60,7 @@ resource "kubernetes_deployment" "stem" {
         }
         init_container {
           name  = "install-loops"
-          image = "python:3.12-slim"
+          image = "python:3.15-slim"
           command = [
             "/bin/sh",
             "-c",
